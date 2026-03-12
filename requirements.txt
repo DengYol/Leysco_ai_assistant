@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+requests
+pydantic
+python-dotenv
+httpx
+loguru
+python-multipart
+pydantic-settings
+rapidfuzz
+numpy
+pandas
+scipy
+groq
+aiohttp>=3.8.0          # For async API calls
+cachetools>=5.0.0       # For advanced caching (optional)
+tenacity>=8.0.0         # For retry logic on API failures

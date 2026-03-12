@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+app.zip
+test_*.py
+test_*.json
+test_results*.json
+*.json
+!package.json  # if you have package.json
+!requirements.txt
+
+# Virtual environment
+venv/
+ENV/
+env/
+
+# Cache files
+*.cache
+*.pid
+*.seed
+*.pid.lock
