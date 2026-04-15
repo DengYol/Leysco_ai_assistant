@@ -10,7 +10,11 @@ FIX SUMMARY
    Falls back to hardcoded KNOWN_POST_ENDPOINTS when OPTIONS returns nothing.
 2. create_quotation(): removed check_endpoint_supports_post() pre-check.
    Now tries each known endpoint in order, moving on only on 405 or exception.
-   A real 4xx/5xx from the server is surfaced to the caller as-is.
+3. ENHANCED: Improved item validation to filter out packing materials.
+4. ENHANCED: Added item search that prioritizes sellable items.
+5. FIXED: Better response parsing for successful quotation creation.
+6. ADDED: Formatted success message with item details, customer name, total, and validity.
+7. UPDATED: Uses ResponseFormatter for consistent message formatting.
 """
 
 import requests
@@ -18,6 +22,9 @@ import logging
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 import json
+import re
+
+from app.ai_engine.response_formatter import ResponseFormatter
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +44,19 @@ class QuotationService:
     }
 
     # Ordered list of POST endpoint *paths* to try when OPTIONS discovery fails.
-    # These are relative to base_url (which already includes /api/v1).
-    # e.g. base_url = https://host/api/v1  +  /documents/quotation
-    #               = https://host/api/v1/documents/quotation  ✅
     KNOWN_POST_ENDPOINTS = [
-        "/documents/quotation",   # ✅ WORKING - Primary (confirmed in Postman)
-        "/documents/quotations",  # ✅ WORKING - Alternative
+        "/documents/quotation",
+        "/documents/quotations",
         "/quotations",
         "/sales/quotations",
         "/marketing/quotation",
         "/quotation/create",
     ]
+
+    # Items to skip (packing materials, raw materials, etc.)
+    SKIP_GROUPS = {"PACKING MATERIAL", "RAW MATERIAL", "PACKAGING"}
+    SKIP_PREFIXES = ("RMST", "RMOP", "RMFC", "RMPA", "RMPK", "PACK", "BAG", "BOX", "LABEL")
+    SKIP_NAME_TERMS = ("LABEL", "PACK", "BAG", "BOX", "STICKER", "SLEEVE", "WRAPPER")
 
     def __init__(self, api_service):
         self.api = api_service
@@ -84,16 +93,57 @@ class QuotationService:
         return True
 
     # ==========================================================
-    # ENDPOINT DISCOVERY (FIXED)
+    # ENHANCED ITEM SEARCH
+    # ==========================================================
+    def _find_sellable_item(self, search_term: str, limit: int = 20) -> Optional[Dict]:
+        """
+        Find a sellable item matching the search term.
+        Skips packing materials, raw materials, and non-sellable items.
+        Prioritizes items that are actually sellable (SellItem = Y).
+        """
+        try:
+            items = self.api.get_items(search=search_term, limit=limit)
+            
+            if not items:
+                return None
+            
+            # First pass: find sellable, non-packing items
+            for item in items:
+                item_code = item.get("ItemCode", "")
+                item_name = item.get("ItemName", "")
+                item_group = (item.get("item_group") or {}).get("ItmsGrpNam", "").upper()
+                is_sellable = item.get("SellItem") == "Y"
+                
+                # Check if it's a packing/raw material
+                is_packing = (
+                    item_group in self.SKIP_GROUPS or
+                    any(item_code.startswith(p) for p in self.SKIP_PREFIXES) or
+                    any(term in item_name.upper() for term in self.SKIP_NAME_TERMS)
+                )
+                
+                if is_sellable and not is_packing:
+                    logger.info(f"✅ Found sellable item: {item_name} ({item_code})")
+                    return item
+            
+            # Second pass: find any sellable item (even if it might be packing)
+            for item in items:
+                if item.get("SellItem") == "Y":
+                    logger.info(f"⚠️ Found sellable but possibly packing item: {item.get('ItemName')} ({item.get('ItemCode')})")
+                    return item
+            
+            # No sellable items found
+            logger.info(f"❌ No sellable items found for: {search_term}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding sellable item for '{search_term}': {e}")
+            return None
+
+    # ==========================================================
+    # ENDPOINT DISCOVERY
     # ==========================================================
     def _discover_quotation_endpoint(self, force_refresh: bool = False) -> Dict[str, Any]:
-        """
-        Discover the correct endpoint for quotation creation.
-
-        FIX: OPTIONS is tried for information only.  If OPTIONS returns no
-        Allow header (common on this server stack), we fall back to
-        KNOWN_POST_ENDPOINTS rather than giving up with create=None.
-        """
+        """Discover the correct endpoint for quotation creation."""
         if not force_refresh and self._endpoint_cache and self._endpoint_cache_time:
             if (datetime.now() - self._endpoint_cache_time) < timedelta(hours=1):
                 logger.info("📦 Using cached quotation endpoint discovery")
@@ -101,12 +151,10 @@ class QuotationService:
 
         logger.info("🔍 Discovering quotation endpoints...")
 
-        # Delegate to the API service's discovery first
         if hasattr(self.api, 'discover_endpoints'):
             discovery = self.api.discover_endpoints(force_refresh)
             result = discovery.get("quotations", {})
 
-            # Check documents endpoints too
             if "documents" in discovery and discovery["documents"].get("create"):
                 if "/quotation" in discovery["documents"]["create"]:
                     result["documents_endpoint"] = discovery["documents"]["create"]
@@ -115,22 +163,16 @@ class QuotationService:
             result["doc_type"] = 23
             result["doc_type_name"] = "Quotations"
 
-            # FIX: if discovery returned no create endpoint, seed from KNOWN_POST_ENDPOINTS
             if not result.get("create"):
                 result["create"] = f"{self.base_url}{self.KNOWN_POST_ENDPOINTS[0]}"
                 result["_fallback_used"] = True
-                logger.warning(
-                    "⚠️ API service discovery found no POST endpoint. "
-                    f"Using hardcoded fallback: {result['create']}"
-                )
+                logger.warning(f"⚠️ Using hardcoded fallback: {result['create']}")
 
             self._endpoint_cache = result
             self._endpoint_cache_time = datetime.now()
             return result
 
-        # -------------------------------------------------------
-        # Manual discovery (used when api_service has no discover_endpoints)
-        # -------------------------------------------------------
+        # Manual discovery
         result = {
             "get": f"{self.base_url}/marketing/docs/23",
             "create": None,
@@ -146,7 +188,6 @@ class QuotationService:
             try:
                 resp = requests.options(full_url, headers=self.headers, timeout=5)
 
-                # Login-page redirect — endpoint exists but auth needed
                 if resp.status_code == 200 and 'text/html' in resp.headers.get('Content-Type', ''):
                     if 'Sign In' in resp.text or 'login' in resp.text:
                         logger.info(f"🔒 Endpoint exists but requires authentication: {full_url}")
@@ -175,40 +216,33 @@ class QuotationService:
                         result["supported_methods"] = methods
                         logger.info(f"✅ OPTIONS confirmed POST endpoint: {full_url}")
 
-            except requests.exceptions.ConnectionError:
-                logger.debug(f"Connection error for {full_url}")
-                continue
             except Exception as e:
                 logger.debug(f"Could not OPTIONS-test {full_url}: {e}")
                 continue
 
-        # Promote documents_create if nothing better found
         if not result["create"] and result["documents_create"]:
             result["create"] = result["documents_create"]
             logger.info(f"📄 Using documents endpoint as primary: {result['documents_create']}")
 
-        # FIX: hardcoded fallback — never leave create as None
         if not result["create"]:
             result["create"] = f"{self.base_url}{self.KNOWN_POST_ENDPOINTS[0]}"
             result["_fallback_used"] = True
-            logger.warning(
-                f"⚠️ OPTIONS discovery found no POST endpoint. "
-                f"Using hardcoded fallback: {result['create']}"
-            )
+            logger.warning(f"⚠️ Using hardcoded fallback: {result['create']}")
 
         self._endpoint_cache = result
         self._endpoint_cache_time = datetime.now()
         return result
 
     # ==========================================================
-    # VALIDATE QUOTATION ITEMS
+    # ENHANCED VALIDATE QUOTATION ITEMS
     # ==========================================================
     def _validate_quotation_items(self, items: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Validate quotation items.
+        Enhanced to skip packing materials and non-sellable items.
+        """
         valid_items = []
         invalid_items = []
-
-        SKIP_GROUPS = {"PACKING MATERIAL", "RAW MATERIAL", "PACKAGING"}
-        SKIP_PREFIXES = ("RMST", "RMOP", "RMFC", "RMPA", "RMPK", "PACK", "BAG", "BOX")
 
         for idx, item in enumerate(items):
             item_code = item.get("ItemCode")
@@ -217,45 +251,74 @@ class QuotationService:
             price     = item.get("Price", 0)
 
             if not item_code:
-                invalid_items.append({"ItemCode": "Unknown", "ItemName": item_name,
-                                       "reason": "Missing item code", "index": idx})
+                invalid_items.append({
+                    "ItemCode": "Unknown", 
+                    "ItemName": item_name,
+                    "reason": "Missing item code", 
+                    "index": idx
+                })
                 continue
 
             if quantity <= 0:
-                invalid_items.append({"ItemCode": item_code, "ItemName": item_name,
-                                       "reason": f"Invalid quantity: {quantity}", "index": idx})
+                invalid_items.append({
+                    "ItemCode": item_code, 
+                    "ItemName": item_name,
+                    "reason": f"Invalid quantity: {quantity}", 
+                    "index": idx
+                })
                 continue
 
             if price <= 0:
-                invalid_items.append({"ItemCode": item_code, "ItemName": item_name,
-                                       "reason": "Zero or negative price - cannot create quotation",
-                                       "index": idx})
+                invalid_items.append({
+                    "ItemCode": item_code, 
+                    "ItemName": item_name,
+                    "reason": "Zero or negative price - cannot create quotation",
+                    "index": idx
+                })
                 continue
 
-            if hasattr(self.api, 'is_item_sellable'):
-                try:
-                    is_sellable, reason, item_details = self.api.is_item_sellable(item_code)
+            # Get full item details to check if sellable
+            try:
+                full_item = self.api.get_item_by_code(item_code)
+                if full_item:
+                    item_group = (full_item.get("item_group") or {}).get("ItmsGrpNam", "").upper()
+                    item_name_upper = full_item.get("ItemName", "").upper()
+                    is_sellable = full_item.get("SellItem") == "Y"
+                    
+                    # Check if it's a packing/raw material
+                    is_packing = (
+                        item_group in self.SKIP_GROUPS or
+                        any(item_code.startswith(p) for p in self.SKIP_PREFIXES) or
+                        any(term in item_name_upper for term in self.SKIP_NAME_TERMS)
+                    )
+                    
                     if not is_sellable:
-                        invalid_items.append({"ItemCode": item_code, "ItemName": item_name,
-                                               "reason": reason, "index": idx})
+                        invalid_items.append({
+                            "ItemCode": item_code, 
+                            "ItemName": full_item.get("ItemName", item_name),
+                            "reason": f"Item not sellable (SellItem = N)",
+                            "index": idx
+                        })
                         continue
-
-                    if item_details:
-                        item_group = (item_details.get("item_group") or {}).get("ItmsGrpNam", "").upper()
-                        if item_group in SKIP_GROUPS or any(item_code.startswith(p) for p in SKIP_PREFIXES):
-                            invalid_items.append({"ItemCode": item_code, "ItemName": item_name,
-                                                   "reason": f"Packing/raw material (Group: {item_group})",
-                                                   "index": idx})
-                            continue
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not validate item {item_code}: {e}")
+                    
+                    if is_packing:
+                        invalid_items.append({
+                            "ItemCode": item_code, 
+                            "ItemName": full_item.get("ItemName", item_name),
+                            "reason": f"Packing/raw material (Group: {item_group})",
+                            "index": idx
+                        })
+                        continue
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ Could not validate item {item_code}: {e}")
 
             valid_items.append(item)
 
         return valid_items, invalid_items
 
     # ==========================================================
-    # FORMAT QUOTATION FOR API
+    # ENHANCED FORMAT QUOTATION FOR API
     # ==========================================================
     def _format_quotation_for_api(self, customer_code: str, items: List[Dict[str, Any]],
                                    comments: str = "", valid_until_days: int = 30) -> Dict[str, Any]:
@@ -266,7 +329,6 @@ class QuotationService:
         total_amount = sum(item.get("Quantity", 1) * item.get("Price", 0) for item in items)
         comment_text = comments or f"Quotation created via AI Assistant on {today_str}"
 
-        # Format used for /documents/quotation endpoint (confirmed working in Postman)
         documents_format = {
             "CardCode":      customer_code,
             "DocDate":       today_str,
@@ -275,6 +337,7 @@ class QuotationService:
             "DocumentLines": [
                 {
                     "ItemCode":  item.get("ItemCode"),
+                    "ItemName":  item.get("ItemName"),
                     "Quantity":  item.get("Quantity", 1),
                     "UnitPrice": item.get("Price", 0),
                 }
@@ -282,7 +345,6 @@ class QuotationService:
             ],
         }
 
-        # SAP B1 native format (backup)
         sap_format = {
             "DocObjectCode": self.SAP_OBJECT_CODE,
             "CardCode":      customer_code,
@@ -292,7 +354,7 @@ class QuotationService:
             "DocumentLines": [
                 {
                     "ItemCode":       item.get("ItemCode"),
-                    "ItemDescription":item.get("ItemName", ""),
+                    "ItemDescription": item.get("ItemName", ""),
                     "Quantity":       float(item.get("Quantity", 1)),
                     "UnitPrice":      float(item.get("Price", 0)),
                     "WarehouseCode":  item.get("Warehouse", "01"),
@@ -301,7 +363,6 @@ class QuotationService:
             ],
         }
 
-        # Sales App format
         sales_app_format = {
             "CardCode":      customer_code,
             "DocDate":       today_str,
@@ -313,7 +374,6 @@ class QuotationService:
             "DocumentLines": sap_format["DocumentLines"],
         }
 
-        # Simplified format (some endpoints prefer camelCase)
         simplified_format = {
             "customerCode": customer_code,
             "date":         today_str,
@@ -333,7 +393,7 @@ class QuotationService:
         }
 
         return {
-            "documents":   documents_format,   # Try first — confirmed working
+            "documents":   documents_format,
             "sales_app":   sales_app_format,
             "sap":         sap_format,
             "simplified":  simplified_format,
@@ -360,7 +420,7 @@ class QuotationService:
         return formatted["simplified"]
 
     # ==========================================================
-    # CREATE QUOTATION (FIXED)
+    # CREATE QUOTATION (FULLY FIXED WITH RESPONSE FORMATTER)
     # ==========================================================
     def create_quotation(
         self,
@@ -374,12 +434,7 @@ class QuotationService:
     ) -> Dict[str, Any]:
         """
         Create a Sales Quotation (Object Type 23).
-
-        FIX: No longer pre-checks endpoints with OPTIONS/check_endpoint_supports_post.
-        Instead, attempts POST on each known endpoint in order:
-          - Move on (silently) only on 405 Method Not Allowed or connection error
-          - Surface any other HTTP error (400, 422, 500 …) to the caller immediately
-            so they can see real validation messages from the server
+        Returns formatted success message with item details using ResponseFormatter.
         """
         invalid_items: List[Dict] = []
 
@@ -387,8 +442,10 @@ class QuotationService:
             logger.info(f"📝 Creating quotation for customer: {customer_code}")
 
             if not items:
-                return {"success": False, "error": "No items provided for quotation."
-                        if language != "sw" else "Hakuna bidhaa zilizotolewa kwa nukuu."}
+                return ResponseFormatter.format_quotation_creation_error(
+                    "No items provided for quotation.",
+                    language=language
+                )
 
             valid_items, invalid_items = self._validate_quotation_items(items)
 
@@ -400,19 +457,29 @@ class QuotationService:
                     if len(invalid_items) > 3:
                         suffix += f" and {len(invalid_items) - 3} more" if language != "sw" else f" na {len(invalid_items) - 3} nyingine"
                     err += suffix
-                return {"success": False, "error": err, "skipped_items": invalid_items}
+                
+                return ResponseFormatter.format_quotation_creation_error(
+                    err,
+                    invalid_items,
+                    language=language
+                )
 
             if force_web_fallback:
                 return self._get_web_fallback_response(customer_code, valid_items, invalid_items, language=language)
 
-            # --------------------------------------------------
-            # Discover / build the ordered list of endpoints
-            # --------------------------------------------------
+            # Get customer name for display
+            customer_name = customer_code
+            try:
+                customer = self.api.get_customer_by_code(customer_code)
+                if customer:
+                    customer_name = customer.get("CardName", customer_code)
+            except Exception:
+                pass
+
+            # Discover endpoints
             endpoint_info = self._discover_quotation_endpoint(force_refresh=refresh_cache)
             primary = endpoint_info.get("create")
 
-            # Build a deduped ordered list of full URLs: primary first, then KNOWN_POST_ENDPOINTS.
-            # Always normalise to full URL — discovery may return a relative path.
             def _to_full_url(ep: str) -> str:
                 if ep.startswith("http://") or ep.startswith("https://"):
                     return ep
@@ -436,9 +503,7 @@ class QuotationService:
                     language=language,
                 )
 
-            # --------------------------------------------------
-            # Pre-format the payload once
-            # --------------------------------------------------
+            # Format payload
             formatted = self._format_quotation_for_api(
                 customer_code, valid_items, comments, valid_until_days
             )
@@ -449,7 +514,6 @@ class QuotationService:
             for endpoint_url in endpoints_to_try:
                 payload = self._pick_payload(endpoint_url, formatted)
                 logger.info(f"   → POST {endpoint_url}")
-                logger.debug(f"   Payload: {json.dumps(payload, indent=2)}")
 
                 try:
                     response = requests.post(
@@ -471,7 +535,6 @@ class QuotationService:
                     last_error = str(e)
                     continue
 
-                # Session expired (HTML login page returned)
                 if not self._check_response_auth(response, endpoint_url):
                     auth_note = ("API session expired. Please log in again through the web interface."
                                  if language != "sw"
@@ -481,66 +544,86 @@ class QuotationService:
                         additional_note=auth_note, language=language,
                     )
 
-                # 405 = endpoint exists but does not accept POST → try next
                 if response.status_code == 405:
                     logger.warning(f"   405 Method Not Allowed — trying next endpoint")
                     last_error = f"405 from {endpoint_url}"
                     continue
 
-                # ✅ Success
                 if response.status_code in [200, 201]:
                     try:
                         result = response.json()
                     except Exception:
                         result = {"raw_response": response.text}
 
-                    # Log full response so we can see the actual field names returned
-                    logger.info(f"📥 Quotation API response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
-                    logger.info(f"📥 Quotation API response (truncated): {str(result)[:500]}")
+                    logger.info(f"📥 Quotation API response: {str(result)[:500]}")
 
-                    # Extract DocNum/DocEntry — check nested ResponseData too
-                    # (some SAP proxies wrap the result like {"ResultState":true,"ResponseData":{...}})
-                    inner = result
-                    if isinstance(result, dict) and "ResponseData" in result:
-                        inner = result["ResponseData"] or result
-                    if isinstance(inner, list) and inner:
-                        inner = inner[0]
-
-                    doc_entry = (inner.get("DocEntry") or inner.get("doc_entry")
-                                 or inner.get("DocNum")  or inner.get("doc_num")
-                                 or inner.get("id")      or inner.get("ID"))
-                    doc_num   = (inner.get("DocNum")  or inner.get("doc_num")
-                                 or inner.get("docNum") or doc_entry)
-                    total_amount = formatted["summary"]["total_amount"]
-
-                    logger.info(f"✅ Quotation created via {endpoint_url}: DocNum={doc_num}, DocEntry={doc_entry}")
-
-                    response_data: Dict[str, Any] = {
-                        "success":       True,
-                        "DocEntry":      doc_entry,
-                        "DocNum":        doc_num,
-                        "CardCode":      customer_code,
-                        "ValidUntil":    formatted["summary"]["valid_until"],
-                        "ItemCount":     len(valid_items),
-                        "TotalAmount":   total_amount,
-                        "valid_items":   valid_items,
-                        "endpoint_used": endpoint_url,
-                        "language":      language,
-                        "raw_response":  result,   # full server response for debugging
-                        "parsed_inner":  inner,    # the unwrapped payload
-                    }
-
-                    if invalid_items:
-                        response_data["skipped_items"] = invalid_items
-                        response_data["warning"] = (
-                            f"{len(invalid_items)} item(s) were skipped due to invalid prices or non-sellable status"
-                            if language != "sw"
-                            else f"Bidhaa {len(invalid_items)} zimerukwa kwa sababu ya bei batili"
+                    # Extract document details
+                    doc_entry = None
+                    doc_num = None
+                    success = False
+                    
+                    if isinstance(result, dict):
+                        if result.get("ResultState") is True or result.get("success") is True:
+                            success = True
+                        
+                        inner = result.get("ResponseData", result)
+                        
+                        if isinstance(inner, dict):
+                            doc_entry = (inner.get("DocEntry") or inner.get("doc_entry")
+                                        or inner.get("DocNum") or inner.get("doc_num")
+                                        or inner.get("id") or inner.get("ID"))
+                            doc_num = (inner.get("DocNum") or inner.get("doc_num")
+                                      or inner.get("docNum") or doc_entry)
+                        elif isinstance(inner, list) and len(inner) > 0:
+                            first_item = inner[0]
+                            doc_entry = (first_item.get("DocEntry") or first_item.get("doc_entry")
+                                        or first_item.get("DocNum") or first_item.get("doc_num"))
+                            doc_num = (first_item.get("DocNum") or first_item.get("doc_num")
+                                      or first_item.get("docNum") or doc_entry)
+                    
+                    if success or response.status_code in [200, 201]:
+                        total_amount = formatted["summary"]["total_amount"]
+                        valid_until = formatted["summary"]["valid_until"]
+                        
+                        # Use ResponseFormatter to format the success message
+                        formatted_response = ResponseFormatter.format_quotation_creation_success(
+                            customer_name=customer_name,
+                            items=valid_items,
+                            total_amount=total_amount,
+                            valid_until=valid_until,
+                            doc_num=doc_num,
+                            language=language
                         )
+                        
+                        logger.info(f"✅ Quotation created successfully via {endpoint_url}")
+                        
+                        response_data = {
+                            "success": True,
+                            "DocEntry": doc_entry,
+                            "DocNum": doc_num,
+                            "CardCode": customer_code,
+                            "ValidUntil": valid_until,
+                            "ItemCount": len(valid_items),
+                            "TotalAmount": total_amount,
+                            "valid_items": valid_items,
+                            "endpoint_used": endpoint_url,
+                            "language": language,
+                            "raw_response": result,
+                            "message": formatted_response["message"],
+                            "data": formatted_response["data"]
+                        }
+                        
+                        if invalid_items:
+                            response_data["skipped_items"] = invalid_items
+                            response_data["warning"] = (
+                                f"{len(invalid_items)} item(s) were skipped due to invalid prices or non-sellable status"
+                                if language != "sw"
+                                else f"Bidhaa {len(invalid_items)} zimerukwa kwa sababu ya bei batili"
+                            )
+                        
+                        return response_data
 
-                    return response_data
-
-                # Any other error — surface to caller (don't silently skip)
+                # Handle error responses
                 try:
                     error_json = response.json()
                 except Exception:
@@ -549,22 +632,15 @@ class QuotationService:
                 logger.error(f"   {response.status_code} from {endpoint_url}: {error_json}")
 
                 if response.status_code == 400:
-                    # Bad request — likely a payload validation error; no point trying other endpoints
-                    return {
-                        "success":      False,
-                        "error":        "Bad request — check quotation data" if language != "sw"
-                                        else "Ombi batili. Tafadhali angalia data ya nukuu.",
-                        "details":      error_json,
-                        "skipped_items": invalid_items,
-                        "language":     language,
-                    }
+                    return ResponseFormatter.format_quotation_creation_error(
+                        "Bad request — check quotation data",
+                        invalid_items,
+                        language=language
+                    )
 
                 last_error = {"status": response.status_code, "endpoint": endpoint_url, "details": error_json}
-                # Continue trying other endpoints for other error codes
 
-            # --------------------------------------------------
             # All endpoints exhausted
-            # --------------------------------------------------
             logger.warning("⚠️ All POST endpoints failed for quotations")
             additional_note = (
                 "The API only supports viewing quotations (GET), not creating them (POST)."
@@ -581,16 +657,64 @@ class QuotationService:
 
         except requests.Timeout:
             logger.error("❌ Quotation creation timed out")
-            return {
-                "success":      False,
-                "error":        "Request timed out. Please try again."
-                               if language != "sw" else "Muda umeisha. Tafadhali jaribu tena.",
-                "skipped_items": invalid_items,
-                "language":     language,
-            }
+            return ResponseFormatter.format_quotation_creation_error(
+                "Request timed out. Please try again.",
+                invalid_items,
+                language=language
+            )
         except Exception as e:
             logger.exception("❌ Quotation creation failed unexpectedly")
-            return {"success": False, "error": str(e), "skipped_items": invalid_items, "language": language}
+            return ResponseFormatter.format_quotation_creation_error(
+                str(e),
+                invalid_items,
+                language=language
+            )
+
+    # ==========================================================
+    # GET LATEST QUOTATION
+    # ==========================================================
+    def get_latest_quotation(self, customer_code: str, language: str = "en") -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent quotation for a customer.
+        Useful after creating a quotation when DocNum isn't returned.
+        """
+        try:
+            params = {
+                "CardCode": customer_code,
+                "page": 1,
+                "per_page": 1,
+                "isDoc": 1
+            }
+            
+            response = requests.get(
+                f"{self.base_url}/marketing/docs/{self.SAP_OBJECT_CODE}",
+                headers=self.headers,
+                params=params,
+                timeout=self.timeout,
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                quotations = data.get("ResponseData", data.get("data", [])) if isinstance(data, dict) else data
+                
+                if quotations and len(quotations) > 0:
+                    latest = quotations[0]
+                    doc_status = latest.get("DocStatus")
+                    if doc_status in self.STATUS_MAP:
+                        latest["StatusText"] = self.STATUS_MAP[doc_status].get(language, self.STATUS_MAP[doc_status]["en"])
+                    
+                    doc_entry = latest.get("DocEntry")
+                    if doc_entry:
+                        full_quotation = self.get_quotation(str(doc_entry), language)
+                        if full_quotation:
+                            return full_quotation
+                    
+                    return latest
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error getting latest quotation for {customer_code}: {e}")
+            return None
 
     # ==========================================================
     # WEB FALLBACK RESPONSE

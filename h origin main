@@ -1,0 +1,29 @@
+[33mcommit 0572993e01d80da30106cddb2208e5a5a468effd[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: Deng Arok <dengarok20@gmail.com>
+Date:   Thu Mar 12 14:18:59 2026 +0300
+
+    Major system enhancements and bug fixes
+    
+    ✨ New Features:
+    - Added smart recommendation intents (cross-sell, upsell, seasonal, trending)
+    - Implemented decision support for inventory health and pricing analysis
+    - Enhanced Swahili language support with better product extraction
+    
+    🐛 Bug Fixes:
+    - Fixed intent classification override for cross-sell queries
+    - Removed duplicate 'Hmm...' uncertainty messages from responses
+    - Corrected action router to return structured data instead of formatted messages
+    - Fixed empty response caching issue
+    
+    🔧 Improvements:
+    - Updated conversation enhancer with skip lists for formatted responses
+    - Enhanced entity extraction with original query preservation
+    - Improved fuzzy matching for customer names
+    - Added comprehensive logging throughout the pipeline
+    - Added .gitignore to exclude sensitive and test files
+
+[33mcommit 8e632066a6a90c8cbe0aaedf1d1fea7bfb679aa8[m[33m ([m[1;31morigin/main[m[33m)[m
+Author: Deng Arok <dengarok20@gmail.com>
+Date:   Tue Feb 3 18:11:05 2026 +0300
+
+    first commit

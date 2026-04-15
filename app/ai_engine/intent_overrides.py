@@ -41,6 +41,9 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
     # 🚫 PROTECTED INTENTS - NEVER OVERRIDE THESE
     # =========================================================
     PROTECTED_INTENTS = {
+        "CREATE_QUOTATION",         # CRITICAL: Never override quotation creation
+        "GET_TOP_SELLING_ITEMS",    # CRITICAL: Never override top selling items
+        "GET_SLOW_MOVING_ITEMS",    # CRITICAL: Never override slow moving items
         "GET_CROSS_SELL",           # Never override cross-sell
         "GET_UPSELL",               # Never override upsell
         "GET_SEASONAL_RECOMMENDATIONS",  # Never override seasonal
@@ -99,16 +102,18 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
         return "GET_SEASONAL_RECOMMENDATIONS"
     
     # =========================================================
-    # 📊 TRENDING DETECTION
+    # 📊 TRENDING DETECTION - Don't override top selling/slow moving
     # =========================================================
     trending_patterns = [
         "trending", "popular now", "hot", "best sellers",
-        "most popular", "top selling", "in demand", "what's trending"
+        "most popular", "in demand", "what's trending"
     ]
     
+    # Only apply trending override if it's not already a protected analytics intent
     if any(pattern in original_query for pattern in trending_patterns):
-        logger.info(f"📊 Trending pattern detected - forcing GET_TRENDING_PRODUCTS")
-        return "GET_TRENDING_PRODUCTS"
+        if intent not in ["GET_TOP_SELLING_ITEMS", "GET_SLOW_MOVING_ITEMS"]:
+            logger.info(f"📊 Trending pattern detected - forcing GET_TRENDING_PRODUCTS")
+            return "GET_TRENDING_PRODUCTS"
 
     # ── RULE 1: item + customer → GET_CUSTOMER_PRICE ──────────────────
     # "price of vegimax for magomano" → both entities extracted
@@ -221,6 +226,16 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
                 logger.info(f"🧹 Cleared bogus customer_name='{customer_name}' from recommendation query")
                 entities["customer_name"] = None
                 customer_name = None  # Update local variable too
+
+    # =========================================================
+    # 🚫 BLOCK CROSS-SELL OVERRIDE FOR QUOTATION
+    # =========================================================
+    # If the query contains quotation keywords, prevent cross-sell override
+    quotation_keywords = ["create", "quotation", "quote", "cash sale", "with", "vegimax"]
+    if any(keyword in original_query for keyword in quotation_keywords) and len(original_query.split()) > 8:
+        if intent == "GET_CROSS_SELL":
+            logger.info(f"📝 Quotation pattern detected - overriding GET_CROSS_SELL to CREATE_QUOTATION")
+            return "CREATE_QUOTATION"
 
     if intent != original_intent:
         logger.info(

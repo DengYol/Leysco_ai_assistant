@@ -1,11 +1,34 @@
+"""
+app/services/leysco_api_service.py
+===================================
+Leysco API Service - Enhanced with Business Partner Type Filtering and Pagination
+Optimized with connection pooling, Redis caching, and async support
+"""
+
 import requests
 import logging
 from typing import List, Dict, Optional, Any
 from app.core.config import settings
 from datetime import datetime, timedelta
 import json
+import hashlib
+from functools import lru_cache, wraps
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
+
+# -------------------------------------------------
+# BUSINESS PARTNER TYPES
+# -------------------------------------------------
+BP_TYPES = {
+    "CUSTOMER": "C",
+    "VENDOR": "V",
+    "LEAD": "L",
+    "ALL": None
+}
 
 # -------------------------------------------------
 # SEARCH TERM CLEANER
@@ -17,6 +40,14 @@ STRIP_FROM_SEARCH = {
     "industries", "industry", "international", "brothers", "bros",
     "holdings", "services", "distributors", "distributor",
 }
+
+# Cache TTLs
+CUSTOMER_CACHE_TTL = 300  # 5 minutes
+ITEM_CACHE_TTL = 300       # 5 minutes
+INVENTORY_CACHE_TTL = 120  # 2 minutes
+PRICE_CACHE_TTL = 300      # 5 minutes
+DELIVERY_CACHE_TTL = 60    # 1 minute
+ANALYTICS_CACHE_TTL = 3600  # 1 hour for analytics (less frequent changes)
 
 
 def clean_customer_search_term(name: str) -> str:
@@ -35,10 +66,40 @@ def clean_customer_search_term(name: str) -> str:
     return result or name
 
 
+def cache_api_result(ttl_seconds: int = 300, key_prefix: str = ""):
+    """Decorator to cache API results."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            cache = get_cache_service()
+            
+            # Generate cache key
+            func_name = func.__name__
+            cache_str = f"{key_prefix or func_name}:{str(args)}:{str(sorted(kwargs.items()))}"
+            cache_key = hashlib.md5(cache_str.encode()).hexdigest()
+            
+            # Check cache
+            cached = cache.get_simple(cache_key)
+            if cached is not None:
+                logger.info(f"⚡ API cache hit: {func_name}")
+                return cached
+            
+            # Execute function
+            result = func(self, *args, **kwargs)
+            
+            # Cache result
+            if result:
+                cache.set_simple(cache_key, result, ttl=ttl_seconds)
+            
+            return result
+        return wrapper
+    return decorator
+
+
 class LeyscoAPIService:
     """
     Service to interact with Leysco Sales System APIs
-    AI-Optimized Version with Endpoint Discovery
+    AI-Optimized Version with Business Partner Type Filtering
     """
 
     # Document type mapping for easy reference (based on Sales App)
@@ -55,17 +116,45 @@ class LeyscoAPIService:
         540000006:  "Custom Document Type",
     }
 
-    # Status mapping for documents
+    # Enhanced status mapping for documents
+    STATUS_MAP = {
+        "open": "Pending",
+        "Open": "Pending",
+        "OPEN": "Pending",
+        "bost_Open": "Pending",
+        1: "Pending",
+        "1": "Pending",
+        "closed": "Completed",
+        "Closed": "Completed",
+        "CLOSED": "Completed",
+        "completed": "Completed",
+        "Completed": "Completed",
+        "COMPLETED": "Completed",
+        "delivered": "Completed",
+        "Delivered": "Completed",
+        "DELIVERED": "Completed",
+        "bost_Close": "Completed",
+        2: "Completed",
+        "2": "Completed",
+        "cancelled": "Cancelled",
+        "Cancelled": "Cancelled",
+        "CANCELLED": "Cancelled",
+        3: "Cancelled",
+        "3": "Cancelled",
+        "in_transit": "In Transit",
+        "In Transit": "In Transit",
+        "partial": "Partially Delivered",
+        "Partially Delivered": "Partially Delivered",
+    }
+
     DOC_STATUS_MAP = {
         "open": 1,
-        "closed": 2,
         "pending": 1,
+        "closed": 2,
         "completed": 2,
         "all": None
     }
 
-    # Common endpoint patterns for document creation.
-    # Paths are RELATIVE to base_url (which already includes /api/v1).
     ENDPOINT_PATTERNS = {
         "quotations": [
             "/documents/quotation",
@@ -102,7 +191,6 @@ class LeyscoAPIService:
         ],
     }
 
-    # Known working POST endpoint paths (relative to base_url).
     KNOWN_POST_ENDPOINTS = {
         "quotations": [
             "/documents/quotation",
@@ -121,17 +209,170 @@ class LeyscoAPIService:
             "Authorization": f"Bearer {settings.LEYSCO_API_TOKEN}",
             "Content-Type": "application/json"
         }
+        
+        # Configure session with connection pooling
         self.session = requests.Session()
         self.session.headers.update(self.headers)
-        self.timeout = 30
         
-        # Cache for discovered endpoints
+        # Connection pooling for better performance
+        adapter = HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=20,
+            max_retries=Retry(
+                total=3,
+                backoff_factor=0.3,
+                status_forcelist=[429, 500, 502, 503, 504]
+            )
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
+        self.timeout = 30
+        self._is_authenticated = True
+        
         self._endpoint_cache = {}
         self._last_discovery = None
         
-        # Cache for customer lookups
+        # Caches for different business partner types
         self._customer_cache = {}
         self._customer_cache_time = {}
+        self._vendor_cache = {}
+        self._vendor_cache_time = {}
+        self._lead_cache = {}
+        self._lead_cache_time = {}
+        
+        # Stats tracking
+        self._stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "api_calls": 0,
+            "errors": 0,
+            "auth_errors": 0
+        }
+        
+        # Initialize pricing service lazily to avoid circular imports
+        self._pricing_service = None
+
+    @property
+    def pricing_service(self):
+        """Lazy load pricing service."""
+        if self._pricing_service is None:
+            from app.services.pricing_service import get_pricing_service
+            self._pricing_service = get_pricing_service()
+        return self._pricing_service
+
+    # -------------------------------------------------
+    # AUTHENTICATION HELPERS
+    # -------------------------------------------------
+    
+    def _check_auth(self, response: requests.Response) -> bool:
+        """Check if response indicates authentication failure."""
+        if response.status_code == 401 or response.status_code == 302:
+            self._stats["auth_errors"] += 1
+            logger.warning(f"Authentication issue detected (status {response.status_code})")
+            
+            # Try to re-authenticate if credentials are available
+            if hasattr(settings, 'LEYSCO_USERNAME') and hasattr(settings, 'LEYSCO_PASSWORD'):
+                if self.login(settings.LEYSCO_USERNAME, settings.LEYSCO_PASSWORD):
+                    logger.info("Re-authentication successful")
+                    return True
+            
+            self._is_authenticated = False
+            return False
+        
+        return True
+    
+    def _ensure_auth(self) -> bool:
+        """Ensure we have valid authentication."""
+        if not self._is_authenticated:
+            if hasattr(settings, 'LEYSCO_USERNAME') and hasattr(settings, 'LEYSCO_PASSWORD'):
+                return self.login(settings.LEYSCO_USERNAME, settings.LEYSCO_PASSWORD)
+        return self._is_authenticated
+
+    # -------------------------------------------------
+    # STATS HELPERS
+    # -------------------------------------------------
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get service statistics."""
+        return self._stats.copy()
+    
+    def _record_cache_hit(self):
+        self._stats["cache_hits"] += 1
+    
+    def _record_cache_miss(self):
+        self._stats["cache_misses"] += 1
+    
+    def _record_api_call(self):
+        self._stats["api_calls"] += 1
+    
+    def _record_error(self):
+        self._stats["errors"] += 1
+
+    # -------------------------------------------------
+    # BUSINESS PARTNER TYPE DETECTION (IMPROVED)
+    # -------------------------------------------------
+    def _get_business_partner_type(self, business_partner: Dict) -> str:
+        """
+        Determine business partner type from the data.
+        Checks multiple possible fields and values.
+        """
+        card_type = business_partner.get("CardType") or business_partner.get("card_type") or business_partner.get("Type") or business_partner.get("type")
+        card_name = business_partner.get("CardName", "").lower()
+        
+        if any(word in card_name for word in ["vendor", "supplier"]):
+            return "V"
+        if any(word in card_name for word in ["lead", "prospect"]):
+            return "L"
+        
+        if card_type:
+            card_type_str = str(card_type).upper()
+            if card_type_str in ["C", "CUSTOMER"]:
+                return "C"
+            elif card_type_str in ["V", "VENDOR", "SUPPLIER"]:
+                return "V"
+            elif card_type_str in ["L", "LEAD"]:
+                return "L"
+        
+        group_code = business_partner.get("GroupCode") or business_partner.get("group_code")
+        if group_code:
+            try:
+                gc = int(group_code)
+                if 1 <= gc <= 100:
+                    return "C"
+                elif 101 <= gc <= 200:
+                    return "V"
+                elif 201 <= gc <= 300:
+                    return "L"
+            except:
+                pass
+        
+        return "C"
+    
+    def _is_customer(self, business_partner: Dict) -> bool:
+        return self._get_business_partner_type(business_partner) == "C"
+    
+    def _is_vendor(self, business_partner: Dict) -> bool:
+        return self._get_business_partner_type(business_partner) == "V"
+    
+    def _is_lead(self, business_partner: Dict) -> bool:
+        return self._get_business_partner_type(business_partner) == "L"
+    
+    def _filter_by_bp_type(self, business_partners: List[Dict], bp_type: str) -> List[Dict]:
+        if not business_partners or bp_type is None:
+            return business_partners
+        
+        filtered = []
+        for bp in business_partners:
+            if bp_type == "C" and self._is_customer(bp):
+                filtered.append(bp)
+            elif bp_type == "V" and self._is_vendor(bp):
+                filtered.append(bp)
+            elif bp_type == "L" and self._is_lead(bp):
+                filtered.append(bp)
+        
+        logger.info(f"Filtered {len(filtered)}/{len(business_partners)} business partners for type {bp_type}")
+        return filtered
 
     # -------------------------------------------------
     # DEBUG LOGGER
@@ -147,6 +388,40 @@ class LeyscoAPIService:
             logger.error(f"Debug logging failed: {e}")
 
     # -------------------------------------------------
+    # ENHANCED STATUS HELPER
+    # -------------------------------------------------
+    def _normalize_status(self, status: Any) -> str:
+        if status is None:
+            return "Unknown"
+        
+        if status in self.STATUS_MAP:
+            return self.STATUS_MAP[status]
+        
+        if isinstance(status, (int, float)):
+            status_str = str(int(status))
+            if status_str in self.STATUS_MAP:
+                return self.STATUS_MAP[status_str]
+        
+        if isinstance(status, str):
+            status_lower = status.lower().strip()
+            for key, value in self.STATUS_MAP.items():
+                if isinstance(key, str) and key.lower() == status_lower:
+                    return value
+        
+        if isinstance(status, str):
+            status_lower = status.lower()
+            if "close" in status_lower or "complete" in status_lower or "deliver" in status_lower:
+                return "Completed"
+            if "open" in status_lower or "pend" in status_lower:
+                return "Pending"
+            if "cancel" in status_lower:
+                return "Cancelled"
+            if "transit" in status_lower or "partial" in status_lower:
+                return "In Transit"
+        
+        return str(status)
+
+    # -------------------------------------------------
     # RESPONSE NORMALIZER
     # -------------------------------------------------
     def _normalize(self, data):
@@ -155,26 +430,61 @@ class LeyscoAPIService:
 
         response_data = data.get("ResponseData") or data.get("responseData")
 
+        if isinstance(response_data, dict) and "stocks" in response_data:
+            stocks = response_data["stocks"]
+            if isinstance(stocks, dict) and "data" in stocks:
+                return stocks["data"]
+        
         if isinstance(response_data, dict):
-            # Standard paginated: ResponseData.data
             records = response_data.get("data")
             if isinstance(records, list):
                 return records
-
-            # Inventory report: ResponseData.stocks.data
-            stocks = response_data.get("stocks")
-            if isinstance(stocks, dict):
-                records = stocks.get("data")
-                if isinstance(records, list):
-                    return records
 
         if isinstance(response_data, list):
             return response_data
 
         if isinstance(data.get("data"), list):
             return data["data"]
+        
+        if isinstance(data.get("items"), list):
+            return data["items"]
+        
+        if isinstance(data.get("ResponseData"), list):
+            return data["ResponseData"]
 
         return []
+
+    def _normalize_warehouse_response(self, data: dict) -> List[Dict]:
+        """Normalize warehouse response from the /warehouse endpoint."""
+        try:
+            # Check if response is in the standard Leysco format
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                if isinstance(response_data, dict):
+                    # Check for data array
+                    if "data" in response_data:
+                        return response_data["data"]
+                    # Check for warehouses array
+                    elif "warehouses" in response_data:
+                        return response_data["warehouses"]
+                elif isinstance(response_data, list):
+                    return response_data
+            
+            # Check for direct data array
+            if isinstance(data.get("data"), list):
+                return data["data"]
+            
+            # Check if the response itself is a list
+            if isinstance(data, list):
+                return data
+            
+            # If we got here, return empty list
+            logger.warning(f"Unknown warehouse response format: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error normalizing warehouse response: {e}")
+            return []
 
     def _apply_limit(self, records: List[Dict], limit: Optional[int]) -> List[Dict]:
         return records[:limit] if limit and isinstance(limit, int) and limit > 0 else records
@@ -188,654 +498,14 @@ class LeyscoAPIService:
         return None
 
     # -------------------------------------------------
-    # CUSTOMER LOOKUP WITH CACHING
-    # -------------------------------------------------
-    def resolve_customer(self, customer_name: str, use_cache: bool = True) -> Optional[Dict]:
-        """
-        Resolve customer name to full customer details with caching.
-        Returns customer dict with CardCode, CardName, etc.
-        """
-        if not customer_name:
-            return None
-        
-        # Clean the search term
-        cleaned_name = clean_customer_search_term(customer_name)
-        
-        # Check cache first
-        if use_cache and cleaned_name in self._customer_cache:
-            cache_time = self._customer_cache_time.get(cleaned_name)
-            if cache_time and (datetime.now() - cache_time) < timedelta(minutes=5):
-                logger.info(f"📦 Using cached customer: {cleaned_name}")
-                return self._customer_cache[cleaned_name]
-        
-        # Search for customer
-        customers = self.get_customers(search=cleaned_name, limit=5)
-        if not customers:
-            logger.warning(f"⚠️ Customer '{customer_name}' not found")
-            return None
-        
-        # Find best match
-        best_match = None
-        for customer in customers:
-            card_name = customer.get("CardName", "").lower()
-            # Exact match first
-            if cleaned_name.lower() == card_name:
-                best_match = customer
-                break
-            # Partial match
-            if cleaned_name.lower() in card_name:
-                if not best_match:
-                    best_match = customer
-                elif len(card_name) < len(best_match.get("CardName", "").lower()):
-                    best_match = customer
-        
-        if not best_match:
-            best_match = customers[0]
-        
-        # Cache the result
-        if best_match and use_cache:
-            self._customer_cache[cleaned_name] = best_match
-            self._customer_cache_time[cleaned_name] = datetime.now()
-            logger.info(f"✅ Cached customer: {cleaned_name} → {best_match.get('CardCode')}")
-        
-        return best_match
-
-    # -------------------------------------------------
-    # ENHANCED ENDPOINT DISCOVERY
-    # -------------------------------------------------
-    def _options_methods(self, url: str) -> List[str]:
-        """
-        Send OPTIONS to a URL and return the list of advertised methods.
-        Returns an empty list (not None) on any failure or missing Allow header.
-        NOTE: many SAP/Laravel proxies do NOT advertise POST in Allow even when
-        POST works fine — callers must not treat an empty list as "POST blocked".
-        """
-        try:
-            resp = self.session.options(url, timeout=5)
-            if resp.status_code == 200:
-                allow = resp.headers.get("Allow", "")
-                if allow:
-                    return [m.strip() for m in allow.split(",")]
-        except Exception as e:
-            logger.debug(f"OPTIONS request failed for {url}: {e}")
-        return []
-
-    def discover_endpoints(self, force_refresh: bool = False) -> Dict[str, Any]:
-        """
-        Discover available API endpoints and their supported methods.
-        Caches results for 1 hour to avoid repeated discovery calls.
-
-        FIX: OPTIONS-based discovery is kept for information only.
-             We no longer *gate* POST on the OPTIONS result because SAP B1 /
-             Laravel API proxies commonly omit POST from the Allow header even
-             when POST is fully supported.  Instead we fall back to the
-             KNOWN_POST_ENDPOINTS list so that create_quotation() always has a
-             URL to try.
-        """
-        # Check cache first
-        if not force_refresh and self._endpoint_cache:
-            cache_age = datetime.now() - self._last_discovery if self._last_discovery else timedelta(hours=1)
-            if cache_age < timedelta(hours=1):
-                logger.info("📦 Using cached endpoint discovery")
-                return self._endpoint_cache
-
-        logger.info("🔍 Discovering API endpoints...")
-        discovery_result = {
-            "quotations": {"get": None, "create": None, "supported_methods": [], "doc_type": 23},
-            "orders": {"get": None, "create": None, "supported_methods": [], "doc_type": 17},
-            "invoices": {"get": None, "create": None, "supported_methods": [], "doc_type": 13},
-            "deliveries": {"get": None, "create": None, "supported_methods": [], "doc_type": 15},
-            "documents": {"get": None, "create": None, "supported_methods": [], "available_endpoints": []},
-            "customers": {"get": None, "create": None},
-            "items": {"get": None},
-        }
-
-        # ----------------------------------------------------------
-        # Step 1: confirm the known GET endpoints are reachable
-        # ----------------------------------------------------------
-        known_get_endpoints = {
-            "quotations": "/marketing/docs/23",
-            "orders": "/marketing/docs/17",
-            "invoices": "/marketing/docs/13",
-            "deliveries": "/marketing/docs/15",
-            "customers": "/bp_masterdata",
-            "items": "/item_masterdata",
-        }
-
-        for doc_type, endpoint in known_get_endpoints.items():
-            try:
-                url = f"{self.base_url}{endpoint}"
-                resp = self.session.head(url, timeout=5, allow_redirects=True)
-                if resp.status_code < 400:
-                    discovery_result[doc_type]["get"] = endpoint
-                    logger.info(f"✅ Found GET endpoint for {doc_type}: {endpoint}")
-
-                    # OPTIONS is informational only — do NOT gate anything on it
-                    methods = self._options_methods(url)
-                    if methods:
-                        discovery_result[doc_type]["supported_methods"] = methods
-                        logger.info(f"   OPTIONS-advertised methods: {methods}")
-                    else:
-                        discovery_result[doc_type]["supported_methods"] = ["GET"]
-            except Exception as e:
-                logger.debug(f"Could not test {doc_type} endpoint {endpoint}: {e}")
-
-        # ----------------------------------------------------------
-        # Step 2: try to discover CREATE endpoints via OPTIONS
-        # (informational — we fall back if nothing is found)
-        # ----------------------------------------------------------
-        for doc_type, patterns in self.ENDPOINT_PATTERNS.items():
-            for pattern in patterns:
-                if pattern in known_get_endpoints.values():
-                    continue  # already handled above
-
-                try:
-                    url = f"{self.base_url}{pattern}"
-                    methods = self._options_methods(url)
-
-                    if "/documents/" in pattern:
-                        discovery_result["documents"]["available_endpoints"].append({
-                            "url": pattern,
-                            "methods": methods
-                        })
-                        if "POST" in methods and not discovery_result["documents"]["create"]:
-                            discovery_result["documents"]["create"] = pattern
-                            discovery_result["documents"]["supported_methods"] = methods
-
-                    if doc_type in discovery_result and "POST" in methods:
-                        if not discovery_result[doc_type]["create"]:
-                            discovery_result[doc_type]["create"] = pattern
-                            discovery_result[doc_type]["supported_methods"] = methods
-                            logger.info(f"✅ OPTIONS confirmed POST endpoint for {doc_type}: {pattern}")
-                except Exception:
-                    continue
-
-        # ----------------------------------------------------------
-        # Step 3 (FIX): hardcoded fallback for any doc type whose
-        # create endpoint is still None after OPTIONS discovery.
-        # We trust KNOWN_POST_ENDPOINTS because OPTIONS is unreliable
-        # on this server stack.
-        # ----------------------------------------------------------
-        for doc_type, fallback_list in self.KNOWN_POST_ENDPOINTS.items():
-            if discovery_result.get(doc_type, {}).get("create"):
-                continue  # already found via OPTIONS — nothing to do
-
-            logger.warning(
-                f"⚠️ OPTIONS discovery found no POST endpoint for '{doc_type}'. "
-                f"Falling back to hardcoded list."
-            )
-            for fallback_ep in fallback_list:
-                discovery_result[doc_type]["create"] = fallback_ep
-                logger.info(f"   Using hardcoded POST endpoint for {doc_type}: {fallback_ep}")
-                break  # use the first one; create_quotation() will try them in order
-
-        self._endpoint_cache = discovery_result
-        self._last_discovery = datetime.now()
-        return discovery_result
-
-    def get_endpoint_for_document(self, doc_type: str, action: str = "get") -> Optional[str]:
-        """
-        Get the appropriate endpoint for a document type and action.
-        """
-        discovery = self.discover_endpoints()
-        if doc_type in discovery:
-            return discovery[doc_type].get(action)
-        return None
-
-    def check_endpoint_supports_post(self, endpoint: str) -> bool:
-        """
-        Check if an endpoint supports POST requests.
-
-        FIX: This method previously returned False when the server did not
-        advertise POST in the Allow header, which blocked valid endpoints.
-        We now return True optimistically and let the actual POST attempt
-        surface any real 405 errors.
-        """
-        try:
-            url = f"{self.base_url}{endpoint}"
-            resp = self.session.options(url, timeout=5)
-            if resp.status_code == 200:
-                allow = resp.headers.get("Allow", "")
-                if allow:
-                    # Only return False when the server *explicitly* excludes POST
-                    if "POST" in allow:
-                        return True
-                    # Allow header present but POST missing — still try optimistically
-                    logger.debug(
-                        f"OPTIONS for {endpoint} returned Allow: {allow!r} "
-                        f"(no POST listed). Will attempt POST anyway."
-                    )
-                    return True
-        except Exception as e:
-            logger.debug(f"Could not OPTIONS-check endpoint {endpoint}: {e}")
-        # No OPTIONS response — attempt POST optimistically
-        return True
-
-    # -------------------------------------------------
-    # ENHANCED CUSTOMER ORDERS METHOD
-    # -------------------------------------------------
-    def get_customer_orders(
-        self,
-        customer_name: str,
-        limit: Optional[int] = 25,
-        doc_status: Optional[str] = "open",
-        include_details: bool = True
-    ) -> List[Dict]:
-        try:
-            logger.info(f"📋 Fetching sales orders for customer: {customer_name}")
-            
-            customer = self.resolve_customer(customer_name)
-            if not customer:
-                logger.warning(f"⚠️ Customer '{customer_name}' not found")
-                return []
-
-            customer_code = customer.get("CardCode")
-            customer_name_resolved = customer.get("CardName", customer_name)
-            
-            logger.info(f"✅ Resolved customer: {customer_name_resolved} ({customer_code})")
-
-            status_value = self.DOC_STATUS_MAP.get(doc_status.lower()) if doc_status else None
-
-            params = {
-                "isDoc": 1,
-                "page": 1,
-                "per_page": min(limit, 100) if limit else 25,
-                "CardCode": customer_code
-            }
-            
-            if status_value is not None:
-                params["DocStatus"] = status_value
-
-            url = f"{self.base_url}/marketing/docs/17"
-            logger.info(f"📤 Calling API: {url} with params: {params}")
-            
-            resp = self.session.get(url, params=params, timeout=20)
-            self._debug_response("CUSTOMER SALES ORDERS", resp)
-            
-            if resp.status_code == 200:
-                orders = self._normalize(resp.json())
-                logger.info(f"✅ Found {len(orders)} orders for {customer_name_resolved}")
-                
-                enhanced_orders = []
-                for order in orders[:limit] if limit else orders:
-                    enhanced_order = {
-                        "DocNum": order.get("DocNum") or order.get("doc_num"),
-                        "DocEntry": order.get("DocEntry") or order.get("doc_entry"),
-                        "DocDate": order.get("DocDate") or order.get("doc_date"),
-                        "DocDueDate": order.get("DocDueDate") or order.get("doc_due_date"),
-                        "DocTotal": float(order.get("DocTotal") or order.get("doc_total") or 0),
-                        "DocCurrency": order.get("DocCurrency") or "KES",
-                        "DocStatus": order.get("DocStatus") or order.get("doc_status"),
-                        "StatusText": self._get_status_text(order.get("DocStatus")),
-                        "CustomerName": customer_name_resolved,
-                        "CustomerCode": customer_code,
-                        "DocumentLines": order.get("DocumentLines", []) if include_details else [],
-                        "LineCount": len(order.get("DocumentLines", [])),
-                        "Comments": order.get("Comments", ""),
-                    }
-                    enhanced_orders.append(enhanced_order)
-                
-                return enhanced_orders
-            else:
-                logger.error(f"❌ API error: {resp.status_code} - {resp.text[:200]}")
-                return []
-
-        except Exception as e:
-            logger.error(f"❌ Error fetching customer orders: {e}")
-            return []
-
-    # -------------------------------------------------
-    # ENHANCED CUSTOMER QUOTATIONS METHOD
-    # -------------------------------------------------
-    def get_customer_quotations(
-        self,
-        customer_name: str,
-        limit: int = 20,
-        status: Optional[str] = None,
-        include_details: bool = True
-    ) -> List[Dict]:
-        try:
-            logger.info(f"📋 Fetching quotations for customer: {customer_name}")
-            
-            customer = self.resolve_customer(customer_name)
-            if not customer:
-                logger.warning(f"⚠️ Customer '{customer_name}' not found")
-                return []
-
-            card_code = customer.get("CardCode")
-            customer_name_resolved = customer.get("CardName", customer_name)
-
-            params = {
-                "isDoc": 1,
-                "page": 1,
-                "per_page": min(limit, 100),
-                "IsICT": "N",
-                "CardCode": card_code
-            }
-            
-            if status and status.lower() == "open":
-                params["DocStatus"] = 1
-            elif status and status.lower() == "closed":
-                params["DocStatus"] = 2
-
-            url = f"{self.base_url}/marketing/docs/23"
-            logger.info(f"📤 Calling API: {url} with params: {params}")
-            
-            response = self.session.get(url, params=params, timeout=20)
-            self._debug_response("CUSTOMER QUOTATIONS", response)
-            
-            if response.status_code == 200:
-                quotations = self._normalize(response.json())
-                logger.info(f"✅ Found {len(quotations)} quotations for {customer_name_resolved}")
-                
-                enhanced_quotations = []
-                for quote in quotations[:limit]:
-                    enhanced_quote = {
-                        "DocNum": quote.get("DocNum") or quote.get("doc_num"),
-                        "DocEntry": quote.get("DocEntry") or quote.get("doc_entry"),
-                        "DocDate": quote.get("DocDate") or quote.get("doc_date"),
-                        "DocDueDate": quote.get("DocDueDate") or quote.get("doc_due_date"),
-                        "DocTotal": float(quote.get("DocTotal") or quote.get("doc_total") or 0),
-                        "DocCurrency": quote.get("DocCurrency") or "KES",
-                        "DocStatus": quote.get("DocStatus") or quote.get("doc_status"),
-                        "StatusText": self._get_status_text(quote.get("DocStatus")),
-                        "CustomerName": customer_name_resolved,
-                        "CustomerCode": card_code,
-                        "DocumentLines": quote.get("DocumentLines", []) if include_details else [],
-                        "LineCount": len(quote.get("DocumentLines", [])),
-                        "Comments": quote.get("Comments", ""),
-                    }
-                    enhanced_quotations.append(enhanced_quote)
-                
-                return enhanced_quotations
-            else:
-                logger.error(f"❌ API error: {response.status_code}")
-                return []
-
-        except Exception as e:
-            logger.error(f"❌ Error fetching customer quotations: {e}")
-            return []
-
-    # -------------------------------------------------
-    # GET ALL CUSTOMER DOCUMENTS
-    # -------------------------------------------------
-    def get_customer_documents(
-        self,
-        customer_name: str,
-        doc_types: List[int] = None,
-        limit_per_type: int = 10,
-        include_details: bool = False
-    ) -> Dict[str, List[Dict]]:
-        if doc_types is None:
-            doc_types = [17, 23, 13, 15]
-        
-        result = {}
-        
-        for doc_type in doc_types:
-            type_name = self.DOC_TYPES.get(doc_type, f"Type {doc_type}")
-            
-            if doc_type == 17:
-                docs = self.get_customer_orders(customer_name, limit_per_type, include_details=include_details)
-            elif doc_type == 23:
-                docs = self.get_customer_quotations(customer_name, limit_per_type, include_details=include_details)
-            elif doc_type in [13, 15]:
-                customer = self.resolve_customer(customer_name)
-                if customer:
-                    card_code = customer.get("CardCode")
-                    docs = self.fetch_marketing_docs(card_code, doc_type)
-                    enhanced_docs = []
-                    for doc in docs[:limit_per_type]:
-                        enhanced_docs.append({
-                            "DocNum": doc.get("DocNum"),
-                            "DocDate": doc.get("DocDate"),
-                            "DocTotal": float(doc.get("DocTotal", 0)),
-                            "CustomerName": customer.get("CardName"),
-                            "CustomerCode": card_code,
-                        })
-                    docs = enhanced_docs
-                else:
-                    docs = []
-            else:
-                docs = []
-            
-            result[type_name] = docs
-        
-        return result
-
-    # -------------------------------------------------
-    # HELPER: Get Status Text
-    # -------------------------------------------------
-    def _get_status_text(self, status_code) -> str:
-        if status_code in [1, "1", "bost_Open"]:
-            return "Open"
-        elif status_code in [2, "2", "bost_Close"]:
-            return "Closed"
-        elif status_code in [3, "3"]:
-            return "Cancelled"
-        else:
-            return str(status_code) if status_code else "Unknown"
-
-    # -------------------------------------------------
-    # ENHANCED QUOTATION CREATION
-    # -------------------------------------------------
-    def create_quotation(self, quotation_data: dict) -> Dict[str, Any]:
-        """
-        Create a new quotation.
-
-        FIX: No longer gates the POST attempt on check_endpoint_supports_post().
-        Instead we try each known POST endpoint in order and surface the first
-        successful response (2xx) or the last error.
-        """
-        # Resolve the create endpoint from discovery (which now always returns one)
-        create_endpoint = self.get_endpoint_for_document("quotations", "create")
-
-        # Also collect the full ordered fallback list in case the primary fails
-        fallback_endpoints = list(self.KNOWN_POST_ENDPOINTS.get("quotations", []))
-
-        # Ensure the discovered endpoint is first in the list
-        if create_endpoint and create_endpoint not in fallback_endpoints:
-            fallback_endpoints.insert(0, create_endpoint)
-        elif create_endpoint:
-            fallback_endpoints.remove(create_endpoint)
-            fallback_endpoints.insert(0, create_endpoint)
-
-        if not fallback_endpoints:
-            logger.warning("⚠️ No POST endpoint available for quotations")
-            return self._quotation_no_endpoint_response()
-
-        # Prepare the payload once
-        if "DocumentLines" not in quotation_data:
-            quotation_data = self._format_quotation_for_api(quotation_data)
-
-        if "metadata" not in quotation_data:
-            quotation_data["metadata"] = {
-                "source": "AI Assistant",
-                "timestamp": datetime.now().isoformat()
-            }
-
-        last_error = None
-
-        for endpoint in fallback_endpoints:
-            url = f"{self.base_url}{endpoint}"
-            logger.info(f"📤 Attempting quotation POST at {url}")
-
-            try:
-                resp = self.session.post(url, json=quotation_data, timeout=self.timeout)
-                self._debug_response("CREATE QUOTATION", resp)
-
-                if resp.status_code in [200, 201]:
-                    response_data = resp.json()
-                    return {
-                        "success": True,
-                        "data": response_data,
-                        "endpoint_used": endpoint,
-                        "DocNum": response_data.get("DocNum") or response_data.get("doc_num"),
-                        "message": "Quotation created successfully"
-                    }
-
-                # 405 = this endpoint definitely doesn't support POST; try next
-                if resp.status_code == 405:
-                    logger.warning(f"   405 Method Not Allowed at {endpoint} — trying next")
-                    last_error = f"405 from {endpoint}"
-                    continue
-
-                # Any other error — record it but try the next endpoint too
-                try:
-                    error_details = resp.json()
-                except Exception:
-                    error_details = resp.text[:500]
-
-                last_error = {
-                    "status": resp.status_code,
-                    "endpoint": endpoint,
-                    "details": error_details,
-                }
-                logger.warning(f"   {resp.status_code} from {endpoint}: {error_details}")
-
-            except Exception as e:
-                logger.error(f"   Exception POSTing to {endpoint}: {e}")
-                last_error = str(e)
-                continue
-
-        # All endpoints exhausted
-        logger.warning("⚠️ All POST endpoints failed for quotations")
-        discovery = self.discover_endpoints()
-        return {
-            "success": False,
-            "error": "Quotation creation via API is not available",
-            "last_error": last_error,
-            "tried_endpoints": fallback_endpoints,
-            "supported_methods": discovery.get("quotations", {}).get("supported_methods", ["GET"]),
-            "available_endpoints": discovery.get("documents", {}).get("available_endpoints", []),
-            "web_interface_instructions": {
-                "message": "Please create quotations through the web interface:",
-                "steps": [
-                    "1️⃣ Go to Sales → Quotations in the Leysco web application",
-                    "2️⃣ Click 'New Quotation' button",
-                    "3️⃣ Select customer and add items",
-                    "4️⃣ Save and send to customer"
-                ],
-                "api_limitation": "The current API only supports viewing quotations (GET), not creating them (POST).",
-                "contact_admin": "Contact your system administrator to enable quotation creation via API if needed."
-            },
-            "discovery_results": discovery.get("quotations", {})
-        }
-
-    def _quotation_no_endpoint_response(self) -> Dict[str, Any]:
-        return {
-            "success": False,
-            "error": "No quotation creation endpoint configured",
-            "web_interface_instructions": {
-                "message": "Please create quotations through the web interface.",
-            }
-        }
-
-    def _format_quotation_for_api(self, data: dict) -> dict:
-        """Format quotation data to match expected API format."""
-        formatted = {
-            "CardCode": data.get("customer_code") or data.get("CardCode"),
-            "DocDate": data.get("doc_date") or datetime.now().strftime("%Y-%m-%d"),
-            "DocDueDate": data.get("valid_until") or (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d"),
-            "Comments": data.get("comments", ""),
-            "DocumentLines": [],
-            "DocType": 23,
-        }
-
-        simplified = {
-            "customerCode": data.get("customer_code") or data.get("CardCode"),
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "validUntil": (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d"),
-            "notes": data.get("comments", ""),
-            "items": [],
-            "documentType": "QUOTATION"
-        }
-
-        for item in data.get("items", []):
-            main_line = {
-                "ItemCode": item.get("ItemCode") or item.get("item_code"),
-                "ItemName": item.get("ItemName") or item.get("item_name"),
-                "Quantity": float(item.get("Quantity") or item.get("quantity", 1)),
-                "UnitPrice": float(item.get("Price") or item.get("price", 0)),
-                "LineTotal": float(item.get("LineTotal") or
-                                   (item.get("Quantity", 1) * item.get("Price", 0))),
-                "WarehouseCode": item.get("Warehouse", "01"),
-            }
-            formatted["DocumentLines"].append(main_line)
-
-            simplified_line = {
-                "itemCode": item.get("ItemCode") or item.get("item_code"),
-                "itemName": item.get("ItemName") or item.get("item_name"),
-                "quantity": float(item.get("Quantity") or item.get("quantity", 1)),
-                "price": float(item.get("Price") or item.get("price", 0)),
-                "total": float(item.get("Quantity", 1) * item.get("Price", 0))
-            }
-            simplified["items"].append(simplified_line)
-
-        return {
-            "main": formatted,
-            "simplified": simplified,
-            "summary": {
-                "customer_code": data.get("customer_code") or data.get("CardCode"),
-                "item_count": len(data.get("items", [])),
-                "total_amount": sum(
-                    item.get("Quantity", 1) * item.get("Price", 0)
-                    for item in data.get("items", [])
-                ),
-                "valid_until": (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-            }
-        }
-
-    # -------------------------------------------------
-    # SALES ORDER CREATION
-    # -------------------------------------------------
-    def create_sales_order(self, order_data: dict) -> Dict[str, Any]:
-        """Create a new sales order."""
-        create_endpoint = self.get_endpoint_for_document("orders", "create")
-        
-        if create_endpoint:
-            url = f"{self.base_url}{create_endpoint}"
-            try:
-                if "DocumentLines" not in order_data:
-                    order_data = self._format_order_for_api(order_data)
-                
-                resp = self.session.post(url, json=order_data, timeout=self.timeout)
-                if resp.status_code in [200, 201]:
-                    return {"success": True, "data": resp.json()}
-                return {"success": False, "error": f"API returned {resp.status_code}"}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-        
-        return {
-            "success": False,
-            "error": "Sales order creation via API is not available",
-            "web_interface": "Please create orders through Sales → Orders in the web interface"
-        }
-
-    def _format_order_for_api(self, data: dict) -> dict:
-        return {
-            "CardCode": data.get("customer_code"),
-            "DocDate": datetime.now().strftime("%Y-%m-%d"),
-            "DocDueDate": data.get("delivery_date", datetime.now().strftime("%Y-%m-%d")),
-            "Comments": data.get("comments", ""),
-            "DocumentLines": [
-                {
-                    "ItemCode": item.get("ItemCode"),
-                    "Quantity": float(item.get("Quantity", 1)),
-                    "UnitPrice": float(item.get("Price", 0)),
-                    "WarehouseCode": item.get("Warehouse", "01"),
-                }
-                for item in data.get("items", [])
-            ],
-            "DocType": 17,
-        }
-
-    # -------------------------------------------------
     # AUTHENTICATION
     # -------------------------------------------------
     def login(self, username: str, password: str) -> bool:
+        """Authenticate with the API and store token."""
         try:
             url = f"{self.base_url}/auth/login"
             payload = {"username": username, "password": password}
+            self._record_api_call()
             resp = self.session.post(url, json=payload, timeout=self.timeout)
             self._debug_response("LOGIN", resp)
 
@@ -845,798 +515,1107 @@ class LeyscoAPIService:
                 if token:
                     self.headers["Authorization"] = f"Bearer {token}"
                     self.session.headers.update(self.headers)
+                    self._is_authenticated = True
                     logger.info("✅ Successfully authenticated with CRM")
                     return True
             logger.error(f"❌ Login failed: {resp.status_code}")
+            self._is_authenticated = False
             return False
         except Exception as e:
+            self._record_error()
             logger.error(f"❌ Login error: {e}")
+            self._is_authenticated = False
             return False
 
     # -------------------------------------------------
-    # CRM DASHBOARD ENDPOINTS
+    # ENHANCED CUSTOMER/VENDOR/LEAD METHODS WITH PAGINATION
     # -------------------------------------------------
-    def get_crm_data_summary(self, start_date: str, end_date: str) -> Dict[str, Any]:
+    
+    @cache_api_result(ttl_seconds=CUSTOMER_CACHE_TTL)
+    def get_customers(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
+        """Get customers only (excludes vendors and leads) with caching."""
         try:
-            url = f"{self.base_url}/crm/data-summary"
-            params = {"startdate": start_date, "enddate": end_date}
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("CRM DATA SUMMARY", resp)
-            resp.raise_for_status()
-            return resp.json()
+            if not self._ensure_auth():
+                return []
+                
+            if search and search.lower() in ["all", "all customers", "customers", "customer", "show", "list", "display"]:
+                search = ""
+            
+            cleaned_search = clean_customer_search_term(search) if search else ""
+            
+            all_customers = []
+            page = 1
+            per_page = 200
+            
+            while True:
+                url = f"{self.base_url}/bp_masterdata"
+                params = {"page": page, "per_page": per_page}
+                if cleaned_search:
+                    params["search"] = cleaned_search
+                
+                logger.info(f"📄 Fetching customers page {page}")
+                self._record_api_call()
+                resp = self.session.get(url, params=params, timeout=30)
+                
+                if not self._check_auth(resp):
+                    # Retry with new auth
+                    resp = self.session.get(url, params=params, timeout=30)
+                
+                if resp.status_code != 200:
+                    logger.error(f"Failed to fetch customers page {page}: {resp.status_code}")
+                    break
+                
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.error(f"Failed to parse customers JSON: {e}")
+                    break
+                
+                if data.get("ResultState") and data.get("ResponseData"):
+                    response_data = data["ResponseData"]
+                    if isinstance(response_data, dict):
+                        partners = response_data.get("data", [])
+                        pagination = {
+                            "current_page": response_data.get("current_page", 1),
+                            "last_page": response_data.get("last_page", 1),
+                            "total": response_data.get("total", 0)
+                        }
+                    else:
+                        partners = response_data if isinstance(response_data, list) else []
+                        pagination = {"current_page": page, "last_page": 1, "total": len(partners)}
+                else:
+                    partners = self._normalize(data)
+                    pagination = {"current_page": page, "last_page": 1, "total": len(partners)}
+                
+                if not partners:
+                    logger.info(f"No more customers on page {page}")
+                    break
+                
+                page_customers = [p for p in partners if self._is_customer(p)]
+                all_customers.extend(page_customers)
+                logger.info(f"Page {page}: Found {len(page_customers)} customers (total: {len(all_customers)})")
+                
+                if page >= pagination.get("last_page", 1):
+                    break
+                page += 1
+                
+                if limit and len(all_customers) >= limit:
+                    all_customers = all_customers[:limit]
+                    break
+            
+            all_customers.sort(key=lambda x: x.get("CardName", ""))
+            logger.info(f"✅ Retrieved {len(all_customers)} total customers")
+            return all_customers
+            
         except Exception as e:
-            logger.error(f"Failed to fetch CRM data summary: {e}")
-            return {}
-
-    def get_crm_time_series(self, start_date: str, end_date: str, granularity: str = "monthly") -> List[Dict]:
+            self._record_error()
+            logger.error(f"Failed to fetch customers: {e}", exc_info=True)
+            return []
+    
+    def get_all_customers(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
+        """
+        Get all customers (alias for get_customers).
+        Used by entity extractor for customer name resolution.
+        """
+        return self.get_customers(search=search, limit=limit)
+    
+    def get_vendors(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
+        """Get vendors only."""
         try:
-            url = f"{self.base_url}/crm/time-series"
-            params = {"startdate": start_date, "enddate": end_date, "granularity": granularity}
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("CRM TIME SERIES", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
+            if not self._ensure_auth():
+                return []
+            
+            all_vendors = []
+            page = 1
+            per_page = 200
+            
+            while True:
+                url = f"{self.base_url}/bp_masterdata"
+                params = {"page": page, "per_page": per_page}
+                if search:
+                    params["search"] = search
+                
+                self._record_api_call()
+                resp = self.session.get(url, params=params, timeout=30)
+                
+                if not self._check_auth(resp):
+                    resp = self.session.get(url, params=params, timeout=30)
+                
+                if resp.status_code != 200:
+                    break
+                
+                data = resp.json()
+                partners = self._normalize(data)
+                
+                if not partners:
+                    break
+                
+                page_vendors = [p for p in partners if self._is_vendor(p)]
+                all_vendors.extend(page_vendors)
+                
+                if len(partners) < per_page:
+                    break
+                page += 1
+                
+                if limit and len(all_vendors) >= limit:
+                    all_vendors = all_vendors[:limit]
+                    break
+            
+            return all_vendors
+            
         except Exception as e:
-            logger.error(f"Failed to fetch CRM time series: {e}")
+            self._record_error()
+            logger.error(f"Failed to fetch vendors: {e}")
+            return []
+    
+    def get_leads(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
+        """Get leads only."""
+        try:
+            if not self._ensure_auth():
+                return []
+            
+            all_leads = []
+            page = 1
+            per_page = 200
+            
+            while True:
+                url = f"{self.base_url}/bp_masterdata"
+                params = {"page": page, "per_page": per_page}
+                if search:
+                    params["search"] = search
+                
+                self._record_api_call()
+                resp = self.session.get(url, params=params, timeout=30)
+                
+                if not self._check_auth(resp):
+                    resp = self.session.get(url, params=params, timeout=30)
+                
+                if resp.status_code != 200:
+                    break
+                
+                data = resp.json()
+                partners = self._normalize(data)
+                
+                if not partners:
+                    break
+                
+                page_leads = [p for p in partners if self._is_lead(p)]
+                all_leads.extend(page_leads)
+                
+                if len(partners) < per_page:
+                    break
+                page += 1
+                
+                if limit and len(all_leads) >= limit:
+                    all_leads = all_leads[:limit]
+                    break
+            
+            return all_leads
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Failed to fetch leads: {e}")
             return []
 
-    def get_top_branches(self, start_date: str, end_date: str, limit: int = 10) -> List[Dict]:
+    def get_all_business_partners(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
+        """Get all business partners (customers, vendors, leads)."""
         try:
-            url = f"{self.base_url}/crm/top-branches"
-            params = {"startdate": start_date, "enddate": end_date, "limit": limit}
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("TOP BRANCHES", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
+            if not self._ensure_auth():
+                return []
+            
+            all_partners = []
+            page = 1
+            per_page = 200
+            
+            while True:
+                url = f"{self.base_url}/bp_masterdata"
+                params = {"page": page, "per_page": per_page}
+                if search:
+                    params["search"] = search
+                
+                self._record_api_call()
+                resp = self.session.get(url, params=params, timeout=30)
+                
+                if not self._check_auth(resp):
+                    resp = self.session.get(url, params=params, timeout=30)
+                
+                if resp.status_code != 200:
+                    break
+                
+                data = resp.json()
+                partners = self._normalize(data)
+                
+                if not partners:
+                    break
+                
+                all_partners.extend(partners)
+                
+                if len(partners) < per_page:
+                    break
+                page += 1
+                
+                if limit and len(all_partners) >= limit:
+                    all_partners = all_partners[:limit]
+                    break
+            
+            return all_partners
+            
         except Exception as e:
-            logger.error(f"Failed to fetch top branches: {e}")
+            self._record_error()
+            logger.error(f"Failed to fetch business partners: {e}")
             return []
 
-    def get_top_salespersons(self, start_date: str, end_date: str, limit: int = 10) -> List[Dict]:
-        try:
-            url = f"{self.base_url}/crm/top-salespersons"
-            params = {"startdate": start_date, "enddate": end_date, "limit": limit}
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("TOP SALESPERSONS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch top salespersons: {e}")
-            return []
-
-    def get_slow_products(self, page: int = 1, per_page: int = 10) -> List[Dict]:
-        try:
-            url = f"{self.base_url}/crm/slow-products"
-            params = {"page": page, "per_page": per_page}
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("SLOW PRODUCTS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch slow products: {e}")
-            return []
-
-    def get_non_buying_customers(self, start_date: str, end_date: str, page: int = 1, per_page: int = 10) -> List[Dict]:
-        try:
-            url = f"{self.base_url}/crm/customers/non-buying"
-            params = {"startdate": start_date, "enddate": end_date, "page": page, "per_page": per_page}
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("NON-BUYING CUSTOMERS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch non-buying customers: {e}")
-            return []
-
-    # -------------------------------------------------
-    # ENHANCED MARKETING DOCS METHODS
-    # -------------------------------------------------
-    def get_document_by_id(self, doc_id: str, doc_type: Optional[int] = None) -> Optional[Dict]:
-        try:
-            url = f"{self.base_url}/marketing/docs/{doc_id}"
-            params = {"isDoc": 1}
-            if doc_type:
-                params["docType"] = doc_type
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response(f"DOCUMENT {doc_id}", resp)
-            if resp.status_code == 200:
-                data = self._normalize(resp.json())
-                return data[0] if data else None
+    def resolve_customer(self, name: str) -> Optional[Dict]:
+        """
+        Resolve customer by name - returns the best matching customer.
+        Tries exact match first, then fuzzy match.
+        """
+        if not name:
             return None
-        except Exception as e:
-            logger.error(f"Failed to fetch document {doc_id}: {e}")
-            return None
-
-    def search_documents(self, doc_type: Optional[int] = None, date_from: Optional[str] = None,
-                         date_to: Optional[str] = None, customer_code: Optional[str] = None,
-                         status: Optional[int] = 1, page: int = 1, per_page: int = 20) -> List[Dict]:
-        try:
-            if doc_type:
-                url = f"{self.base_url}/marketing/docs/{doc_type}"
-            else:
-                url = f"{self.base_url}/marketing/docs/search"
-
-            params = {"isDoc": 1, "page": page, "per_page": per_page}
-            if status is not None:
-                params["DocStatus"] = status
-            if date_from:
-                params["FromDate"] = date_from
-            if date_to:
-                params["ToDate"] = date_to
-            if customer_code:
-                params["CardCode"] = customer_code
-
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("DOCUMENT SEARCH", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to search documents: {e}")
-            return []
-
-    def get_document_types(self) -> Dict[int, str]:
-        return self.DOC_TYPES
-
-    def explore_document_type(self, doc_type: int) -> Dict[str, Any]:
-        try:
-            url = f"{self.base_url}/marketing/docs/{doc_type}"
-            params = {"isDoc": 1, "page": 1, "per_page": 5}
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            result = {
-                "doc_type": doc_type,
-                "status_code": resp.status_code,
-                "success": resp.status_code == 200,
-                "sample_data": None,
-            }
-            if resp.status_code == 200:
-                data = self._normalize(resp.json())
-                result["sample_data"] = data[:2] if data else []
-                result["count"] = len(data)
-                if data and doc_type not in self.DOC_TYPES:
-                    self.DOC_TYPES[doc_type] = f"Discovered Type {doc_type}"
-            return result
-        except Exception as e:
-            logger.error(f"Failed to explore doc type {doc_type}: {e}")
-            return {"doc_type": doc_type, "error": str(e), "success": False}
-
-    # -------------------------------------------------
-    # ENHANCED CUSTOMER METHODS
-    # -------------------------------------------------
-    def get_customers_paginated(self, page: int = 1, per_page: int = 20, search: str = "") -> Dict[str, Any]:
-        try:
-            url = f"{self.base_url}/getCustomers"
-            params = {"page": page, "per_page": per_page}
-            if search:
-                params["search"] = clean_customer_search_term(search)
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            self._debug_response("CUSTOMERS PAGINATED", resp)
-            resp.raise_for_status()
-            data = resp.json()
-            return {
-                "data": self._normalize(data),
-                "page": page,
-                "per_page": per_page,
-                "total": data.get("total", len(self._normalize(data))),
-            }
-        except Exception as e:
-            logger.error(f"Failed to fetch paginated customers: {e}")
-            return {"data": [], "page": page, "per_page": per_page, "total": 0}
+        
+        # Try exact match first
+        customers = self.get_customers(search=name, limit=10)
+        if customers:
+            name_lower = name.lower()
+            for customer in customers:
+                customer_name = customer.get("CardName", "").lower()
+                if customer_name == name_lower:
+                    logger.info(f"✅ Exact match found for customer: {customer.get('CardName')}")
+                    return customer
+            
+            # Return first match if no exact match
+            logger.info(f"✅ Returning first match for customer: {customers[0].get('CardName')}")
+            return customers[0]
+        
+        # Try with cleaned search term
+        cleaned = clean_customer_search_term(name)
+        if cleaned != name:
+            customers = self.get_customers(search=cleaned, limit=5)
+            if customers:
+                logger.info(f"✅ Found customer using cleaned term '{cleaned}': {customers[0].get('CardName')}")
+                return customers[0]
+        
+        logger.warning(f"❌ No customer found for: {name}")
+        return None
 
     # -------------------------------------------------
     # ITEMS
     # -------------------------------------------------
+    @cache_api_result(ttl_seconds=ITEM_CACHE_TTL)
     def get_items(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
         try:
+            if not self._ensure_auth():
+                return []
+                
             url = f"{self.base_url}/item_masterdata"
             params = {"page": 1, "per_page": 50, "search": search}
+            self._record_api_call()
             resp = self.session.get(url, params=params, timeout=15)
+            
+            if not self._check_auth(resp):
+                resp = self.session.get(url, params=params, timeout=15)
+            
             self._debug_response("ITEMS", resp)
-            resp.raise_for_status()
-            return self._apply_limit(self._normalize(resp.json()), limit)
+            if resp.status_code == 200:
+                return self._apply_limit(self._normalize(resp.json()), limit)
+            return []
         except Exception as e:
+            self._record_error()
             logger.error(f"Failed to fetch items: {e}")
             return []
 
     def get_item_by_name(self, name: str) -> Optional[Dict]:
-        return self._match_by_name(
-            self.get_items(search=name), name,
-            ["ItemName", "ItemCode", "full_name"]
-        )
+        """Get a single item by name."""
+        items = self.get_items(search=name, limit=1)
+        return items[0] if items else None
 
+    # =========================================================
+    # GET ITEM BY CODE - FIXED for quotation validation
+    # =========================================================
     def get_item_by_code(self, item_code: str) -> Optional[Dict]:
+        """
+        Get a single item by its code.
+        Used by quotation service to validate items.
+        """
         try:
-            url = f"{self.base_url}/item_masterdata/{item_code}"
-            resp = self.session.get(url, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                normalized = self._normalize(data)
-                if normalized:
-                    return normalized[0]
+            if not self._ensure_auth():
+                return None
+            
+            # Search for the item by code
+            items = self.get_items(search=item_code, limit=5)
+            
+            if items:
+                # Find exact match by code
+                for item in items:
+                    if item.get("ItemCode") == item_code:
+                        logger.info(f"✅ Found item by code: {item_code} - {item.get('ItemName')}")
+                        return item
+            
+            logger.warning(f"❌ Item not found by code: {item_code}")
             return None
+            
         except Exception as e:
-            logger.error(f"Failed to fetch item by code {item_code}: {e}")
-            return None
-
-    def get_item_price(self, item_code: str, customer_name: str = None) -> Optional[Dict]:
-        from app.services.pricing_service import PricingService
-        pricing = PricingService()
-        customer = self.get_customer_by_name(customer_name) if customer_name else None
-        result = (
-            pricing.get_price_for_customer(item_code=item_code, customer=customer)
-            if customer
-            else pricing.get_price(item_code=item_code)
-        )
-        return result if result and result.get("found") else None
-
-    # -------------------------------------------------
-    # CUSTOMERS
-    # -------------------------------------------------
-    def get_customers(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
-        try:
-            cleaned_search = clean_customer_search_term(search)
-            url = f"{self.base_url}/bp_masterdata"
-            resp = self.session.get(url, params={"search": cleaned_search}, timeout=15)
-            self._debug_response("CUSTOMERS", resp)
-            resp.raise_for_status()
-            return self._apply_limit(self._normalize(resp.json()), limit)
-        except Exception as e:
-            logger.error(f"Failed to fetch customers: {e}")
-            return []
-
-    def get_customer_by_name(self, name: str) -> Optional[Dict]:
-        return self.resolve_customer(name)
-
-    def get_customer_by_code(self, card_code: str) -> Optional[Dict]:
-        try:
-            url = f"{self.base_url}/bp_masterdata/{card_code}"
-            resp = self.session.get(url, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                normalized = self._normalize(data)
-                if normalized:
-                    return normalized[0]
-            return None
-        except Exception as e:
-            logger.error(f"Failed to fetch customer by code {card_code}: {e}")
+            logger.error(f"Error getting item by code {item_code}: {e}")
             return None
 
-    def get_all_customers(self, limit: int = 2000) -> list:
-        try:
-            url = f"{self.base_url}/bp_masterdata"
-            params = {"page": 1, "per_page": limit, "search": ""}
-            response = self.session.get(url, params=params, timeout=30)
-            if response.status_code != 200:
-                logger.warning(f"Failed to fetch all customers: {response.text}")
-                return []
-            customers = [
-                {"CardCode": c.get("CardCode"), "CardName": c.get("CardName")}
-                for c in self._normalize(response.json())
-                if c.get("CardName")
-            ]
-            logger.info(f"Loaded {len(customers)} customers for AI matching")
-            return customers
-        except Exception as e:
-            logger.error(f"Customer list fetch failed: {e}")
-            return []
-
     # -------------------------------------------------
-    # PRICING & DISCOUNTS
+    # ITEM PRICE LOOKUP - INTEGRATED WITH PRICING SERVICE
     # -------------------------------------------------
-    def get_discount_groups(self) -> List[Dict]:
+    @cache_api_result(ttl_seconds=PRICE_CACHE_TTL, key_prefix="item_price")
+    def get_item_price(
+        self, 
+        item_code: str, 
+        customer_name: Optional[str] = None,
+        sap_list_num: Optional[int] = None
+    ) -> Optional[Dict]:
+        """
+        Get price for a specific item code using the Pricing Service.
+        
+        Args:
+            item_code: The ItemCode from SAP
+            customer_name: Optional customer name for customer-specific pricing
+            sap_list_num: Optional SAP price list number (overrides customer lookup)
+        
+        Returns:
+            Dictionary with price information following the format expected by db_query_service
+        """
         try:
-            resp = self.session.get(f"{self.base_url}/DiscountGroup", timeout=15)
-            self._debug_response("DISCOUNT GROUPS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch discount groups: {e}")
-            return []
-
-    def get_volume_discount(self, item_code: str, qty: float) -> float:
-        try:
-            best = 0
-            for g in self.get_discount_groups():
-                if g.get("ItemCode") == item_code:
-                    min_qty = float(g.get("MinQty", 0))
-                    disc = float(g.get("DiscountPercent", 0))
-                    if qty >= min_qty and disc > best:
-                        best = disc
-            return best
-        except Exception as e:
-            logger.error(f"Volume discount calc failed: {e}")
-            return 0
-
-    def get_promo_price(self, item_code: str) -> Optional[Dict]:
-        try:
-            resp = self.session.get(f"{self.base_url}/promo-items", timeout=15)
-            self._debug_response("PROMO ITEMS", resp)
-            resp.raise_for_status()
-            promos = self._normalize(resp.json())
-            for p in promos:
-                if p.get("ItemCode") == item_code:
-                    return p
-            return None
-        except Exception as e:
-            logger.error(f"Promo fetch failed: {e}")
-            return None
-
-    def get_price_lists(self) -> List[Dict]:
-        try:
-            resp = self.session.get(f"{self.base_url}/price_lists", timeout=15)
-            self._debug_response("PRICE LISTS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch price lists: {e}")
-            return []
-
-    def get_price_history(self, item_code: str, days: int = 180) -> List[Dict]:
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            url = f"{self.base_url}/price_history"
-            params = {
-                "ItemCode": item_code,
-                "FromDate": start_date.strftime("%Y-%m-%d"),
-                "ToDate": end_date.strftime("%Y-%m-%d"),
-            }
-            resp = self.session.get(url, params=params, timeout=20)
-            self._debug_response("PRICE HISTORY", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch price history for {item_code}: {e}")
-            return []
-
-    # -------------------------------------------------
-    # CURRENCY & MISC
-    # -------------------------------------------------
-    def get_currency_rates(self) -> List[Dict]:
-        try:
-            resp = self.session.get(f"{self.base_url}/currency", timeout=15)
-            self._debug_response("CURRENCY", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Currency fetch failed: {e}")
-            return []
-
-    def get_item_groups(self) -> List[Dict]:
-        try:
-            resp = self.session.get(f"{self.base_url}/itemgroup", timeout=15)
-            self._debug_response("ITEM GROUPS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Item group fetch failed: {e}")
-            return []
-
-    def get_uoms(self) -> List[Dict]:
-        try:
-            resp = self.session.get(f"{self.base_url}/uoms", timeout=15)
-            self._debug_response("UOMS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch UOMs: {e}")
-            return []
-
-    # -------------------------------------------------
-    # MARKETING DOCUMENTS
-    # -------------------------------------------------
-    def fetch_marketing_docs(self, card_code: str, doc_type: int) -> List[Dict]:
-        try:
-            url = f"{self.base_url}/marketing/docs/{doc_type}"
-            params = {"isDoc": 1, "page": 1, "per_page": 5, "CardCode": card_code}
-            resp = self.session.get(url, params=params, timeout=20)
-            self._debug_response("MARKETING DOCS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Marketing docs fetch failed: {e}")
-            return []
-
-    def get_customer_activity_summary(self, card_code: str) -> dict:
-        return {
-            "invoices": self.fetch_marketing_docs(card_code, 13) or [],
-            "deliveries": self.fetch_marketing_docs(card_code, 15) or [],
-            "quotations": self.fetch_marketing_docs(card_code, 23) or [],
-        }
-
-    def calculate_engagement_level(self, summary: dict) -> str:
-        total = sum(len(summary.get(k, [])) for k in ["invoices", "deliveries", "quotations"])
-        if total >= 10: return "🔥 Very Active"
-        if total >= 5:  return "✅ Active"
-        if total >= 1:  return "⚠ Low Activity"
-        return "❄ Dormant"
-
-    def get_orders(self, customer_code: str, limit: int = 10) -> dict:
-        try:
-            url = f"{self.base_url}/marketing/docs/17"
-            params = {"isDoc": 1, "CardCode": customer_code, "page": 1, "per_page": limit}
-            response = self.session.get(url, params=params, timeout=30)
-            self._debug_response("ORDERS", response)
-
-            if response.status_code == 200:
-                normalized_data = self._normalize(response.json())
+            # If customer name is provided, try to resolve customer and get their price list
+            customer = None
+            if customer_name and not sap_list_num:
+                customer = self.resolve_customer(customer_name)
+                if customer:
+                    logger.info(f"✅ Resolved customer: {customer.get('CardName')} (Code: {customer.get('CardCode')})")
+            
+            # Use pricing service to get price
+            if customer and not sap_list_num:
+                # Customer-specific pricing
+                price_result = self.pricing_service.get_price_for_customer(
+                    item_code=item_code,
+                    customer=customer
+                )
+            else:
+                # Default pricing with optional specific price list
+                list_num = sap_list_num or 1  # Default to price list 1
+                price_result = self.pricing_service.get_price(
+                    item_code=item_code,
+                    sap_list_num=list_num
+                )
+            
+            # Transform pricing service result to the format expected by db_query_service
+            if price_result and price_result.get("found") and price_result.get("price", 0) > 0:
                 return {
-                    "ResultState": True,
-                    "ResultCode": 1200,
-                    "ResultDesc": "Operation Was Successful",
-                    "ResponseData": normalized_data[:limit] if normalized_data else [],
+                    "found": True,
+                    "item_code": item_code,
+                    "price": price_result.get("price"),
+                    "currency": price_result.get("currency", "KES"),
+                    "price_list_name": price_result.get("price_list_name", ""),
+                    "is_gross_price": price_result.get("is_gross_price", False),
+                    "uom_entry": price_result.get("uom_entry"),
+                    "note": price_result.get("note", ""),
+                    "sap_list_num": price_result.get("sap_list_num"),
+                    "chain_walked": price_result.get("chain_walked", [])
                 }
+            else:
+                # Item exists but has no price configured
+                return {
+                    "found": False,
+                    "item_code": item_code,
+                    "price": 0,
+                    "message": price_result.get("note", "No price configured for this item"),
+                    "price_list_name": price_result.get("price_list_name", ""),
+                    "chain_walked": price_result.get("chain_walked", [])
+                }
+                
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Failed to get item price for {item_code}: {e}")
+            # Return fallback structure
             return {
-                "ResultState": False,
-                "ResultCode": response.status_code,
-                "ResultDesc": f"Error: {response.status_code}",
-                "ResponseData": [],
+                "found": False,
+                "item_code": item_code,
+                "price": 0,
+                "error": str(e),
+                "message": "Could not retrieve price at this time"
             }
-        except Exception as e:
-            logger.error(f"Exception in get_orders: {e}")
-            return {"ResultState": False, "ResultCode": 500, "ResultDesc": f"Exception: {e}", "ResponseData": []}
 
-    def get_outstanding_deliveries(self, customer_name: str, limit: Optional[int] = 25) -> List[Dict]:
+    def get_item_price_any_list(self, item_code: str) -> Optional[Dict]:
+        """
+        Try all price lists to find a price for an item.
+        Useful when you don't know which price list the item belongs to.
+        """
         try:
-            logger.info(f"Fetching outstanding deliveries for {customer_name}")
-            customers = self.get_customers(search=customer_name)
-            if not customers:
-                return []
-
-            card_code = customers[0].get("CardCode")
-            params = {"isDoc": 1, "page": 1, "per_page": 50, "CardCode": card_code, "DocStatus": 1}
-            url = f"{self.base_url}/marketing/docs/15"
-            resp = self.session.get(url, params=params, timeout=20)
-            self._debug_response("OUTSTANDING DELIVERIES", resp)
-            resp.raise_for_status()
-
-            deliveries = self._normalize(resp.json())
-            outstanding = []
-            for d in deliveries:
-                lines = d.get("DocumentLines") or d.get("document_lines") or []
-                for line in lines:
-                    if float(line.get("DeliveredQty", 0)) < float(line.get("Quantity", 0)):
-                        outstanding.append(d)
-                        break
-                else:
-                    if not lines:
-                        outstanding.append(d)
-
-            return self._apply_limit(outstanding, limit)
+            price_result = self.pricing_service.get_price_any_list(item_code=item_code)
+            
+            if price_result and price_result.get("found") and price_result.get("price", 0) > 0:
+                return {
+                    "found": True,
+                    "item_code": item_code,
+                    "price": price_result.get("price"),
+                    "currency": price_result.get("currency", "KES"),
+                    "price_list_name": price_result.get("price_list_name", ""),
+                    "is_gross_price": price_result.get("is_gross_price", False),
+                    "uom_entry": price_result.get("uom_entry"),
+                    "note": price_result.get("note", ""),
+                    "sap_list_num": price_result.get("sap_list_num")
+                }
+            else:
+                return {
+                    "found": False,
+                    "item_code": item_code,
+                    "price": 0,
+                    "message": price_result.get("note", "No price found on any list")
+                }
         except Exception as e:
-            logger.error(f"Outstanding delivery fetch failed: {e}")
+            self._record_error()
+            logger.error(f"Failed to get price from any list for {item_code}: {e}")
+            return {
+                "found": False,
+                "item_code": item_code,
+                "price": 0,
+                "error": str(e),
+                "message": "Could not retrieve price at this time"
+            }
+
+    # -------------------------------------------------
+    # INVENTORY REPORT - IMPROVED
+    # -------------------------------------------------
+    @cache_api_result(ttl_seconds=INVENTORY_CACHE_TTL)
+    def get_inventory_report(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
+        """Get inventory report with proper authentication handling."""
+        try:
+            if not self._ensure_auth():
+                logger.warning("Not authenticated, cannot fetch inventory report")
+                return []
+            
+            all_items = []
+            page = 1
+            per_page = min(limit, 500) if limit else 100
+            
+            while True:
+                params = {"page": page, "per_page": per_page}
+                if search:
+                    params["search"] = search
+                    
+                url = f"{self.base_url}/inventory/report"
+                self._record_api_call()
+                resp = self.session.get(url, params=params, timeout=15)
+                
+                if not self._check_auth(resp):
+                    logger.warning("Authentication failed during inventory fetch, retrying...")
+                    resp = self.session.get(url, params=params, timeout=15)
+                
+                self._debug_response("INVENTORY REPORT", resp)
+                
+                if resp.status_code != 200:
+                    logger.error(f"Inventory report API error: {resp.status_code}")
+                    break
+                
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.error(f"Failed to parse inventory report JSON: {e}")
+                    break
+                
+                # Parse the response
+                items = self._parse_inventory_response_data(data)
+                
+                if not items:
+                    break
+                
+                for item in items:
+                    processed_item = {
+                        "ItemCode": item.get("ItemCode") or item.get("item_code", ""),
+                        "ItemName": item.get("ItemName") or item.get("item_name", ""),
+                        "WhsCode": item.get("WhsCode") or item.get("whs_code", ""),
+                        "CurrentOnHand": float(item.get("CurrentOnHand") or item.get("OnHand") or 0),
+                        "CurrentIsCommited": float(item.get("CurrentIsCommited") or item.get("IsCommited") or 0),
+                        "LastTransactionDate": item.get("LastTransactionDate", ""),
+                        "PeriodOutQty": float(item.get("PeriodOutQty", 0)),
+                        "Available": float(item.get("CurrentOnHand") or item.get("OnHand") or 0) - 
+                                     float(item.get("CurrentIsCommited") or item.get("IsCommited") or 0)
+                    }
+                    all_items.append(processed_item)
+                
+                if len(items) < per_page:
+                    break
+                page += 1
+                
+                if limit and len(all_items) >= limit:
+                    all_items = all_items[:limit]
+                    break
+            
+            logger.info(f"✅ Retrieved {len(all_items)} inventory items")
+            return all_items
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Failed to fetch inventory report: {e}", exc_info=True)
+            return []
+
+    def _parse_inventory_response_data(self, data: dict) -> List[Dict]:
+        """Parse inventory response from various possible formats."""
+        try:
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                
+                if isinstance(response_data, dict) and "stocks" in response_data:
+                    stocks = response_data["stocks"]
+                    if isinstance(stocks, dict) and "data" in stocks:
+                        return stocks["data"]
+                elif isinstance(response_data, dict) and "data" in response_data:
+                    return response_data["data"]
+                elif isinstance(response_data, list):
+                    return response_data
+            else:
+                # Try direct data array
+                if isinstance(data.get("data"), list):
+                    return data["data"]
+            
+            return []
+        except Exception as e:
+            logger.error(f"Error parsing inventory response: {e}")
             return []
 
     # -------------------------------------------------
-    # WAREHOUSES & INVENTORY
+    # WAREHOUSES - FIXED ENDPOINT
     # -------------------------------------------------
     def get_warehouses(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
+        """Get warehouses from the correct API endpoint: /warehouse (singular, not /warehouses)."""
         try:
-            resp = self.session.get(f"{self.base_url}/warehouse", timeout=15)
-            self._debug_response("WAREHOUSES", resp)
-            resp.raise_for_status()
-            warehouses = self._normalize(resp.json())
+            if not self._ensure_auth():
+                logger.warning("Not authenticated, cannot fetch warehouses")
+                return []
+            
+            # Use the correct endpoint - /warehouse (not /warehouses)
+            url = f"{self.base_url}/warehouse"
+            params = {"page": 1, "per_page": 100}
             if search:
-                warehouses = [w for w in warehouses if search.lower() in str(w.get("WhsName", "")).lower()]
-            return self._apply_limit(warehouses, limit)
+                params["search"] = search
+            
+            logger.info(f"🏭 Fetching warehouses from: {url}")
+            self._record_api_call()
+            resp = self.session.get(url, params=params, timeout=15)
+            
+            if not self._check_auth(resp):
+                logger.warning("Authentication failed during warehouse fetch, retrying...")
+                resp = self.session.get(url, params=params, timeout=15)
+            
+            self._debug_response("WAREHOUSES", resp)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                warehouses = self._normalize_warehouse_response(data)
+                return self._apply_limit(warehouses, limit)
+            else:
+                logger.error(f"Warehouse API error: {resp.status_code}")
+                return []
+            
         except Exception as e:
+            self._record_error()
             logger.error(f"Failed to fetch warehouses: {e}")
             return []
 
-    def get_warehouse_by_code(self, whs_code: str) -> Optional[Dict]:
+    # =========================================================
+    # FIXED: GET OPEN SALES ORDERS (for outstanding deliveries)
+    # =========================================================
+    @cache_api_result(ttl_seconds=DELIVERY_CACHE_TTL)
+    def get_open_sales_orders(self, customer_code: str = None, limit: int = 100) -> List[Dict]:
+        """
+        Fetch open sales orders with outstanding quantities from SAP Business One.
+        
+        Args:
+            customer_code: Optional customer code to filter by
+            limit: Maximum number of orders to return
+        
+        Returns:
+            List of open orders with outstanding delivery quantities
+        """
         try:
-            warehouses = self.get_warehouses(search=whs_code)
-            for wh in warehouses:
-                if wh.get("WhsCode") == whs_code:
-                    return wh
-            return None
-        except Exception as e:
-            logger.error(f"Failed to fetch warehouse by code {whs_code}: {e}")
-            return None
-
-    def get_inventory_report(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
-        try:
-            params = {"page": 1, "per_page": 100, "search": search}
-            resp = self.session.get(f"{self.base_url}/inventory/report", params=params, timeout=15)
-            self._debug_response("INVENTORY REPORT", resp)
-            resp.raise_for_status()
-            return self._apply_limit(self._normalize(resp.json()), limit)
-        except Exception as e:
-            logger.error(f"Failed to fetch inventory report: {e}")
+            if not self._ensure_auth():
+                logger.warning("Not authenticated, cannot fetch open sales orders")
+                return []
+            
+            # Try multiple possible endpoints - prioritize /marketing/docs/17
+            endpoints_to_try = [
+                "/marketing/docs/17",  # SAP document type for Sales Orders (priority - working endpoint)
+                "/sales_orders?status=open",
+                "/orders?status=open",
+                "/documents/order",
+            ]
+            
+            for endpoint in endpoints_to_try:
+                url = f"{self.base_url}{endpoint}"
+                params = {"page": 1, "per_page": limit}
+                if customer_code:
+                    params["CardCode"] = customer_code
+                
+                logger.info(f"📦 Fetching open sales orders from: {url}")
+                self._record_api_call()
+                
+                try:
+                    resp = self.session.get(url, params=params, timeout=15)
+                    
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        
+                        # Parse based on endpoint
+                        orders = []
+                        
+                        if endpoint == "/marketing/docs/17":
+                            # Handle the specific format from /marketing/docs/17
+                            if data.get("ResultState") and data.get("ResponseData"):
+                                response_data = data["ResponseData"]
+                                if isinstance(response_data, dict):
+                                    # Check for data array (list of documents)
+                                    if "data" in response_data:
+                                        orders = response_data["data"]
+                                    elif "DocumentLines" in response_data:
+                                        # Single document returned
+                                        orders = [response_data]
+                                elif isinstance(response_data, list):
+                                    orders = response_data
+                        else:
+                            # Use standard normalization for other endpoints
+                            orders = self._normalize(data)
+                        
+                        if orders:
+                            logger.info(f"✅ Found {len(orders)} orders from {endpoint}")
+                            
+                            # Process and format orders to extract line items
+                            formatted_orders = []
+                            
+                            for order in orders:
+                                # Extract order header
+                                doc_num = order.get("DocNum") or order.get("doc_num") or order.get("DocumentNumber")
+                                doc_entry = order.get("DocEntry") or order.get("doc_entry") or order.get("DocumentEntry")
+                                card_code = order.get("CardCode") or order.get("card_code") or customer_code
+                                card_name = order.get("CardName") or order.get("card_name") or "Unknown"
+                                doc_date = order.get("DocDate") or order.get("doc_date") or ""
+                                doc_due_date = order.get("DocDueDate") or order.get("doc_due_date") or ""
+                                
+                                # Get items - check multiple possible field names
+                                items = (order.get("DocumentLines") or 
+                                        order.get("items") or 
+                                        order.get("Lines") or 
+                                        order.get("document_lines") or
+                                        [])
+                                
+                                # If no items found and order is a single item structure
+                                if not items and order.get("ItemCode"):
+                                    items = [order]
+                                
+                                logger.debug(f"Processing order {doc_num}: {len(items)} items")
+                                
+                                for item in items:
+                                    item_code = item.get("ItemCode") or item.get("item_code") or item.get("ProductCode")
+                                    item_name = item.get("ItemName") or item.get("item_name") or item.get("ProductName")
+                                    quantity = float(item.get("Quantity") or item.get("quantity") or 0)
+                                    open_qty = float(item.get("OpenQty") or item.get("open_qty") or item.get("OpenQuantity") or quantity)
+                                    price = float(item.get("Price") or item.get("price") or 0)
+                                    
+                                    # Only include items with outstanding quantity
+                                    if open_qty > 0:
+                                        formatted_orders.append({
+                                            "DocNum": doc_num,
+                                            "DocEntry": doc_entry,
+                                            "CardCode": card_code,
+                                            "CardName": card_name,
+                                            "DocDate": doc_date,
+                                            "DocDueDate": doc_due_date,
+                                            "ItemCode": item_code,
+                                            "ItemName": item_name,
+                                            "Quantity": quantity,
+                                            "OpenQty": open_qty,
+                                            "Price": price,
+                                            "Status": "Open"
+                                        })
+                                        logger.debug(f"  Added item: {item_code} - {item_name}, OpenQty: {open_qty}")
+                                
+                                # Limit the number of orders to prevent overwhelming response
+                                if len(formatted_orders) >= limit:
+                                    break
+                            
+                            if formatted_orders:
+                                logger.info(f"✅ Processed {len(formatted_orders)} line items from {endpoint}")
+                                return formatted_orders
+                            else:
+                                logger.warning(f"Found {len(orders)} orders but no items with outstanding quantity")
+                        
+                except Exception as e:
+                    logger.debug(f"Endpoint {endpoint} failed: {e}")
+                    continue
+            
+            # If we get here, no orders found
+            logger.info("No open sales orders found from any endpoint")
             return []
-
-    def get_inventory_by_item(self, item_code: str) -> List[Dict]:
-        try:
-            inventory = self.get_inventory_report(search=item_code)
-            return [item for item in inventory if item.get("ItemCode") == item_code]
+            
         except Exception as e:
-            logger.error(f"Failed to fetch inventory for item {item_code}: {e}")
+            self._record_error()
+            logger.error(f"Failed to fetch open sales orders: {e}", exc_info=True)
             return []
-
-    def get_inventory_turnover(self, warehouse_code: Optional[str] = None) -> List[Dict]:
-        try:
-            url = f"{self.base_url}/inventory/turnover"
-            params = {}
-            if warehouse_code:
-                params["Warehouse"] = warehouse_code
-            resp = self.session.get(url, params=params, timeout=20)
-            self._debug_response("INVENTORY TURNOVER", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch inventory turnover: {e}")
-            return []
-
-    def get_stock_by_warehouse(self, warehouse: str, item_name: Optional[str] = None) -> Dict:
-        try:
-            params = {"warehouse": warehouse}
-            if item_name:
-                params["search"] = item_name
-            resp = self.session.get(f"{self.base_url}/inventory_stock", params=params, timeout=15)
-            self._debug_response("WAREHOUSE STOCK", resp)
-            resp.raise_for_status()
-            data = self._normalize(resp.json())
-            if not data:
-                return {"message": f"No stock found in {warehouse}"}
-            return {"data": data}
-        except Exception as e:
-            logger.error(f"Warehouse stock error: {e}")
-            return {"error": str(e)}
 
     # -------------------------------------------------
-    # SALES ANALYSIS & INTELLIGENCE
+    # ANALYTICS: TOP SELLING ITEMS (ENHANCED FALLBACK)
     # -------------------------------------------------
-    def get_sales_history(self, item_code: str, days: int = 90) -> List[Dict]:
+    @cache_api_result(ttl_seconds=ANALYTICS_CACHE_TTL)
+    def get_top_selling_items(self, limit: int = 10, days: int = 30) -> List[Dict]:
+        """
+        Get top selling items based on sales velocity.
+        Uses inventory data with recency scoring when API endpoint is unavailable.
+        """
         try:
+            # Try API endpoint first
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
-            url = f"{self.base_url}/sales_analysis"
-            params = {
-                "ItemCode": item_code,
-                "FromDate": start_date.strftime("%Y-%m-%d"),
-                "ToDate": end_date.strftime("%Y-%m-%d"),
-                "page": 1,
-                "per_page": 100,
-            }
-            resp = self.session.get(url, params=params, timeout=20)
-            self._debug_response("SALES HISTORY", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch sales history for {item_code}: {e}")
-            return []
-
-    def get_top_selling_items(self, limit: int = 50, days: int = 30) -> List[Dict]:
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
+            
             url = f"{self.base_url}/sales_analysis/top_items"
             params = {
                 "FromDate": start_date.strftime("%Y-%m-%d"),
                 "ToDate": end_date.strftime("%Y-%m-%d"),
                 "limit": limit,
             }
-            resp = self.session.get(url, params=params, timeout=20)
-            self._debug_response("TOP SELLING ITEMS", resp)
-            if resp.status_code == 200:
-                return self._normalize(resp.json())
-            return self._get_top_selling_fallback(limit)
+            
+            if self._ensure_auth():
+                self._record_api_call()
+                resp = self.session.get(url, params=params, timeout=20)
+                
+                if resp.status_code == 200:
+                    try:
+                        items = self._normalize(resp.json())
+                        if items:
+                            for i, item in enumerate(items, 1):
+                                item["rank"] = i
+                                item["analysis_days"] = days
+                                item["analysis_period"] = f"Last {days} days"
+                            logger.info(f"✅ Retrieved {len(items)} top selling items from API")
+                            return items
+                    except:
+                        pass
+            
+            # Fallback: Calculate from inventory data
+            return self._calculate_top_selling_from_inventory(limit, days)
+            
         except Exception as e:
+            self._record_error()
             logger.error(f"Failed to fetch top selling items: {e}")
-            return self._get_top_selling_fallback(limit)
-
-    def _get_top_selling_fallback(self, limit: int = 20) -> List[Dict]:
-        try:
-            inventory = self.get_inventory_report(limit=200)
-            scored_items = []
-            for item in inventory:
-                on_hand = float(item.get("CurrentOnHand", item.get("OnHand", 0)) or 0)
-                committed = float(item.get("CurrentIsCommited", item.get("IsCommited", 0)) or 0)
-                popularity = committed / on_hand if on_hand > 0 and committed > 0 else 0
-                scored_items.append({
-                    "ItemCode": item.get("ItemCode"),
-                    "ItemName": item.get("ItemName"),
-                    "OnHand": on_hand,
-                    "Committed": committed,
-                    "PopularityScore": popularity,
-                    "Category": "Fallback Estimate"
-                })
-            scored_items.sort(key=lambda x: x["PopularityScore"], reverse=True)
-            logger.info(f"Generated {min(limit, len(scored_items))} top items from fallback")
-            return scored_items[:limit]
-        except Exception as e:
-            logger.error(f"Fallback top selling calculation failed: {e}")
-            return []
-
-    # -------------------------------------------------
-    # CUSTOMER INTELLIGENCE
-    # -------------------------------------------------
-    def get_customer_segments(self) -> List[Dict]:
-        try:
-            resp = self.session.get(f"{self.base_url}/customer_segments", timeout=20)
-            self._debug_response("CUSTOMER SEGMENTS", resp)
-            resp.raise_for_status()
-            return self._normalize(resp.json())
-        except Exception as e:
-            logger.error(f"Failed to fetch customer segments: {e}")
-            return []
-
-    def get_customer_rfm_analysis(self, customer_code: str) -> Optional[Dict]:
-        try:
-            resp = self.session.get(f"{self.base_url}/customer_rfm/{customer_code}", timeout=20)
-            self._debug_response("CUSTOMER RFM", resp)
-            resp.raise_for_status()
-            data = self._normalize(resp.json())
-            return data[0] if data else None
-        except Exception as e:
-            logger.error(f"Failed to fetch RFM for {customer_code}: {e}")
-            return None
+            return self._calculate_top_selling_from_inventory(limit, days)
 
     # =========================================================
-    # 🆕 NEW: ENHANCED METHODS FOR RECOMMENDATIONS
+    # FIXED: _calculate_top_selling_from_inventory
     # =========================================================
-
-    def get_cross_sell_data(self, item_code: str, limit: int = 5) -> List[Dict]:
+    
+    def _calculate_top_selling_from_inventory(self, limit: int = 20, days: int = 30) -> List[Dict]:
         """
-        Get items frequently bought together with the given item.
-        This would analyze order history to find correlations.
-        """
-        try:
-            logger.info(f"🔍 Fetching cross-sell data for: {item_code}")
-            
-            # This would query a dedicated cross-sell endpoint or analyze order patterns
-            # For now, return empty list and let recommendation service use fallback
-            # Example: You might have an endpoint like /analytics/cross-sell/{item_code}
-            # url = f"{self.base_url}/analytics/cross-sell/{item_code}"
-            # resp = self.session.get(url, params={"limit": limit}, timeout=15)
-            # if resp.status_code == 200:
-            #     return self._normalize(resp.json())
-            
-            # For now, use related items from same category as fallback
-            item = self.get_item_by_code(item_code)
-            if item:
-                group = item.get("ItmsGrpCod")
-                if group:
-                    # Get items in same group
-                    items = self.get_items(limit=limit * 2)
-                    result = []
-                    for itm in items:
-                        if itm.get("ItemCode") != item_code and itm.get("ItmsGrpCod") == group:
-                            result.append(itm)
-                            if len(result) >= limit:
-                                break
-                    return result
-            
-            return []
-        except Exception as e:
-            logger.error(f"Failed to fetch cross-sell data: {e}")
-            return []
-
-    def get_upsell_data(self, item_code: str, limit: int = 3) -> List[Dict]:
-        """
-        Get premium/upgrade alternatives for an item.
+        Calculate top selling items from inventory data using multiple metrics.
+        FIXED: Properly handles zero PeriodOutQty by using committed orders as demand indicator.
         """
         try:
-            logger.info(f"🔍 Fetching upsell data for: {item_code}")
+            inventory = self.get_inventory_report(limit=1000)
             
-            # Get the source item to determine its category/price range
-            source_item = self.get_item_by_code(item_code)
-            if not source_item:
+            if not inventory:
+                logger.warning("No inventory data available for top selling calculation")
                 return []
             
-            # Try to get price for source item
-            source_price_info = self.get_item_price(item_code)
-            source_price = source_price_info.get("price", 0) if source_price_info else 0
+            scored_items = []
             
-            # Find items in same group with higher price
-            group = source_item.get("ItmsGrpCod")
-            if group:
-                # Get all items in same group
-                all_items = self.get_items(limit=50)
-                candidates = []
-                for item in all_items:
-                    if item.get("ItemCode") != item_code and item.get("ItmsGrpCod") == group:
-                        # Get price for this item
-                        price_info = self.get_item_price(item.get("ItemCode"))
-                        price = price_info.get("price", 0) if price_info else 0
-                        if price > source_price:
-                            item["Price"] = price
-                            item["PriceDifference"] = price - source_price
-                            candidates.append(item)
+            for item in inventory:
+                # Extract item details
+                item_code = item.get("ItemCode", "")
+                item_name = item.get("ItemName", "")
                 
-                # Sort by price (highest first) and return top ones
-                candidates.sort(key=lambda x: x.get("Price", 0), reverse=True)
-                return candidates[:limit]
-            
-            return []
-        except Exception as e:
-            logger.error(f"Failed to fetch upsell data: {e}")
-            return []
-
-    def get_seasonal_items(self, month: str = None, limit: int = 10) -> List[Dict]:
-        """
-        Get items that are seasonal or recommended for a specific month.
-        """
-        try:
-            logger.info(f"🔍 Fetching seasonal items for: {month or 'current month'}")
-            
-            # This could query a seasonal products endpoint
-            # url = f"{self.base_url}/analytics/seasonal"
-            # params = {"month": month, "limit": limit}
-            # resp = self.session.get(url, params=params, timeout=15)
-            # if resp.status_code == 200:
-            #     return self._normalize(resp.json())
-            
-            # For now, return trending items as fallback
-            return self.get_trending_items(days=30, limit=limit)
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch seasonal items: {e}")
-            return []
-
-    def get_trending_items(self, days: int = 30, limit: int = 10) -> List[Dict]:
-        """
-        Get trending/popular items based on recent sales.
-        """
-        try:
-            logger.info(f"🔍 Fetching trending items from last {days} days")
-            
-            # Use existing top-selling items method
-            return self.get_top_selling_items(limit=limit, days=days)
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch trending items: {e}")
-            return self._get_top_selling_fallback(limit)
-
-    def get_customer_purchase_history(self, customer_code: str, limit: int = 50) -> List[Dict]:
-        """
-        Get detailed purchase history for a customer including line items.
-        Useful for personalized recommendations.
-        """
-        try:
-            logger.info(f"🔍 Fetching purchase history for customer: {customer_code}")
-            
-            # Get orders first
-            orders = self.get_orders(customer_code, limit=limit)
-            
-            # If we have a proper response, extract line items
-            if isinstance(orders, dict) and orders.get("ResultState"):
-                order_data = orders.get("ResponseData", [])
+                # Skip items with no name or code
+                if not item_code and not item_name:
+                    continue
                 
-                # For each order, we might need to fetch details to get line items
-                # This could be optimized with a dedicated endpoint
+                # Get stock metrics
+                on_hand = float(item.get("CurrentOnHand", 0))
+                committed = float(item.get("CurrentIsCommited", 0))
+                period_out_qty = float(item.get("PeriodOutQty", 0))
+                last_transaction = item.get("LastTransactionDate", "")
                 
-                return order_data
+                # Calculate demand score based on available data
+                demand_score = 0
+                
+                # If we have period out quantity (actual sales), use that
+                if period_out_qty > 0:
+                    # Daily sales rate over the period
+                    daily_sales = period_out_qty / days if days > 0 else 0
+                    demand_score = min(100, daily_sales * 10)  # Scale: 10 units/day = 100 score
+                elif committed > 0:
+                    # Use committed orders as demand indicator
+                    # High committed relative to on-hand indicates demand
+                    if on_hand > 0:
+                        demand_ratio = min(2.0, committed / on_hand)
+                        demand_score = min(100, demand_ratio * 50)
+                    else:
+                        # Out of stock with committed orders - high demand
+                        demand_score = min(100, 50 + (committed / 100))
+                elif on_hand > 0:
+                    # Have stock but no demand indicators - low priority
+                    demand_score = 5
+                
+                # Recency bonus (newer transactions = higher score)
+                recency_bonus = 0
+                if last_transaction:
+                    try:
+                        last_date = datetime.strptime(last_transaction, "%Y-%m-%d")
+                        days_ago = (datetime.now() - last_date).days
+                        if days_ago < 7:
+                            recency_bonus = 30
+                        elif days_ago < 30:
+                            recency_bonus = 20
+                        elif days_ago < 90:
+                            recency_bonus = 10
+                        else:
+                            recency_bonus = 5
+                    except:
+                        pass
+                
+                # Turnover bonus (how fast stock is moving relative to on-hand)
+                turnover_bonus = 0
+                if on_hand > 0 and committed > 0:
+                    turnover_ratio = committed / on_hand
+                    if turnover_ratio > 2:
+                        turnover_bonus = 25
+                    elif turnover_ratio > 1:
+                        turnover_bonus = 15
+                    elif turnover_ratio > 0.5:
+                        turnover_bonus = 10
+                
+                # Stockout bonus (items with low stock and high committed)
+                stockout_bonus = 0
+                if on_hand > 0 and committed > on_hand:
+                    stockout_bonus = 20  # Items that are backordered
+                
+                total_score = demand_score + recency_bonus + turnover_bonus + stockout_bonus
+                
+                # Determine velocity category
+                if total_score >= 80:
+                    velocity = "VERY_HIGH"
+                elif total_score >= 60:
+                    velocity = "HIGH"
+                elif total_score >= 40:
+                    velocity = "MEDIUM"
+                elif total_score >= 20:
+                    velocity = "LOW"
+                else:
+                    velocity = "VERY_LOW"
+                
+                # Only include items with some activity
+                if total_score > 0 or on_hand > 0:
+                    scored_items.append({
+                        "ItemCode": item_code,
+                        "ItemName": item_name if item_name else item_code,
+                        "PopularityScore": round(total_score, 2),
+                        "CurrentOnHand": on_hand,
+                        "CurrentIsCommited": committed,
+                        "PeriodOutQty": period_out_qty,
+                        "LastTransactionDate": last_transaction if last_transaction else "N/A",
+                        "Velocity": velocity,
+                        "DemandScore": round(demand_score, 1),
+                        "RecencyBonus": round(recency_bonus, 1),
+                    })
             
-            return []
+            # Sort by popularity score (highest first)
+            scored_items.sort(key=lambda x: x["PopularityScore"], reverse=True)
+            result = scored_items[:limit]
+            
+            for i, item in enumerate(result, 1):
+                item["rank"] = i
+                item["analysis_days"] = days
+                item["analysis_period"] = f"Last {days} days"
+            
+            logger.info(f"✅ Calculated {len(result)} top selling items from inventory data")
+            
+            # Log the first few items for debugging
+            for item in result[:5]:
+                logger.info(f"   Top item: {item.get('ItemName')} (Code: {item.get('ItemCode')}, Score: {item.get('PopularityScore')})")
+            
+            return result
+            
         except Exception as e:
-            logger.error(f"Failed to fetch customer purchase history: {e}")
+            self._record_error()
+            logger.error(f"Failed to calculate top selling from inventory: {e}")
             return []
 
-    def get_items_by_category(self, category: str, limit: int = 20) -> List[Dict]:
+    # -------------------------------------------------
+    # ANALYTICS: SLOW MOVING ITEMS (ENHANCED FALLBACK)
+    # -------------------------------------------------
+    @cache_api_result(ttl_seconds=ANALYTICS_CACHE_TTL)
+    def get_slow_moving_items(self, limit: int = 10, days: int = 90, turnover_threshold: float = 0.5) -> List[Dict]:
         """
-        Get items filtered by category/item group.
+        Get slow moving items based on turnover rate.
+        Uses inventory data when API endpoint is unavailable.
         """
         try:
-            logger.info(f"🔍 Fetching items in category: {category}")
+            # Try API endpoint first
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
             
-            # First, find the item group code for this category
-            groups = self.get_item_groups()
-            group_code = None
-            for group in groups:
-                if category.lower() in group.get("ItmsGrpNam", "").lower():
-                    group_code = group.get("id")
-                    break
+            url = f"{self.base_url}/sales_analysis/slow_items"
+            params = {
+                "FromDate": start_date.strftime("%Y-%m-%d"),
+                "ToDate": end_date.strftime("%Y-%m-%d"),
+                "limit": limit,
+                "turnover_threshold": turnover_threshold,
+            }
             
-            if group_code:
-                url = f"{self.base_url}/item_masterdata"
-                params = {"page": 1, "per_page": limit, "GroupCode": group_code}
-                resp = self.session.get(url, params=params, timeout=15)
+            if self._ensure_auth():
+                self._record_api_call()
+                resp = self.session.get(url, params=params, timeout=20)
+                
                 if resp.status_code == 200:
-                    return self._normalize(resp.json())
+                    try:
+                        items = self._normalize(resp.json())
+                        if items:
+                            for i, item in enumerate(items, 1):
+                                item["rank"] = i
+                                item["analysis_days"] = days
+                                item["analysis_period"] = f"Last {days} days"
+                                item["turnover_threshold"] = turnover_threshold
+                            logger.info(f"✅ Retrieved {len(items)} slow moving items from API")
+                            return items
+                    except:
+                        pass
             
-            # Fallback to search
-            return self.get_items(search=category, limit=limit)
+            # Fallback: Calculate from inventory data
+            return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
             
         except Exception as e:
-            logger.error(f"Failed to fetch items by category: {e}")
+            self._record_error()
+            logger.error(f"Failed to fetch slow moving items: {e}")
+            return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
+
+    def _calculate_slow_moving_from_inventory(self, limit: int = 20, days: int = 90, turnover_threshold: float = 0.5) -> List[Dict]:
+        """
+        Calculate slow moving items from inventory data.
+        No hardcoded data - all calculations based on actual inventory.
+        """
+        try:
+            inventory = self.get_inventory_report(limit=1000)
+            
+            if not inventory:
+                logger.warning("No inventory data available for slow moving calculation")
+                return []
+            
+            slow_items = []
+            
+            for item in inventory:
+                on_hand = float(item.get("CurrentOnHand", 0))
+                committed = float(item.get("CurrentIsCommited", 0))
+                last_transaction = item.get("LastTransactionDate", "")
+                period_out_qty = float(item.get("PeriodOutQty", 0))
+                
+                # Calculate turnover rate
+                if on_hand > 0:
+                    if committed > 0:
+                        turnover_rate = committed / on_hand
+                    elif period_out_qty > 0:
+                        turnover_rate = period_out_qty / on_hand / (days / 30)
+                    else:
+                        turnover_rate = 0.05
+                else:
+                    turnover_rate = 0
+                
+                turnover_rate = min(turnover_rate, 5.0)
+                
+                # Check if slow moving
+                if turnover_rate < turnover_threshold and on_hand > 0:
+                    days_since = None
+                    if last_transaction:
+                        try:
+                            last_date = datetime.strptime(last_transaction, "%Y-%m-%d")
+                            days_since = (datetime.now() - last_date).days
+                        except:
+                            pass
+                    
+                    # Determine severity and recommendation
+                    if turnover_rate < 0.1:
+                        severity = "critical"
+                        urgency = "HIGH - Immediate action required"
+                        recommendation = "⚠️ CRITICAL: Consider markdown or bundle promotion immediately"
+                    elif turnover_rate < 0.3:
+                        severity = "warning"
+                        urgency = "MEDIUM - Review within 30 days"
+                        recommendation = "⚠️ Review pricing strategy or consider discontinuation"
+                    else:
+                        severity = "monitor"
+                        urgency = "LOW - Monitor monthly"
+                        recommendation = "Monitor sales velocity and consider promotional offers"
+                    
+                    if days_since and days_since > 180:
+                        recommendation = f"⚠️ No activity for {days_since} days - Consider write-off or deep discount"
+                    elif days_since and days_since > 90:
+                        recommendation = f"⚠️ No activity for {days_since} days - Bundle with popular items"
+                    elif on_hand > 1000 and turnover_rate < 0.1:
+                        recommendation = "📦 Excess stock - Run clearance sale immediately"
+                    
+                    slow_items.append({
+                        "ItemCode": item.get("ItemCode"),
+                        "ItemName": item.get("ItemName"),
+                        "TurnoverRate": round(turnover_rate, 2),
+                        "CurrentOnHand": on_hand,
+                        "CurrentIsCommited": committed,
+                        "PeriodOutQty": period_out_qty,
+                        "DaysSinceLastTransaction": days_since if days_since else "N/A",
+                        "Severity": severity,
+                        "Urgency": urgency,
+                        "Recommendation": recommendation,
+                    })
+            
+            slow_items.sort(key=lambda x: x["TurnoverRate"])
+            result = slow_items[:limit]
+            
+            for i, item in enumerate(result, 1):
+                item["rank"] = i
+                item["analysis_days"] = days
+                item["analysis_period"] = f"Last {days} days"
+                item["turnover_threshold"] = turnover_threshold
+            
+            logger.info(f"✅ Calculated {len(result)} slow moving items from inventory data")
+            return result
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Failed to calculate slow moving from inventory: {e}")
             return []
+
+    # -------------------------------------------------
+    # CACHE MANAGEMENT
+    # -------------------------------------------------
+    
+    def clear_cache(self):
+        """Clear all caches."""
+        self._customer_cache.clear()
+        self._customer_cache_time.clear()
+        self._vendor_cache.clear()
+        self._vendor_cache_time.clear()
+        self._lead_cache.clear()
+        self._lead_cache_time.clear()
+        self._endpoint_cache.clear()
+        
+        # Clear pricing service cache
+        if self._pricing_service:
+            self._pricing_service.clear_cache()
+        
+        # Clear Redis cache
+        cache = get_cache_service()
+        cache.clear()
+        
+        logger.info("LeyscoAPIService cache cleared")
+        self._stats["cache_hits"] = 0
+        self._stats["cache_misses"] = 0
+
+
+# Singleton instance
+_leysco_api_instance: Optional[LeyscoAPIService] = None
+
+
+def get_leysco_api_service() -> LeyscoAPIService:
+    """Get or create singleton instance."""
+    global _leysco_api_instance
+    if _leysco_api_instance is None:
+        _leysco_api_instance = LeyscoAPIService()
+        logger.info("✅ Created new LeyscoAPIService singleton instance")
+    return _leysco_api_instance

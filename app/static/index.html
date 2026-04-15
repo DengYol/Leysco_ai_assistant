@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+<title>Leysco AI Assistant</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+body { background:#0D1117; }
+
+/* SIDEBAR */
+.sidebar {
+    background:#161B22;
+    border-right:1px solid #30363D;
+    transition: transform 0.3s ease;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: #4b5563 #1f2937;
+}
+
+.sidebar-content::-webkit-scrollbar { width: 6px; }
+.sidebar-content::-webkit-scrollbar-track { background: #1f2937; border-radius: 3px; }
+.sidebar-content::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+
+.menu-item {
+    padding:10px 12px;
+    border-radius:10px;
+    cursor:pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.menu-item:hover { background:#21262D; color:#00C853; }
+.menu-item i { width: 20px; font-size: 14px; }
+
+.menu-category {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #6b7280;
+    padding: 12px 12px 6px 12px;
+    margin-top: 8px;
+    position: sticky;
+    top: 0;
+    background: #161B22;
+    z-index: 10;
+}
+
+.bubble {
+    max-width:80%;
+    padding:12px 16px;
+    border-radius:18px;
+    word-wrap: break-word;
+    line-height: 1.5;
+}
+.ai { background:#21262D; color: #e5e7eb; }
+.user { background:#00C853; color: #000; }
+
+.avatar {
+    width:32px;height:32px;
+    border-radius:50%;
+    background:linear-gradient(135deg,#00C853,#007B33);
+    display:flex;align-items:center;justify-content:center;
+    flex-shrink:0;
+}
+
+.input-box {
+    background:#21262D;
+    border:1px solid #30363D;
+    border-radius:30px;
+    padding:8px 16px;
+    transition: border-color 0.2s;
+}
+.input-box:focus-within { border-color: #00C853; }
+
+.mic-btn {
+    width:36px;height:36px;
+    border-radius:50%;
+    background:#00C853;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+    transition: all 0.2s;
+}
+.mic-btn:hover { background:#00e060; transform:scale(1.05); }
+.mic-btn.recording { animation: pulse 1.5s infinite; background:#ef4444; }
+
+@keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(239,68,68,0.7); }
+    70% { box-shadow: 0 0 0 10px rgba(239,68,68,0); }
+    100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+}
+
+.typing-dot {
+    width:8px;height:8px;
+    border-radius:50%;
+    background:#00C853;
+    animation:bounce 1s infinite alternate;
+}
+.typing-dot:nth-child(2){animation-delay:.2s}
+.typing-dot:nth-child(3){animation-delay:.4s}
+
+@keyframes bounce {
+    from { transform:translateY(0); opacity:0.5; }
+    to { transform:translateY(-8px); opacity:1; }
+}
+
+.chat-area::-webkit-scrollbar { width: 6px; }
+.chat-area::-webkit-scrollbar-track { background: #1f2937; }
+.chat-area::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.animate-fadeIn { animation: fadeIn 0.3s ease-out; }
+
+.menu-badge {
+    background: #00C853;
+    color: #000;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    margin-left: auto;
+    font-weight: bold;
+}
+
+.menu-badge-danger {
+    background: #ef4444;
+    color: white;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    margin-left: auto;
+    font-weight: bold;
+}
+
+.menu-divider {
+    height: 1px;
+    background: #30363D;
+    margin: 8px 12px;
+}
+
+.welcome-message {
+    text-align: center;
+    padding: 40px 20px;
+    color: #6b7280;
+}
+.welcome-message h2 { color: #00C853; margin-bottom: 16px; }
+
+@media (max-width: 768px) {
+    .sidebar {
+        position: fixed;
+        left: -280px;
+        top: 0;
+        bottom: 0;
+        z-index: 100;
+        width: 280px;
+        transition: left 0.3s ease;
+    }
+    .sidebar.open { left: 0; }
+    .mobile-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 99;
+        display: none;
+    }
+    .mobile-overlay.open { display: block; }
+    .bubble { max-width: 90%; }
+    .menu-toggle { display: block; }
+}
+
+.menu-toggle { display: none; cursor: pointer; padding: 8px; }
+</style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+
+<body class="text-white h-screen flex overflow-hidden">
+
+<div id="mobileOverlay" class="mobile-overlay" onclick="closeSidebar()"></div>
+
+<div id="sidebar" class="sidebar w-72 flex flex-col">
+    <div class="p-4 font-bold border-b border-gray-700 flex items-center justify-between flex-shrink-0">
+        <div class="flex items-center gap-2">
+            <i class="fas fa-robot text-green-500"></i>
+            <span>✨ Leysco AI</span>
+        </div>
+        <button id="closeSidebarBtn" class="md:hidden text-gray-400 hover:text-white">
+            <i class="fas fa-times"></i>
+        </button>
+    </div>
+
+    <div class="p-3 flex-shrink-0">
+        <button id="newChat" class="w-full bg-green-600 hover:bg-green-700 py-2 rounded-lg transition-colors flex items-center justify-center gap-2">
+            <i class="fas fa-plus-circle"></i> New Chat
+        </button>
+    </div>
+
+    <div class="sidebar-content">
+        <div class="menu-category"><i class="fas fa-chart-line mr-1"></i> 📈 ANALYTICS</div>
+        <div class="px-2 space-y-1">
+            <div class="menu-item" data-msg="Show me top 10 items">
+                <i class="fas fa-fire text-orange-400"></i> Top 10 Selling Items
+                <span class="menu-badge">🔥 HOT</span>
+            </div>
+            <div class="menu-item" data-msg="Show me top 5 items">
+                <i class="fas fa-trophy text-yellow-400"></i> Top 5 Best Sellers
+            </div>
+            <div class="menu-item" data-msg="Show me slow moving items">
+                <i class="fas fa-turtle text-red-400"></i> Slow Moving Items
+                <span class="menu-badge-danger">⚠️ ACTION</span>
+            </div>
+            <div class="menu-item" data-msg="Analyze inventory health">
+                <i class="fas fa-heartbeat text-pink-400"></i> Inventory Health
+            </div>
+            <div class="menu-item" data-msg="What should I reorder?">
+                <i class="fas fa-shopping-cart text-emerald-400"></i> Reorder Decisions
+            </div>
+        </div>
+
+        <div class="menu-divider"></div>
+
+        <div class="menu-category"><i class="fas fa-tag mr-1"></i> 💰 PRICING</div>
+        <div class="px-2 space-y-1">
+            <div class="menu-item" data-msg="price of" data-prompt="true">
+                <i class="fas fa-dollar-sign text-green-400"></i> Check Item Price
+            </div>
+            <div class="menu-item" data-msg="Best price for" data-prompt="true">
+                <i class="fas fa-trophy text-yellow-400"></i> Find Best Price
+            </div>
+            <div class="menu-item" data-msg="Competitor price for" data-prompt="true">
+                <i class="fas fa-chart-line text-orange-400"></i> Competitor Prices
+            </div>
+        </div>
+
+        <div class="menu-divider"></div>
+
+        <div class="menu-category"><i class="fas fa-boxes mr-1"></i> 📦 STOCK</div>
+        <div class="px-2 space-y-1">
+            <div class="menu-item" data-msg="Show items">
+                <i class="fas fa-box text-blue-400"></i> Browse Items
+            </div>
+            <div class="menu-item" data-msg="Stock level of" data-prompt="true">
+                <i class="fas fa-chart-line text-blue-400"></i> Check Stock Level
+            </div>
+            <div class="menu-item" data-msg="Low stock alerts">
+                <i class="fas fa-bell text-yellow-400"></i> Low Stock Alerts
+            </div>
+            <div class="menu-item" data-msg="Show warehouses">
+                <i class="fas fa-warehouse text-cyan-400"></i> Warehouses
+            </div>
+        </div>
+
+        <div class="menu-divider"></div>
+
+        <div class="menu-category"><i class="fas fa-users mr-1"></i> 👥 CUSTOMERS</div>
+        <div class="px-2 space-y-1">
+            <div class="menu-item" data-msg="Show customers">
+                <i class="fas fa-users text-purple-400"></i> View Customers
+            </div>
+            <div class="menu-item" data-msg="Customer details for" data-prompt="true">
+                <i class="fas fa-id-card text-cyan-400"></i> Customer Details
+            </div>
+            <div class="menu-item" data-msg="Orders for" data-prompt="true">
+                <i class="fas fa-shopping-bag text-yellow-400"></i> Customer Orders
+            </div>
+            <div class="menu-item" data-msg="Create a quotation" data-prompt="true">
+                <i class="fas fa-file-invoice-dollar text-pink-400"></i> Create Quotation
+            </div>
+            <div class="menu-item" data-msg="Outstanding deliveries">
+                <i class="fas fa-truck text-blue-400"></i> Track Deliveries
+            </div>
+        </div>
+
+        <div class="menu-divider"></div>
+
+        <div class="menu-category"><i class="fas fa-graduation-cap mr-1"></i> 🎓 HELP</div>
+        <div class="px-2 space-y-1">
+            <div class="menu-item" data-msg="Tell me about Leysco">
+                <i class="fas fa-info-circle text-blue-400"></i> About Leysco
+            </div>
+            <div class="menu-item" data-msg="Contact support">
+                <i class="fas fa-headset text-green-400"></i> Contact Support
+            </div>
+            <div class="menu-item" data-msg="What are your payment methods?">
+                <i class="fas fa-credit-card text-purple-400"></i> Payment Methods
+            </div>
+        </div>
+
+        <div class="menu-divider"></div>
+
+        <div class="menu-category"><i class="fas fa-history mr-1"></i> 📜 RECENT CHATS</div>
+        <div id="history" class="px-2 pb-4 text-sm text-gray-400"></div>
+    </div>
+
+    <div class="p-3 border-t border-gray-700 text-xs text-gray-500 flex justify-between items-center flex-shrink-0">
+        <span><i class="fas fa-circle text-green-500 text-[8px] mr-1"></i> Online</span>
+        <button id="clearAllChats" class="text-gray-500 hover:text-red-400 transition-colors">
+            <i class="fas fa-trash-alt"></i> Clear All
+        </button>
+    </div>
+</div>
+
+<div class="flex-1 flex flex-col overflow-hidden">
+
+<div class="flex items-center px-4 py-3 border-b border-gray-700 bg-gray-900/50 flex-shrink-0">
+    <button id="menuToggle" class="menu-toggle mr-3 text-gray-400 hover:text-white">
+        <i class="fas fa-bars text-xl"></i>
+    </button>
+    <div class="avatar mr-2">✨</div>
+    <div class="font-bold">Leysco AI Assistant</div>
+    <div class="ml-auto flex items-center gap-2">
+        <button id="voiceGlobalBtn" class="p-2 text-gray-400 hover:text-green-500 transition-colors rounded-lg" title="Voice Input">
+            <i class="fas fa-microphone text-lg"></i>
+        </button>
+    </div>
+</div>
+
+<div id="chatBox" class="flex-1 overflow-y-auto p-4 space-y-4 chat-area">
+    <div class="welcome-message">
+        <i class="fas fa-robot text-5xl text-gray-600 mb-4"></i>
+        <h2 class="text-xl font-bold">Welcome to Leysco AI Assistant</h2>
+        <p class="text-gray-400 mt-2">Ask me anything about products, pricing, stock, or customers!</p>
+        <div class="flex flex-wrap justify-center gap-2 mt-4">
+            <button class="suggestion-chip" data-suggestion="Show me top 10 items">🔥 Top 10 Items</button>
+            <button class="suggestion-chip" data-suggestion="Price of vegimax">💰 Price Check</button>
+            <button class="suggestion-chip" data-suggestion="Low stock alerts">⚠️ Low Stock</button>
+        </div>
+    </div>
+</div>
+
+<div class="p-4 border-t border-gray-700 bg-gray-900/30 flex-shrink-0">
+    <div class="flex items-center gap-2">
+        <div class="input-box flex items-center gap-2 flex-1">
+            <input id="input" class="flex-1 bg-transparent outline-none text-white" placeholder="Ask anything... (e.g., 'Show me top 10 items')">
+            <div id="micBtn" class="mic-btn">
+                <i class="fas fa-microphone text-white text-sm"></i>
+            </div>
+        </div>
+        <button id="sendBtn" class="w-12 h-12 bg-green-600 hover:bg-green-700 rounded-full transition-all flex items-center justify-center">
+            <i class="fas fa-paper-plane"></i>
+        </button>
+    </div>
+</div>
+
+</div>
+
+<script>
+// DOM Elements
+const chatBox = document.getElementById("chatBox");
+const historyEl = document.getElementById("history");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("sendBtn");
+const newChatBtn = document.getElementById("newChat");
+const menuToggle = document.getElementById("menuToggle");
+const closeSidebarBtn = document.getElementById("closeSidebarBtn");
+const sidebar = document.getElementById("sidebar");
+const mobileOverlay = document.getElementById("mobileOverlay");
+const clearAllChatsBtn = document.getElementById("clearAllChats");
+const voiceGlobalBtn = document.getElementById("voiceGlobalBtn");
+const micBtn = document.getElementById("micBtn");
+
+// API Configuration - Use relative URL since we're serving from FastAPI
+const API_URL = '/api/ai/chat';
+
+// State
+let chats = JSON.parse(localStorage.getItem("chats") || "[]");
+let currentChatId = null;
+let currentStreamInterval = null;
+let recognition = null;
+let isListening = false;
+let finalTranscript = "";
+
+function openSidebar() { sidebar.classList.add("open"); mobileOverlay.classList.add("open"); }
+function closeSidebar() { sidebar.classList.remove("open"); mobileOverlay.classList.remove("open"); }
+
+if (menuToggle) menuToggle.onclick = openSidebar;
+if (closeSidebarBtn) closeSidebarBtn.onclick = closeSidebar;
+
+function saveChats() {
+    localStorage.setItem("chats", JSON.stringify(chats));
+    localStorage.setItem("last_chat_id", currentChatId);
+}
+
+function createChat() {
+    const chat = { id: Date.now(), title: "New Chat", messages: [] };
+    chats.unshift(chat);
+    currentChatId = chat.id;
+    saveChats();
+    renderHistory();
+    renderChat();
+    input.focus();
+}
+
+function loadChat(id) {
+    currentChatId = id;
+    renderChat();
+    renderHistory();
+}
+
+function currentChat() { return chats.find(c => c.id === currentChatId); }
+
+function generateTitle(text) {
+    let title = text.split(" ").slice(0, 5).join(" ");
+    return title.length > 30 ? title.substring(0, 30) + "..." : title;
+}
+
+function renderHistory() {
+    if (!historyEl) return;
+    historyEl.innerHTML = "";
+    if (chats.length === 0) {
+        historyEl.innerHTML = '<div class="text-center text-gray-500 text-xs py-4">No chats yet</div>';
+        return;
+    }
+    chats.forEach(chat => {
+        const div = document.createElement("div");
+        div.className = `group flex items-center justify-between p-2 rounded-lg cursor-pointer transition-colors mb-1 ${chat.id === currentChatId ? "bg-gray-800 text-white" : "hover:bg-gray-800 text-gray-400"}`;
+        const titleSpan = document.createElement("span");
+        titleSpan.className = "truncate flex-1 text-sm";
+        titleSpan.innerText = chat.title;
+        titleSpan.onclick = (e) => { e.stopPropagation(); loadChat(chat.id); };
+        const deleteBtn = document.createElement("button");
+        deleteBtn.className = "opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 transition-all p-1";
+        deleteBtn.innerHTML = '<i class="fas fa-trash-alt text-xs"></i>';
+        deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (confirm("Delete this chat?")) {
+                chats = chats.filter(c => c.id !== chat.id);
+                if (currentChatId === chat.id) {
+                    currentChatId = chats.length > 0 ? chats[0].id : null;
+                    if (currentChatId) renderChat();
+                    else chatBox.innerHTML = '<div class="welcome-message"><i class="fas fa-robot text-5xl text-gray-600 mb-4"></i><h2 class="text-xl font-bold">Welcome to Leysco AI Assistant</h2><p class="text-gray-400 mt-2">Ask me anything!</p></div>';
+                }
+                saveChats();
+                renderHistory();
+                if (chats.length === 0) createChat();
+            }
+        };
+        div.appendChild(titleSpan);
+        div.appendChild(deleteBtn);
+        historyEl.appendChild(div);
+    });
+}
+
+async function sendToAI(message) {
+    const response = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: message, session_id: currentChatId ? currentChatId.toString() : null, stream: false })
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+}
+
+function formatMessageText(text) {
+    let formatted = text;
+    formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    formatted = formatted.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    formatted = formatted.replace(/```([\s\S]*?)```/g, '<pre class="bg-gray-900 p-2 rounded-lg overflow-x-auto text-xs"><code>$1</code></pre>');
+    formatted = formatted.replace(/`([^`]+)`/g, '<code class="bg-gray-900 px-1 py-0.5 rounded text-xs">$1</code>');
+    formatted = formatted.replace(/\n/g, '<br>');
+    return formatted;
+}
+
+function drawMessage(text, isUser) {
+    const welcomeMsg = chatBox.querySelector('.welcome-message');
+    if (welcomeMsg && chatBox.children.length === 1) welcomeMsg.remove();
+    
+    const row = document.createElement("div");
+    row.className = "flex " + (isUser ? "justify-end" : "justify-start") + " animate-fadeIn";
+    if (!isUser) {
+        const avatar = document.createElement("div");
+        avatar.className = "avatar mr-2 flex-shrink-0";
+        avatar.innerHTML = "✨";
+        row.appendChild(avatar);
+    }
+    const bubbleContainer = document.createElement("div");
+    bubbleContainer.className = "flex flex-col items-start max-w-[80%]";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble " + (isUser ? "user" : "ai") + " break-words";
+    bubble.innerHTML = formatMessageText(text);
+    const timestamp = document.createElement("div");
+    timestamp.className = "text-xs text-gray-500 mt-1 " + (isUser ? "text-right" : "text-left");
+    timestamp.innerText = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    bubbleContainer.appendChild(bubble);
+    bubbleContainer.appendChild(timestamp);
+    row.appendChild(bubbleContainer);
+    chatBox.appendChild(row);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function addMessage(text, isUser) {
+    if (!currentChat()) createChat();
+    drawMessage(text, isUser);
+    const chat = currentChat();
+    chat.messages.push({ text, isUser, timestamp: new Date().toISOString() });
+    if (isUser && chat.messages.length === 1) {
+        chat.title = generateTitle(text);
+        renderHistory();
+    }
+    saveChats();
+}
+
+function renderChat() {
+    chatBox.innerHTML = "";
+    const chat = currentChat();
+    if (!chat || chat.messages.length === 0) {
+        chatBox.innerHTML = '<div class="welcome-message"><i class="fas fa-robot text-5xl text-gray-600 mb-4"></i><h2 class="text-xl font-bold">Welcome to Leysco AI Assistant</h2><p class="text-gray-400 mt-2">Ask me anything about products, pricing, stock, or customers!</p><div class="flex flex-wrap justify-center gap-2 mt-4"><button class="suggestion-chip" data-suggestion="Show me top 10 items">🔥 Top 10 Items</button><button class="suggestion-chip" data-suggestion="Price of vegimax">💰 Price Check</button><button class="suggestion-chip" data-suggestion="Low stock alerts">⚠️ Low Stock</button></div></div>';
+        return;
+    }
+    chat.messages.forEach(m => drawMessage(m.text, m.isUser));
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function showTyping() {
+    hideTyping();
+    const row = document.createElement("div");
+    row.id = "typing";
+    row.className = "flex justify-start";
+    row.innerHTML = `<div class="avatar mr-2 flex-shrink-0">✨</div><div class="bubble ai"><div class="flex gap-1"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div></div>`;
+    chatBox.appendChild(row);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function hideTyping() { const typing = document.getElementById("typing"); if (typing) typing.remove(); }
+
+function streamText(fullText, onUpdate, speed = 12) {
+    if (currentStreamInterval) clearInterval(currentStreamInterval);
+    let i = 0, output = "";
+    currentStreamInterval = setInterval(() => {
+        if (i < fullText.length) {
+            output += fullText[i];
+            onUpdate(formatMessageText(output));
+            i++;
+        } else {
+            clearInterval(currentStreamInterval);
+            currentStreamInterval = null;
+        }
+    }, speed);
+}
+
+async function sendMessage(textOverride = null) {
+    let text = textOverride || input.value.trim();
+    if (!text) return;
+    addMessage(text, true);
+    input.value = "";
+    showTyping();
+    try {
+        const res = await sendToAI(text);
+        hideTyping();
+        let finalText = res.reply || res.result || "I couldn't process your request.";
+        const row = document.createElement("div");
+        row.className = "flex justify-start";
+        const avatar = document.createElement("div");
+        avatar.className = "avatar mr-2 flex-shrink-0";
+        avatar.innerHTML = "✨";
+        const bubbleContainer = document.createElement("div");
+        bubbleContainer.className = "flex flex-col items-start max-w-[80%]";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble ai break-words";
+        const timestamp = document.createElement("div");
+        timestamp.className = "text-xs text-gray-500 mt-1 text-left";
+        timestamp.innerText = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        bubbleContainer.appendChild(bubble);
+        bubbleContainer.appendChild(timestamp);
+        row.appendChild(avatar);
+        row.appendChild(bubbleContainer);
+        chatBox.appendChild(row);
+        streamText(finalText, (formatted) => { bubble.innerHTML = formatted; chatBox.scrollTop = chatBox.scrollHeight; });
+        setTimeout(() => {
+            const chat = currentChat();
+            if (chat) { chat.messages.push({ text: finalText, isUser: false, timestamp: new Date().toISOString() }); saveChats(); }
+        }, finalText.length * 12 + 200);
+    } catch (error) {
+        hideTyping();
+        console.error("Error:", error);
+        addMessage(`❌ Connection error: ${error.message}. Make sure the backend is running on port 8000.`, false);
+    }
+}
+
+function initSpeech() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return null;
+    const recog = new SpeechRecognition();
+    recog.continuous = false;
+    recog.interimResults = true;
+    recog.lang = "en-US";
+    return recog;
+}
+
+recognition = initSpeech();
+
+function startListening() {
+    if (!recognition) { alert("Voice not supported"); return; }
+    finalTranscript = "";
+    recognition.start();
+    isListening = true;
+    micBtn.classList.add("recording");
+    micBtn.innerHTML = '<i class="fas fa-stop text-white text-sm"></i>';
+}
+
+function stopListening() {
+    if (!recognition) return;
+    recognition.stop();
+    isListening = false;
+    micBtn.classList.remove("recording");
+    micBtn.innerHTML = '<i class="fas fa-microphone text-white text-sm"></i>';
+}
+
+if (micBtn) micBtn.onclick = () => { if (isListening) stopListening(); else startListening(); };
+if (voiceGlobalBtn) voiceGlobalBtn.onclick = startListening;
+
+if (recognition) {
+    recognition.onresult = (event) => {
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) finalTranscript += transcript + " ";
+            else interim += transcript;
+        }
+        input.value = (finalTranscript + interim).trim();
+    };
+    recognition.onend = () => {
+        micBtn.classList.remove("recording");
+        micBtn.innerHTML = '<i class="fas fa-microphone text-white text-sm"></i>';
+        isListening = false;
+        if (finalTranscript.trim().length > 2) sendMessage(finalTranscript.trim());
+        finalTranscript = "";
+    };
+    recognition.onerror = (event) => { console.error("Speech error:", event.error); stopListening(); };
+}
+
+document.querySelectorAll(".suggestion-chip").forEach(chip => {
+    chip.onclick = () => { const suggestion = chip.dataset.suggestion; if (suggestion) sendMessage(suggestion); };
+});
+
+document.querySelectorAll(".menu-item").forEach(item => {
+    item.onclick = () => {
+        let msg = item.dataset.msg;
+        const isPrompt = item.dataset.prompt === "true";
+        if (msg) {
+            if (isPrompt) {
+                let promptText = "";
+                if (msg === "price of") promptText = "Which item price do you want to know?";
+                else if (msg === "Competitor price for") promptText = "Which item do you want competitor prices for?";
+                else if (msg === "Best price for") promptText = "Which item do you want the best price for?";
+                else if (msg === "Create a quotation") promptText = "Create quotation for which customer?";
+                else if (msg === "Stock level of") promptText = "Check stock level for which item?";
+                else if (msg === "Customer details for") promptText = "Get details for which customer?";
+                else if (msg === "Orders for") promptText = "View orders for which customer?";
+                else promptText = `Enter details for: ${msg}`;
+                const promptMsg = prompt(promptText, "");
+                if (promptMsg && promptMsg.trim()) sendMessage(`${msg} ${promptMsg}`);
+            } else sendMessage(msg);
+        }
+        closeSidebar();
+    };
+});
+
+sendBtn.onclick = () => sendMessage();
+input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+newChatBtn.onclick = createChat;
+clearAllChatsBtn.onclick = () => { if (confirm("⚠️ Clear ALL chat history?")) { chats = []; createChat(); saveChats(); renderHistory(); renderChat(); } };
+
+const lastChat = localStorage.getItem("last_chat_id");
+if (chats.length === 0) createChat();
+else currentChatId = lastChat || chats[0].id;
+renderHistory();
+renderChat();
+input.focus();
+
+console.log("✅ Leysco AI Assistant Ready!");
+console.log(`🔗 API URL: ${API_URL}`);
+</script>
+</body>
+</html>

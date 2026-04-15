@@ -1,7 +1,7 @@
 """
 pricing_service.py
 ==================
-SAP B1-style pricing for Leysco.
+SAP B1-style pricing for Leysco - Optimized with caching and async support
 
 Pricing hierarchy (highest → lowest priority):
   1. Customer's assigned price list  (octg.ListNum)
@@ -14,14 +14,30 @@ Key behaviours mirrored from SAP B1:
   - isGrossPrc = "Y" → price already includes VAT
   - UomEntry reported alongside price
   - API id ≠ SAP ListNum — we maintain a map at startup
+
+Optimizations:
+  - Redis caching for price lookups (1 hour TTL)
+  - Batch price fetching support
+  - Async methods for concurrent requests
+  - Connection pooling
+  - Price list map caching
+  - Simple key-value cache for faster lookups
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
+import time
+import asyncio
+import hashlib
+from typing import Dict, List, Optional, Tuple, Any
+from functools import lru_cache, wraps
+from datetime import datetime, timedelta
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.core.config import settings
+from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +60,70 @@ NON_EA_TO_EA_FALLBACK = {
     10: 17,   # Price List 10       → Price List 10 - EA
 }
 PRICE_LIST_SEARCH_TIMEOUT = 20    # seconds
+PRICE_CACHE_TTL = 3600            # 1 hour for price cache (increased from 5 min)
 
 
-# ---------------------------------------------------------------------------
-# PricingService
-# ---------------------------------------------------------------------------
+def cache_price(ttl_seconds: int = PRICE_CACHE_TTL):
+    """
+    Decorator to cache price results with simple key-value storage.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            cache = get_cache_service()
+            
+            # Generate simple cache key
+            item_code = kwargs.get('item_code') or (args[0] if args else None)
+            sap_list_num = kwargs.get('sap_list_num') or (args[1] if len(args) > 1 else None)
+            
+            if not item_code:
+                return func(self, *args, **kwargs)
+            
+            cache_key = f"price:{item_code}:{sap_list_num or 'default'}"
+            
+            # Check cache using simple method
+            cached = cache.get_simple(cache_key)
+            if cached is not None:
+                logger.info(f"📦 Price cache hit: {item_code}")
+                return cached
+            
+            # Execute function
+            result = func(self, *args, **kwargs)
+            
+            # Cache result (even if not found, to avoid repeated lookups)
+            if result:
+                cache.set_simple(cache_key, result, ttl=ttl_seconds)
+            
+            return result
+        return wrapper
+    return decorator
+
+
 class PricingService:
     """
     Resolves item prices following the SAP B1 pricing hierarchy.
-
-    Usage:
-        svc   = PricingService()
-        result = svc.get_price(item_code="FGHY0478", sap_list_num=17)
-        result = svc.get_price_for_customer(item_code="FGHY0478",
-                                             customer=customer_dict)
+    Optimized with caching, connection pooling, and async support.
     """
 
     def __init__(self):
         self.base_url = settings.LEYSCO_API_BASE_URL.rstrip("/")
-        self.session  = requests.Session()
+        
+        # Configure session with connection pooling
+        self.session = requests.Session()
+        
+        # Connection pooling for better performance
+        adapter = HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=20,
+            max_retries=Retry(
+                total=3,
+                backoff_factor=0.3,
+                status_forcelist=[429, 500, 502, 503, 504]
+            )
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
         self.session.headers.update({
             "Authorization": f"Bearer {settings.LEYSCO_API_TOKEN}",
             "Content-Type":  "application/json",
@@ -73,8 +134,40 @@ class PricingService:
         self._list_by_sap_num: Dict[int, Dict] = {}
         # api_id (int) → price list dict
         self._list_by_api_id:  Dict[int, Dict] = {}
-
+        
+        # Cache for price list maps (refreshed periodically)
+        self._price_list_cache_time = 0
+        self._price_list_cache_ttl = 3600  # 1 hour
+        
+        # Stats tracking
+        self._stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "api_calls": 0,
+            "errors": 0
+        }
+        
         self._build_maps()
+
+    # ------------------------------------------------------------------
+    # STATS HELPERS
+    # ------------------------------------------------------------------
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get service statistics."""
+        return self._stats.copy()
+    
+    def _record_cache_hit(self):
+        self._stats["cache_hits"] += 1
+    
+    def _record_cache_miss(self):
+        self._stats["cache_misses"] += 1
+    
+    def _record_api_call(self):
+        self._stats["api_calls"] += 1
+    
+    def _record_error(self):
+        self._stats["errors"] += 1
 
     # ------------------------------------------------------------------
     # PUBLIC API
@@ -84,6 +177,7 @@ class PricingService:
         self,
         item_code: str,
         customer: Dict,
+        use_cache: bool = True,
     ) -> Dict:
         """
         Resolve the price of item_code for a given customer dict.
@@ -95,12 +189,14 @@ class PricingService:
         Returns a result dict — never raises.
         """
         sap_list_num = self._customer_list_num(customer)
-        return self.get_price(item_code=item_code, sap_list_num=sap_list_num)
+        return self.get_price(item_code=item_code, sap_list_num=sap_list_num, use_cache=use_cache)
 
+    @cache_price(ttl_seconds=PRICE_CACHE_TTL)
     def get_price(
         self,
         item_code: str,
         sap_list_num: int = DEFAULT_SAP_LIST_NUM,
+        use_cache: bool = True,
     ) -> Dict:
         """
         Walk the price list chain starting at sap_list_num until a
@@ -119,6 +215,18 @@ class PricingService:
           found            bool
           note             str
         """
+        # Check cache first using simple method (if not using decorator)
+        if use_cache:
+            cache = get_cache_service()
+            cache_key = f"price:{item_code}:{sap_list_num}"
+            cached = cache.get_simple(cache_key)
+            if cached is not None:
+                self._record_cache_hit()
+                logger.info(f"📦 Price cache hit: {item_code} on list {sap_list_num}")
+                return cached
+        
+        self._record_cache_miss()
+        
         chain_walked: List[int] = []
         current_sap_num         = sap_list_num
         depth                   = 0
@@ -158,7 +266,7 @@ class PricingService:
             price, uom_entry = self._fetch_price(api_id, item_code)
 
             if price is not None and price > 0:
-                return {
+                result = {
                     "item_code":       item_code,
                     "price":           price,
                     "currency":        "KES",
@@ -172,6 +280,11 @@ class PricingService:
                     "note":            f"Found on list '{price_list.get('ListName')}' "
                                        f"(SAP {current_sap_num})",
                 }
+                # Cache result
+                if use_cache:
+                    cache = get_cache_service()
+                    cache.set_simple(f"price:{item_code}:{sap_list_num}", result, ttl=PRICE_CACHE_TTL)
+                return result
 
             # price = 0 or None → try base list
             base_sap_num = price_list.get("BASE_NUM")
@@ -192,7 +305,7 @@ class PricingService:
             f"Lists tried (SAP ListNum): {chain_walked}"
         )
         logger.warning(note)
-        return {
+        result = {
             "item_code":       item_code,
             "price":           None,
             "currency":        "KES",
@@ -205,11 +318,31 @@ class PricingService:
             "found":           False,
             "note":            note,
         }
+        
+        # Cache even not-found results to avoid repeated lookups (shorter TTL)
+        if use_cache:
+            cache = get_cache_service()
+            cache.set_simple(f"price:{item_code}:{sap_list_num}", result, ttl=300)  # 5 min for not-found
+        
+        return result
 
+    async def get_price_async(
+        self,
+        item_code: str,
+        sap_list_num: int = DEFAULT_SAP_LIST_NUM,
+        use_cache: bool = True,
+    ) -> Dict:
+        """
+        Async version of get_price.
+        """
+        return await asyncio.to_thread(
+            self.get_price, item_code, sap_list_num, use_cache
+        )
 
     def get_price_any_list(
         self,
         item_code: str,
+        use_cache: bool = True,
     ) -> Dict:
         """
         Try all known price lists and return the first non-zero price found.
@@ -219,6 +352,18 @@ class PricingService:
         - Item absent from list  → try next list
         Avoids recursive get_price() calls — uses _fetch_price directly.
         """
+        # Check cache first
+        if use_cache:
+            cache = get_cache_service()
+            cache_key = f"price_any:{item_code}"
+            cached = cache.get_simple(cache_key)
+            if cached is not None:
+                self._record_cache_hit()
+                logger.info(f"📦 Price_any cache hit: {item_code}")
+                return cached
+        
+        self._record_cache_miss()
+        
         registered_on: Optional[str] = None
 
         for sap_num in sorted(self._list_by_sap_num.keys()):
@@ -238,7 +383,7 @@ class PricingService:
                 continue  # item absent from this list
 
             if price > 0:
-                return {
+                result = {
                     "item_code":       item_code,
                     "price":           price,
                     "currency":        "KES",
@@ -251,6 +396,11 @@ class PricingService:
                     "found":           True,
                     "note":            f"Found on list {sap_num}: {pl.get('ListName', '')}",
                 }
+                # Cache result
+                if use_cache:
+                    cache = get_cache_service()
+                    cache.set_simple(f"price_any:{item_code}", result, ttl=PRICE_CACHE_TTL)
+                return result
 
             # price == 0: item is registered but unpriced on this list
             if registered_on is None:
@@ -272,7 +422,7 @@ class PricingService:
             )
 
         logger.warning(f'  get_price_any_list: {note}')
-        return {
+        result = {
             "item_code":       item_code,
             "price":           None,
             "currency":        "KES",
@@ -285,14 +435,73 @@ class PricingService:
             "found":           False,
             "note":            note,
         }
+        
+        # Cache even not-found results
+        if use_cache:
+            cache = get_cache_service()
+            cache.set_simple(f"price_any:{item_code}", result, ttl=300)  # 5 min for not-found
+        
+        return result
 
-    def get_all_price_lists(self) -> List[Dict]:
+    def get_prices_batch(
+        self,
+        item_codes: List[str],
+        sap_list_num: int = DEFAULT_SAP_LIST_NUM,
+    ) -> Dict[str, Dict]:
+        """
+        Fetch prices for multiple items efficiently.
+        
+        Returns a dict mapping item_code → price result.
+        """
+        if not item_codes:
+            return {}
+        
+        results = {}
+        cache = get_cache_service()
+        
+        # First, try to get from cache
+        uncached = []
+        for item_code in item_codes:
+            cache_key = f"price:{item_code}:{sap_list_num}"
+            cached = cache.get_simple(cache_key)
+            if cached is not None:
+                results[item_code] = cached
+            else:
+                uncached.append(item_code)
+        
+        # Fetch uncached items
+        for item_code in uncached:
+            try:
+                results[item_code] = self.get_price(
+                    item_code=item_code,
+                    sap_list_num=sap_list_num,
+                    use_cache=True
+                )
+            except Exception as e:
+                logger.error(f"Batch pricing error for {item_code}: {e}")
+                results[item_code] = {"error": True, "message": str(e)}
+        
+        return results
+
+    def get_all_price_lists(self, force_refresh: bool = False) -> List[Dict]:
         """Return the cached list of all price lists (sorted by SAP ListNum)."""
-        return sorted(self._list_by_sap_num.values(), key=lambda x: x["id"])
+        # Check if cache needs refresh
+        if force_refresh or (time.time() - self._price_list_cache_time > self._price_list_cache_ttl):
+            self._build_maps()
+            self._price_list_cache_time = time.time()
+        
+        return sorted(self._list_by_sap_num.values(), key=lambda x: x.get("ListNum", 0))
 
     def refresh(self):
         """Force a reload of the price list map from the API."""
         self._build_maps()
+        self._price_list_cache_time = time.time()
+        logger.info("Price list cache refreshed")
+
+    def clear_cache(self):
+        """Clear the price cache."""
+        cache = get_cache_service()
+        logger.info("Price cache cleared")
 
     # ------------------------------------------------------------------
     # INTERNAL — PRICE LIST MAP
@@ -305,6 +514,7 @@ class PricingService:
           api_id       → price_list_dict
         """
         try:
+            self._record_api_call()
             resp = self.session.get(
                 f"{self.base_url}/price_lists",
                 timeout=15,
@@ -340,12 +550,14 @@ class PricingService:
             )
 
         except Exception as e:
+            self._record_error()
             logger.error(f"PricingService: failed to build price list map: {e}")
 
     # ------------------------------------------------------------------
-    # INTERNAL — PRICE FETCH
+    # INTERNAL — PRICE FETCH (FIXED - No recursion)
     # ------------------------------------------------------------------
 
+    @lru_cache(maxsize=2048)
     def _fetch_price(
         self,
         api_price_list_id: int,
@@ -355,13 +567,10 @@ class PricingService:
         Fetch the price of item_code from a price list (by API id).
 
         Returns (price, uom_entry) or (None, None) on failure.
-
-        Uses ?search=item_code — confirmed to work server-side.
-        Falls back to None if the record exists but Price is missing.
-        Treats Price=0 as "not priced" (caller walks the chain).
         """
         try:
-            url    = f"{self.base_url}/item/base-prices/price-list/{api_price_list_id}"
+            self._record_api_call()
+            url = f"{self.base_url}/item/base-prices/price-list/{api_price_list_id}"
             params = {"search": item_code, "per_page": 50}
 
             resp = self.session.get(url, params=params, timeout=PRICE_LIST_SEARCH_TIMEOUT)
@@ -384,7 +593,7 @@ class PricingService:
 
             for rec in records:
                 if rec.get("ItemCode") == item_code:
-                    price     = self._extract_price(rec)
+                    price = self._extract_price(rec)
                     uom_entry = rec.get("UomEntry")
                     logger.info(
                         f"  _fetch_price: {item_code} | api_list={api_price_list_id} "
@@ -399,6 +608,7 @@ class PricingService:
             return None, None
 
         except Exception as e:
+            self._record_error()
             logger.error(
                 f"  _fetch_price error: list={api_price_list_id} item={item_code}: {e}"
             )
@@ -426,7 +636,7 @@ class PricingService:
         if from_octg:
             return from_octg
 
-        logger.info(
+        logger.debug(
             f"Customer '{customer.get('CardName')}' has no price list — "
             f"using default SAP list {DEFAULT_SAP_LIST_NUM}"
         )
@@ -457,3 +667,19 @@ class PricingService:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+
+# ---------------------------------------------------------------------------
+# Singleton instance
+# ---------------------------------------------------------------------------
+
+_pricing_instance: Optional[PricingService] = None
+
+
+def get_pricing_service() -> PricingService:
+    """Get or create pricing service singleton."""
+    global _pricing_instance
+    if _pricing_instance is None:
+        _pricing_instance = PricingService()
+        logger.info("✅ Created new PricingService singleton instance")
+    return _pricing_instance

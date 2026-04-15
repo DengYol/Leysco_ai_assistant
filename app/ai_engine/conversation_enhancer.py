@@ -1,10 +1,16 @@
 """
 Conversation Enhancer - Makes all responses more natural and conversational
+Optimized with caching and async support.
 """
 import logging
 import random
+import asyncio
+import hashlib
 from typing import Dict, Any, List, Optional
+from functools import lru_cache, wraps
 import re
+
+from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +19,7 @@ class ConversationEnhancer:
     """
     Enhances responses to make them more conversational and human-like.
     Adds personality, context-appropriate tone, and natural language.
+    Optimized with caching for better performance.
     """
     
     def __init__(self):
@@ -47,6 +54,13 @@ class ConversationEnhancer:
                 "I found these customers:",
                 "Your customer list:",
                 "Here are the customers I found:"
+            ],
+            # Customer Segmentation (NEW)
+            "FIND_CUSTOMERS_BY_ITEM": [
+                "🎯 Here are the customers who buy this product:",
+                "I found these potential buyers:",
+                "👥 Here are the customers interested in this item:",
+                "Here's your customer segmentation analysis:"
             ],
             "COMPANY_INFO": [
                 "🏢 Let me tell you about Leysco!",
@@ -200,7 +214,8 @@ class ConversationEnhancer:
             "recommendations": "🔄 Generated {count} recommendation{s}",
             "opportunities": "💰 Found {count} opportunity{s}",
             "insights": "📋 Generated {count} insight{s}",
-            "forecast": "📈 Created forecast for {count} item{s}"
+            "forecast": "📈 Created forecast for {count} item{s}",
+            "segmentation": "👥 Found {count} customer{s} for this product"
         }
         
         # Contextual tips
@@ -219,7 +234,8 @@ class ConversationEnhancer:
             "GET_REORDER_DECISIONS": "Need forecasts too? Try 'forecast demand for [item]'.",
             "ANALYZE_PRICING_OPPORTUNITIES": "Check specific items with 'price analysis for [item]'.",
             "ANALYZE_CUSTOMER_BEHAVIOR": "Compare customers with 'analyze multiple customers'.",
-            "FORECAST_DEMAND": "Adjust forecast period with 'forecast for 60 days'."
+            "FORECAST_DEMAND": "Adjust forecast period with 'forecast for 60 days'.",
+            "FIND_CUSTOMERS_BY_ITEM": "You can create quotations for these customers with 'create quotation for [customer]'."
         }
         
         # Intents that have their own formatting and should NOT get openers
@@ -236,7 +252,8 @@ class ConversationEnhancer:
             "GET_LOW_STOCK_ALERTS",
             "GREETING",
             "THANKS",
-            "SMALL_TALK"
+            "SMALL_TALK",
+            "FIND_CUSTOMERS_BY_ITEM"  # Customer segmentation has its own formatting
         }
         
         # Intents that should NOT get tips
@@ -247,7 +264,8 @@ class ConversationEnhancer:
             "GET_CROSS_SELL",
             "GET_UPSELL",
             "GET_SEASONAL_RECOMMENDATIONS",
-            "GET_TRENDING_PRODUCTS"
+            "GET_TRENDING_PRODUCTS",
+            "FIND_CUSTOMERS_BY_ITEM"
         }
         
         # Intents that should NOT get closers
@@ -255,13 +273,68 @@ class ConversationEnhancer:
             "GET_CROSS_SELL",
             "GET_UPSELL",
             "GET_SEASONAL_RECOMMENDATIONS",
-            "GET_TRENDING_PRODUCTS"
+            "GET_TRENDING_PRODUCTS",
+            "FIND_CUSTOMERS_BY_ITEM"
         }
-    
+        
+        # Cache for enhanced responses
+        self._cache = {}
+        self._cache_ttl = 300  # 5 minutes
+
+    def _get_cache_key(self, intent: str, message: str, data_hash: str) -> str:
+        """Generate cache key for enhanced response."""
+        return f"enhanced:{intent}:{hashlib.md5(message.encode()).hexdigest()}:{data_hash}"
+
+    def _get_data_hash(self, data: Optional[List]) -> str:
+        """Generate hash from data for cache key."""
+        if not data:
+            return "none"
+        # Simple hash of first few items
+        import json
+        data_str = json.dumps(data[:5] if len(data) > 5 else data, default=str)
+        return hashlib.md5(data_str.encode()).hexdigest()[:16]
+
+    @lru_cache(maxsize=256)
+    def _get_opener_cached(self, intent: str, has_thank: bool, has_sorry: bool) -> str:
+        """Cached version of opener selection."""
+        if has_thank:
+            return random.choice([
+                "You're very welcome! 😊",
+                "My pleasure!",
+                "Happy to help!",
+                "Anytime!"
+            ])
+        
+        if has_sorry:
+            return random.choice([
+                "No problem at all!",
+                "No worries!",
+                "That's okay!",
+                "No need to apologize!"
+            ])
+        
+        # Get intent-based opener
+        openers = self.openers.get(intent, self.openers["UNKNOWN"])
+        
+        # Don't use UNKNOWN openers for known intents (prevents "Hmm..." messages)
+        if intent != "UNKNOWN" and openers == self.openers["UNKNOWN"]:
+            return ""  # Return empty string for known intents
+        
+        return random.choice(openers)
+
     def enhance(self, intent: str, original_message: str, data: Optional[List] = None, user_message: str = "") -> str:
         """
-        Take a raw response and make it conversational
+        Take a raw response and make it conversational.
+        Optimized with caching.
         """
+        # Check cache
+        data_hash = self._get_data_hash(data)
+        cache_key = self._get_cache_key(intent, original_message, data_hash)
+        
+        if cache_key in self._cache:
+            logger.info(f"⚡ Enhancement cache hit: {intent}")
+            return self._cache[cache_key]
+        
         # Clean up the original message (remove any existing prefixes)
         clean_message = self._clean_message(original_message)
         
@@ -270,7 +343,9 @@ class ConversationEnhancer:
         
         # Choose an appropriate opener (skip for intents with their own formatting)
         if intent not in self.SKIP_OPENER_INTENTS:
-            opener = self._get_opener(intent, user_message)
+            has_thank = "thank" in user_message.lower()
+            has_sorry = "sorry" in user_message.lower()
+            opener = self._get_opener_cached(intent, has_thank, has_sorry)
             if opener:
                 enhanced = f"{opener}\n\n{enhanced}"
         
@@ -290,7 +365,20 @@ class ConversationEnhancer:
         if intent not in self.SKIP_CLOSER_INTENTS:
             enhanced += random.choice(self.closers)
         
+        # Cache the result
+        self._cache[cache_key] = enhanced
+        # Clean old cache entries if needed
+        if len(self._cache) > 500:
+            # Remove oldest 100 entries
+            oldest_keys = list(self._cache.keys())[:100]
+            for key in oldest_keys:
+                del self._cache[key]
+        
         return enhanced
+    
+    async def enhance_async(self, intent: str, original_message: str, data: Optional[List] = None, user_message: str = "") -> str:
+        """Async version of enhance."""
+        return await asyncio.to_thread(self.enhance, intent, original_message, data, user_message)
     
     def _clean_message(self, message: str) -> str:
         """Remove any existing prefixes or formatting that might duplicate"""
@@ -305,7 +393,8 @@ class ConversationEnhancer:
             r"^📊.*?\n",
             r"^⚠️.*?\n",
             r"^✅.*?\n",
-            r"^🎓.*?\n"
+            r"^🎓.*?\n",
+            r"^🎯.*?\n"
         ]
         
         cleaned = message
@@ -313,34 +402,6 @@ class ConversationEnhancer:
             cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
         
         return cleaned.strip()
-    
-    def _get_opener(self, intent: str, user_message: str) -> str:
-        """Get appropriate opener based on intent and context"""
-        # Check for specific keywords in user message
-        if "thank" in user_message.lower():
-            return random.choice([
-                "You're very welcome! 😊",
-                "My pleasure!",
-                "Happy to help!",
-                "Anytime!"
-            ])
-        
-        if "sorry" in user_message.lower():
-            return random.choice([
-                "No problem at all!",
-                "No worries!",
-                "That's okay!",
-                "No need to apologize!"
-            ])
-        
-        # Get intent-based opener
-        openers = self.openers.get(intent, self.openers["UNKNOWN"])
-        
-        # Don't use UNKNOWN openers for known intents (prevents "Hmm..." messages)
-        if intent != "UNKNOWN" and openers == self.openers["UNKNOWN"]:
-            return ""  # Return empty string for known intents
-        
-        return random.choice(openers)
     
     def _get_data_summary(self, intent: str, data: List) -> Optional[str]:
         """Generate a summary of the data found"""
@@ -353,8 +414,10 @@ class ConversationEnhancer:
         # Determine data type
         intent_lower = intent.lower()
         
-        if "ITEM" in intent_lower and "PRICE" not in intent_lower:
+        if "ITEM" in intent_lower and "PRICE" not in intent_lower and "FIND_CUSTOMERS" not in intent_lower:
             template = self.data_summaries.get("items", "Found {count} item{s}")
+        elif "CUSTOMER" in intent_lower and "FIND_CUSTOMERS" in intent_lower:
+            template = self.data_summaries.get("segmentation", "Found {count} customer{s} for this product")
         elif "CUSTOMER" in intent_lower:
             template = self.data_summaries.get("customers", "Found {count} customer{s}")
         elif "PRICE" in intent_lower:
@@ -427,6 +490,11 @@ class ConversationEnhancer:
                 "✅ Done! Your quotation is ready.",
                 "🎯 Perfect! Quotation has been created."
             ],
+            "FIND_CUSTOMERS_BY_ITEM": [
+                "🎯 Great! Now you know who to target!",
+                "✅ Found your potential customers!",
+                "🎉 Ready to reach out to these customers!"
+            ],
             "default": [
                 "✅ Done!",
                 "🎉 Success!",
@@ -436,3 +504,12 @@ class ConversationEnhancer:
         
         choices = celebrations.get(action, celebrations["default"])
         return random.choice(choices)
+    
+    def clear_cache(self):
+        """Clear the enhancement cache."""
+        self._cache.clear()
+        logger.info("Conversation enhancer cache cleared")
+
+
+# Module-level singleton
+conversation_enhancer = ConversationEnhancer()
