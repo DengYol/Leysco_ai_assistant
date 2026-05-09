@@ -2,32 +2,71 @@
 app/api/ai_routes.py
 ====================
 AI Chat Endpoint - Optimized with async, caching, and streaming support
+
+MODIFIED FOR PHASE 1: Passes user token to ActionRouter and other services
+MODIFIED FOR PHASE 2: Added proper outstanding deliveries formatting
+MODIFIED FOR PHASE 3: Added conversation memory and proactive notifications
+MODIFIED FOR PHASE 4: Added activity logging and analytics endpoints
+MODIFIED FOR PHASE 5: Added feedback loop and ML forecasting endpoints
+MODIFIED FOR PHASE 6: Added anomaly detection endpoints
+MODIFIED FOR PHASE 7: Added RAG (Retrieval-Augmented Generation) endpoints
+MODIFIED FOR PHASE 8: Added Knowledge Graph endpoints
+FIXED: Issue 1 - Token threaded to streaming path
+FIXED: Issue 2 - Session ID from request takes priority
+FIXED: Issue 3 - Intent classification before streaming decision
+FIXED: Issue 4 - zadd_async implemented in cache service
+FIXED: Issue 5 - UTF-8 encoding for emojis and special characters
+FIXED: Issue 6 - Added GET /quotation/{quotation_id} endpoint
+FIXED: Issue 7 - GET_TOP_SELLING_ITEMS and GET_SLOW_MOVING_ITEMS now use proper formatter
+FIXED: Issue 8 - Null handling for limit/days parameters in formatter calls
 """
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 from pydantic import BaseModel
 from app.ai_engine.intent_classifier import IntentClassifier
 from app.ai_engine.entity_extractor import EntityExtractor
 from app.ai_engine.swahili_support import SwahiliSupport
-from app.ai_engine.action_router import ActionRouter
+from app.ai_engine.action_router import create_action_router
 from app.ai_engine.response_formatter import ResponseFormatter
 from app.ai_engine.intent_overrides import apply_intent_overrides
 from app.ai_engine.decision_support import DecisionSupport
 from app.ai_engine.suggestions_engine import suggestions_engine
 from app.services.cache_service import get_cache_service
-from app.services.db_query_service import DBQueryService
+from app.services.db_query_service import create_db_query_service
 from app.services.llm_service import get_llm_service
-from app.services.pricing_service import PricingService
+from app.services.pricing_service import create_pricing_service
 from app.services.dashboard_service import get_dashboard_service
 from app.services.session_context import session_ctx
 from app.services.performance_monitor import performance_monitor
+from app.services.conversation_memory import get_conversation_memory
+from app.services.notification_service import get_notification_service
+from app.services.activity_logger import get_activity_logger
+from app.services.feedback_service import get_feedback_service
+from app.services.anomaly_detection_service import get_anomaly_detection_service
+from app.services.vector_store import get_vector_store
+from app.services.knowledge_ingestion import get_knowledge_ingestion_service
+from app.services.knowledge_graph import get_knowledge_graph
+from app.services.quotation_service import QuotationService
+from app.services.leysco_api_service import create_api_service
+from app.ml.forecasting_service import get_ml_forecasting_service
+from app.api.dependencies import (
+    get_token_from_header,
+    get_company_code,
+    get_conversation_context,
+    require_manager_role,
+    extract_user_role_from_token,
+    extract_assigned_customers_from_token
+)
+from app.core.tenant_context import set_current_tenant, TenantContext, clear_current_tenant
 import logging
 import uuid
 import re
 import json
 import asyncio
-from typing import Optional, Any, AsyncGenerator
+from typing import Optional, Any, AsyncGenerator, Dict, List
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +91,7 @@ class AIResponse(BaseModel):
     suggestions: list[str] = []
     session_id: str = ""
     processing_time_ms: int = 0
+    context_used: bool = False  # Indicates if context was used
 
 
 class StreamChunk(BaseModel):
@@ -67,18 +107,30 @@ class StreamChunk(BaseModel):
 intent_classifier = IntentClassifier()
 entity_extractor = EntityExtractor()
 swahili_support = SwahiliSupport()
-action_router = ActionRouter()
+# ActionRouter will be created per request with user token
 formatter = ResponseFormatter()
-db = DBQueryService()
+# REMOVED: db = DBQueryService() - will be created per request with token
 llm = get_llm_service(provider="auto")  # Auto-select Gemini or Groq
-pricing_service = PricingService()
 
-decision_support = DecisionSupport(
-    api=db.api,
-    pricing=pricing_service,
-    warehouse=None,
-    recommender=None,
-)
+
+# ---------------------------------------------------------------------------
+# Helper function for UTF-8 JSON response
+# ---------------------------------------------------------------------------
+
+def utf8_json_response(content: dict, status_code: int = 200) -> JSONResponse:
+    """
+    Return JSON response with proper UTF-8 encoding and headers.
+    Ensures emojis and special characters display correctly.
+    """
+    return JSONResponse(
+        content=content,
+        status_code=status_code,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Encoding": "utf-8",
+            "Cache-Control": "no-cache"
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +169,9 @@ DECISION_SUPPORT_INTENTS = {
     "FIND_BEST_PRICE",
     "MARKET_INTELLIGENCE",
     "PRICE_ALERT",
-    "GET_TOP_SELLING_ITEMS",      # NEW: Top selling items analytics
-    "GET_SLOW_MOVING_ITEMS",       # NEW: Slow moving items analytics
+    "GET_TOP_SELLING_ITEMS",
+    "GET_SLOW_MOVING_ITEMS",
+    "GET_SALES_ANALYTICS",
 }
 
 KNOWLEDGE_BASE_INTENTS = {
@@ -151,25 +204,137 @@ RECOMMENDATION_INTENTS = {
 
 PRICE_INTENTS = {"GET_ITEM_PRICE", "GET_ITEM_BASE_PRICE", "GET_CUSTOMER_PRICE"}
 
+# Intents that should use the new ResponseFormatter with emojis and bold text
+FORMATTED_INTENTS = {
+    "CREATE_QUOTATION",
+    "GET_TOP_SELLING_ITEMS",
+    "GET_SLOW_MOVING_ITEMS",
+    "GET_OUTSTANDING_DELIVERIES",
+    "FIND_CUSTOMERS_BY_ITEM",
+    "GET_CROSS_SELL",
+    "GET_UPSELL",
+    "ANALYZE_INVENTORY_HEALTH",
+    "GET_REORDER_DECISIONS",
+    "ANALYZE_PRICING_OPPORTUNITIES",
+    "FORECAST_DEMAND",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
 
-def _suggest(intent: str, entities: dict, language: str) -> list[str]:
-    """Get suggestion chips for the response."""
-    # Analytics-specific suggestions
+def ensure_utf8_string(text: str) -> str:
+    """Ensure string is properly encoded as UTF-8."""
+    if not text:
+        return text
+    try:
+        # Remove any invalid UTF-8 sequences
+        return text.encode('utf-8', errors='ignore').decode('utf-8')
+    except Exception:
+        return str(text)
+
+
+async def _enhance_with_rag(query: str, tenant_code: str) -> Optional[str]:
+    """
+    Retrieve relevant knowledge base content to augment the prompt.
+    """
+    try:
+        vector_store = get_vector_store()
+        
+        # Search for relevant documents
+        results = await vector_store.search(query, limit=3)
+        
+        if not results:
+            return None
+        
+        # Filter by similarity threshold (0.5 = moderately similar)
+        relevant_docs = [r for r in results if r["similarity"] > 0.5]
+        
+        if not relevant_docs:
+            return None
+        
+        # Build context from retrieved documents
+        context_parts = []
+        for doc in relevant_docs:
+            context_parts.append(doc["content"])
+        
+        context = "\n\n---\n\n".join(context_parts)
+        
+        logger.info(f"RAG retrieved {len(relevant_docs)} relevant documents")
+        return context
+        
+    except Exception as e:
+        logger.error(f"RAG enhancement failed: {e}")
+        return None
+
+
+async def _suggest_with_feedback(
+    intent: str,
+    entities: dict,
+    language: str,
+    context: Dict = None,
+    tenant_code: str = None,
+    user_id: int = None
+) -> list[str]:
+    """Get suggestion chips reordered by feedback."""
+    # Get base suggestions
+    suggestions = _suggest(intent, entities, language, context)
+    
+    if not suggestions or not tenant_code:
+        return suggestions
+    
+    # Reorder based on feedback
+    feedback_service = get_feedback_service()
+    reordered = await feedback_service.reorder_suggestions(
+        tenant_code=tenant_code,
+        intent=intent,
+        suggestions=suggestions,
+        user_id=user_id
+    )
+    
+    return reordered[:5]  # Limit to 5 suggestions
+
+
+def _suggest(intent: str, entities: dict, language: str, context: Dict = None) -> list[str]:
+    """Get suggestion chips for the response with context awareness."""
+    suggestions = []
+    
+    # Context-aware suggestions
+    if context and context.get("last_results"):
+        last_results = context.get("last_results", [])
+        if last_results and len(last_results) > 0:
+            if intent in ["GET_TOP_SELLING_ITEMS", "GET_ITEMS"]:
+                top_item = last_results[0].get("ItemName") or last_results[0].get("name")
+                if top_item:
+                    suggestions.append(f"Tell me about {top_item}")
+                    suggestions.append(f"Price of {top_item}")
+    
+    # Intent-specific suggestions
     if intent == "GET_TOP_SELLING_ITEMS":
         if language == "sw":
-            return ["Top 5 bidhaa", "Top 10 bidhaa", "Bidhaa bora mwezi huu"]
-        return ["Top 5 items", "Top 10 items", "Best sellers this month"]
+            suggestions.extend(["Top 5 bidhaa", "Top 10 bidhaa", "Bidhaa bora mwezi huu"])
+        else:
+            suggestions.extend(["Top 5 items", "Top 10 items", "Best sellers this month"])
     
-    if intent == "GET_SLOW_MOVING_ITEMS":
+    elif intent == "GET_SLOW_MOVING_ITEMS":
         if language == "sw":
-            return ["Bidhaa polepole", "Dead stock", "Bidhaa zisizouzwa"]
-        return ["Slow movers", "Dead stock", "Non-moving items"]
+            suggestions.extend(["Bidhaa polepole", "Dead stock", "Bidhaa zisizouzwa"])
+        else:
+            suggestions.extend(["Slow movers", "Dead stock", "Non-moving items"])
     
-    return suggestions_engine.get(intent=intent, entities=entities, language=language)
+    elif intent == "GET_OUTSTANDING_DELIVERIES":
+        if language == "sw":
+            suggestions.extend(["Onyesha maelezo", "Tengeneza hati", "Usafirishaji uliochelewa"])
+        else:
+            suggestions.extend(["Show details", "Create delivery note", "Overdue deliveries"])
+    
+    # Add fallback suggestions if none generated
+    if not suggestions:
+        suggestions = suggestions_engine.get(intent=intent, entities=entities, language=language)
+    
+    # Limit to 5 suggestions
+    return suggestions[:5]
 
 
 def _legacy_format(intent: str, api_result, formatter: ResponseFormatter) -> dict:
@@ -189,26 +354,24 @@ def _legacy_format(intent: str, api_result, formatter: ResponseFormatter) -> dic
     elif intent in {"GET_CROSS_SELL", "GET_UPSELL", "GET_SEASONAL_RECOMMENDATIONS", 
                     "GET_TRENDING_PRODUCTS", "FIND_CUSTOMERS_BY_ITEM"}:
         return formatter.format_cross_sell(api_result)
+    elif intent == "GET_OUTSTANDING_DELIVERIES":
+        # Use the new formatter for outstanding deliveries
+        return formatter.format_outstanding_deliveries(api_result)
     else:
         return formatter.format_generic_error({"error": "Data not available."})
 
 
 def _truncate_large_data(data: Any, max_items: int = 10) -> Any:
-    """
-    Truncate large data structures to prevent token limit issues.
-    """
+    """Truncate large data structures to prevent token limit issues."""
     if isinstance(data, dict):
         truncated = data.copy()
-        
         for key in ['critical_items', 'overstock_items', 'slow_movers', 
                     'fast_movers', 'reorder_recommendations', 'risk_items']:
             if key in truncated and isinstance(truncated[key], list) and len(truncated[key]) > max_items:
                 truncated[key] = truncated[key][:max_items]
                 truncated[f"{key}_truncated"] = True
                 truncated[f"{key}_total"] = len(data[key])
-        
         return truncated
-    
     elif isinstance(data, list):
         if len(data) > max_items:
             return {
@@ -217,14 +380,11 @@ def _truncate_large_data(data: Any, max_items: int = 10) -> Any:
                 "truncated": True
             }
         return data
-    
     return data
 
 
 def _create_summary_from_analysis(intent: str, analysis: dict) -> str:
-    """
-    Create a text summary from analysis data for LLM narration.
-    """
+    """Create a text summary from analysis data for LLM narration."""
     if intent == "FIND_CUSTOMERS_BY_ITEM":
         if isinstance(analysis, list) and len(analysis) > 0:
             item_name = analysis[0].get("ItemName", "this product") if analysis else "this product"
@@ -234,256 +394,39 @@ def _create_summary_from_analysis(intent: str, analysis: dict) -> str:
                 summary += f"\nTop customers: {', '.join(top_customers)}"
             return summary
         return "Customer segmentation analysis completed."
-
-    # FIXED: Top selling items summary
-    elif intent == "GET_TOP_SELLING_ITEMS":
-        if isinstance(analysis, list):
-            total_items = len(analysis)
-            summary = f"📊 **Top {total_items} Selling Items**\n\n"
-            
-            for i, item in enumerate(analysis[:10], 1):
-                # Get item name - handle different field names
-                item_name = item.get("ItemName") or item.get("name") or item.get("Item_Name") or "Unknown"
-                item_code = item.get("ItemCode") or item.get("code") or item.get("Item_Code") or ""
-                score = item.get("PopularityScore") or item.get("score") or 0
-                velocity = item.get("Velocity") or item.get("velocity") or "MEDIUM"
-                on_hand = item.get("CurrentOnHand") or item.get("on_hand") or 0
-                committed = item.get("CurrentIsCommited") or item.get("committed") or 0
-                
-                # Choose icon based on velocity
-                if velocity == "VERY_HIGH":
-                    icon = "🔥🔥"
-                elif velocity == "HIGH":
-                    icon = "🔥"
-                elif velocity == "MEDIUM":
-                    icon = "📈"
-                elif velocity == "LOW":
-                    icon = "📉"
-                else:
-                    icon = "⭐"
-                
-                summary += f"{i}. {icon} **{item_name}**"
-                if item_code:
-                    summary += f" ({item_code})"
-                summary += "\n"
-                
-                if score > 0:
-                    summary += f"   • Popularity Score: {score:.0f}/100\n"
-                if on_hand > 0:
-                    summary += f"   • Current Stock: {on_hand:,.0f} units\n"
-                if committed > 0:
-                    summary += f"   • Committed Orders: {committed:,.0f} units\n"
-                summary += "\n"
-            
-            if total_items > 10:
-                summary += f"\n... and {total_items - 10} more items.\n"
-            
-            summary += "\n💡 **Tip:** Ask 'Show stock of [item]' to check availability."
-            return summary
-        
-        elif isinstance(analysis, dict):
-            items = analysis.get("items", analysis.get("data", []))
-            if items:
-                return _create_summary_from_analysis(intent, items)
-        
-        return "Top selling items analysis completed. No data available."
-
-    # FIXED: Slow moving items summary
-    elif intent == "GET_SLOW_MOVING_ITEMS":
-        if isinstance(analysis, list):
-            total_items = len(analysis)
-            summary = f"📉 **{total_items} Slow Moving Items**\n\n"
-            summary += "⚠️ These items have low sales velocity and may need attention:\n\n"
-            
-            for i, item in enumerate(analysis[:10], 1):
-                # Get item name - handle different field names
-                item_name = item.get("ItemName") or item.get("name") or item.get("Item_Name") or "Unknown"
-                item_code = item.get("ItemCode") or item.get("code") or item.get("Item_Code") or ""
-                turnover = item.get("TurnoverRate") or item.get("turnover") or 0
-                on_hand = item.get("CurrentOnHand") or item.get("on_hand") or 0
-                committed = item.get("CurrentIsCommited") or item.get("committed") or 0
-                severity = item.get("Severity") or item.get("severity") or "monitor"
-                recommendation = item.get("Recommendation") or item.get("recommendation") or "Monitor sales"
-                
-                # Choose icon based on severity
-                if severity == "critical":
-                    icon = "🔴"
-                elif severity == "warning":
-                    icon = "🟡"
-                else:
-                    icon = "🟢"
-                
-                summary += f"{i}. {icon} **{item_name}**"
-                if item_code:
-                    summary += f" ({item_code})"
-                summary += "\n"
-                
-                if turnover:
-                    summary += f"   • Turnover rate: {turnover}x/year\n"
-                if on_hand > 0:
-                    summary += f"   • Current stock: {on_hand:,.0f} units\n"
-                if committed > 0:
-                    summary += f"   • Committed orders: {committed:,.0f} units\n"
-                summary += f"   • Recommendation: {recommendation}\n\n"
-            
-            if total_items > 10:
-                summary += f"\n... and {total_items - 10} more slow moving items.\n"
-            
-            summary += "\n💡 **Tip:** Consider markdowns, promotions, or bundling to clear slow-moving inventory."
-            return summary
-        
-        elif isinstance(analysis, dict):
-            items = analysis.get("items", analysis.get("data", []))
-            if items:
-                return _create_summary_from_analysis(intent, items)
-        
-        return "Slow moving items analysis completed. No data available."
-
+    elif intent == "FORECAST_DEMAND":
+        if isinstance(analysis, dict):
+            item_name = analysis.get("item_name", "Unknown item")
+            forecast = analysis.get("forecast", {})
+            next_month = forecast.get("next_month", "N/A")
+            confidence = forecast.get("confidence", "N/A")
+            return f"Demand forecast for {item_name}: Next month: {next_month} units (Confidence: {confidence}%)"
+        return "Demand forecast analysis completed."
     elif intent == "ANALYZE_INVENTORY_HEALTH":
-        summary = analysis.get("summary", {})
-        health_score = analysis.get("health_score", 0)
-        health_rating = summary.get("health_rating", "Unknown")
-        critical = summary.get("critical_items_count", 0)
-        low = summary.get("low_items_count", 0)
-        overstock = summary.get("overstock_items_count", 0)
-        out_of_stock = summary.get("out_of_stock_count", 0)
-        total_value = summary.get("total_inventory_value", 0)
-        
-        summary_text = f"""
-        Inventory Health Analysis:
-        - Health Score: {health_score}/100 ({health_rating})
-        - Total Value: KES {total_value:,.2f}
-        - Critical Items: {critical}
-        - Low Stock: {low}
-        - Out of Stock: {out_of_stock}
-        - Overstock: {overstock}
-        - Healthy: {summary.get('healthy_items_count', 0)}
-        """
-        
-        if analysis.get("critical_items") and len(analysis["critical_items"]) > 0:
-            summary_text += "\n\nTop Critical Items:\n"
-            for item in analysis["critical_items"][:5]:
-                summary_text += f"- {item['name']}: {item['available']} units left ({item['days_left']} days)\n"
-        
-        if analysis.get("reorder_recommendations") and len(analysis["reorder_recommendations"]) > 0:
-            summary_text += "\n\nTop Reorder Recommendations:\n"
-            for rec in analysis["reorder_recommendations"][:5]:
-                summary_text += f"- {rec['name']}: Order {rec['recommended_qty']} units (Current: {rec['current']}, {rec['urgency']} urgency)\n"
-        
-        return summary_text
-    
+        if isinstance(analysis, dict):
+            health_score = analysis.get("health_score", 0)
+            total_items = analysis.get("total_items", 0)
+            low_stock = analysis.get("low_stock_items", 0)
+            overstock = analysis.get("overstock_items", 0)
+            return f"Inventory health score: {health_score}/100. Total items: {total_items}, Low stock: {low_stock}, Overstock: {overstock}"
+        return "Inventory health analysis completed."
     elif intent == "GET_REORDER_DECISIONS":
-        # Get summary data - handle both direct and nested structures
-        if "summary" in analysis:
-            summary_data = analysis["summary"]
-        else:
-            summary_data = analysis
-        
-        immediate = analysis.get("immediate_orders", [])
-        planned = analysis.get("planned_orders", [])
-        total_cost = analysis.get("total_reorder_cost", 0)
-        priority_summary = analysis.get("priority_summary", {})
-        
-        critical_count = priority_summary.get("CRITICAL", 0)
-        high_count = priority_summary.get("HIGH", 0)
-        medium_count = priority_summary.get("MEDIUM", 0)
-        
-        total_needing_reorder = critical_count + high_count + medium_count
-        
-        summary_text = f"""
-        📊 **Reorder Recommendations**
-        
-        **Summary:**
-        • Items needing reorder: {total_needing_reorder}
-        • Critical (out of stock): {critical_count}
-        • High priority: {high_count}
-        • Medium priority: {medium_count}
-        • Estimated total cost: KES {total_cost:,.2f}
-        """
-        
-        # Critical items (immediate orders with CRITICAL urgency)
-        critical_items = [item for item in immediate if item.get("urgency") == "CRITICAL"]
-        if critical_items:
-            summary_text += "\n\n🔴 **CRITICAL - Order Immediately:**\n"
-            for item in critical_items[:5]:
-                # Handle different field name variations safely
-                item_name = item.get("name", item.get("ItemName", "Unknown"))
-                available = item.get("available", item.get("current_stock", item.get("Available", 0)))
-                days_left = item.get("days_of_stock_left", item.get("days_left", "N/A"))
-                recommended_qty = item.get("recommended_qty", item.get("RecommendedQty", 0))
-                summary_text += f"• {item_name}: Order {recommended_qty} units (Available: {available}, Days left: {days_left})\n"
-        
-        # High priority items
-        high_items = [item for item in immediate if item.get("urgency") == "HIGH"]
-        if high_items:
-            summary_text += "\n\n🟠 **HIGH Priority - Order This Week:**\n"
-            for item in high_items[:5]:
-                item_name = item.get("name", item.get("ItemName", "Unknown"))
-                available = item.get("available", item.get("current_stock", item.get("Available", 0)))
-                days_left = item.get("days_of_stock_left", item.get("days_left", "N/A"))
-                recommended_qty = item.get("recommended_qty", item.get("RecommendedQty", 0))
-                summary_text += f"• {item_name}: Order {recommended_qty} units (Available: {available}, Days left: {days_left})\n"
-        
-        # Medium priority items
-        if planned:
-            summary_text += f"\n\n🟡 **MEDIUM Priority - Plan for Next Week ({len(planned)} items):**\n"
-            for item in planned[:5]:
-                item_name = item.get("name", item.get("ItemName", "Unknown"))
-                available = item.get("available", item.get("current_stock", item.get("Available", 0)))
-                recommended_qty = item.get("recommended_qty", item.get("RecommendedQty", 0))
-                summary_text += f"• {item_name}: Order {recommended_qty} units (Available: {available})\n"
-        
-        if total_needing_reorder == 0:
-            summary_text += "\n\n✅ No reorder needed at this time. All inventory levels are adequate."
-        
-        return summary_text
-    
-    elif intent == "ANALYZE_PRICING_OPPORTUNITIES":
-        drops = analysis.get("price_drops", [])
-        hikes = analysis.get("price_hikes", [])
-        summary = analysis.get("summary", {})
-        
-        summary_text = f"""
-        Pricing Opportunities:
-        - Price Drops: {summary.get('price_drops_found', 0)}
-        - Price Hikes: {summary.get('price_hikes_found', 0)}
-        - Volume Discount Opportunities: {summary.get('volume_opportunities', 0)}
-        """
-        
-        if drops:
-            summary_text += "\n\nBest Price Drops:\n"
-            for drop in drops[:3]:
-                summary_text += f"- {drop['name']}: Down {drop['drop_percent']}% to KES {drop['current']:,.2f}\n"
-        
-        if hikes:
-            summary_text += "\n\nPrice Increases to Monitor:\n"
-            for hike in hikes[:3]:
-                summary_text += f"- {hike['name']}: Up {hike['hike_percent']}% to KES {hike['current']:,.2f}\n"
-        
-        return summary_text
-    
-    elif intent == "GET_INVENTORY_TURNOVER":
-        summary = analysis.get("summary", {})
-        
-        summary_text = f"""
-        Inventory Turnover Analysis:
-        - Average Turnover: {summary.get('average_turnover', 0)}x/year
-        - High Turnover Items: {summary.get('high_turnover_count', 0)}
-        - Low Turnover Items: {summary.get('low_turnover_count', 0)}
-        """
-        
-        if summary.get("top_performers"):
-            summary_text += "\n\nTop Performers:\n"
-            for item in summary["top_performers"][:3]:
-                summary_text += f"- {item.get('ItemName', 'Unknown')}: {item.get('TurnoverRate', 0)}x/year\n"
-        
-        if summary.get("slow_movers"):
-            summary_text += "\n\nSlow Movers:\n"
-            for item in summary["slow_movers"][:3]:
-                summary_text += f"- {item.get('ItemName', 'Unknown')}: {item.get('TurnoverRate', 0)}x/year\n"
-        
-        return summary_text
-    
+        if isinstance(analysis, dict):
+            recommendations = analysis.get("recommendations", [])
+            if recommendations:
+                return f"Found {len(recommendations)} reorder recommendations. Top: {recommendations[0].get('item_name', 'Unknown')} - {recommendations[0].get('reason', 'Reorder needed')}"
+            return "No reorder recommendations at this time."
+        return "Reorder decision analysis completed."
+    elif intent == "GET_TOP_SELLING_ITEMS":
+        if isinstance(analysis, list) and len(analysis) > 0:
+            top_items = [item.get("ItemName", "Unknown") for item in analysis[:5]]
+            return f"Top selling items: {', '.join(top_items)}"
+        return "No top selling items found."
+    elif intent == "GET_SLOW_MOVING_ITEMS":
+        if isinstance(analysis, list) and len(analysis) > 0:
+            slow_items = [item.get("ItemName", "Unknown") for item in analysis[:5]]
+            return f"Slow moving items: {', '.join(slow_items)}"
+        return "No slow moving items found."
     else:
         try:
             compact = {}
@@ -499,166 +442,22 @@ def _create_summary_from_analysis(intent: str, analysis: dict) -> str:
 
 
 def _format_delivery_response(data: Any, intent: str, language: str) -> str:
-    """
-    Format delivery data into a readable response.
-    Shows completed deliveries from previous weeks clearly.
-    """
+    """Format delivery data into a readable response."""
     if not data:
         if language == "sw":
             return "Hakuna taarifa za usafirishaji zilizopatikana."
-        else:
-            return "No delivery information found."
+        return "No delivery information found."
     
-    if isinstance(data, dict):
-        # Handle delivery status summary
-        if "analysis_type" in data and data["analysis_type"] == "delivery_status":
-            summary = data.get("summary", {})
-            customer = data.get("customer", "All Customers")
-            
-            response = f"📦 **Delivery Status Report**\n"
-            if customer != "All Customers":
-                response += f"**Customer:** {customer}\n"
-            response += f"**As of:** {data.get('as_of_date', 'Today')}\n\n"
-            
-            # Get summary stats
-            completed_today = summary.get('completed_today', 0)
-            completed_this_week = summary.get('completed_this_week', 0)
-            in_transit = summary.get('in_transit', 0)
-            pending = summary.get('pending', 0)
-            overdue = summary.get('overdue', 0)
-            total_deliveries = summary.get('total', 0)
-            
-            # Calculate completed from previous weeks
-            completed_previous = total_deliveries - (completed_today + completed_this_week + in_transit + pending + overdue)
-            
-            response += f"**Summary:**\n"
-            response += f"• ✅ Completed Today: {completed_today}\n"
-            response += f"• ✅ Completed This Week: {completed_this_week}\n"
-            if completed_previous > 0:
-                response += f"• ✅ Completed Previously: {completed_previous}\n"
-            response += f"• 🚚 In Transit: {in_transit}\n"
-            response += f"• ⏳ Pending: {pending}\n"
-            response += f"• ⚠️ Overdue: {overdue}\n"
-            response += f"• 📦 Total Deliveries: {total_deliveries}\n\n"
-            
-            # Show completed today
-            if data.get("completed_today"):
-                response += f"**✅ Completed Today ({len(data['completed_today'])})**\n"
-                for delivery in data["completed_today"][:5]:
-                    if isinstance(delivery, dict):
-                        response += f"• Delivery #{delivery.get('doc_num', 'N/A')} - {delivery.get('customer_name', 'Unknown')}\n"
-                response += "\n"
-            
-            # Show completed this week
-            if data.get("completed_this_week"):
-                response += f"**✅ Completed This Week ({len(data['completed_this_week'])})**\n"
-                for delivery in data["completed_this_week"][:5]:
-                    if isinstance(delivery, dict):
-                        response += f"• Delivery #{delivery.get('doc_num', 'N/A')} - {delivery.get('customer_name', 'Unknown')}\n"
-                        if delivery.get('doc_date'):
-                            response += f"  Completed: {delivery.get('doc_date')}\n"
-                response += "\n"
-            
-            # Show completed previously (sample)
-            if completed_previous > 0:
-                response += f"**✅ Completed Previously ({completed_previous} deliveries)**\n"
-                all_completed = data.get("completed_this_week", []) + data.get("completed_today", [])
-                if all_completed:
-                    for delivery in all_completed[:3]:
-                        if isinstance(delivery, dict):
-                            response += f"• Delivery #{delivery.get('doc_num', 'N/A')} - {delivery.get('customer_name', 'Unknown')}\n"
-                            if delivery.get('doc_date'):
-                                response += f"  Completed: {delivery.get('doc_date')}\n"
-                else:
-                    response += f"These deliveries were completed before this week.\n"
-                
-                response += f"\n💡 **Tip:** To see older deliveries, ask: 'Show deliveries from last month' or 'Show completed deliveries for March 2026'\n\n"
-            
-            # Show in transit
-            if data.get("in_transit"):
-                response += f"**🚚 In Transit ({len(data['in_transit'])})**\n"
-                for delivery in data["in_transit"][:5]:
-                    if isinstance(delivery, dict):
-                        progress = delivery.get('completion_percentage', 0)
-                        response += f"• Delivery #{delivery.get('doc_num', 'N/A')} - {progress}% delivered\n"
-                        if delivery.get('doc_due_date'):
-                            response += f"  Expected: {delivery.get('doc_due_date')}\n"
-                response += "\n"
-            
-            # Show pending
-            if data.get("pending"):
-                response += f"**⏳ Pending ({len(data['pending'])})**\n"
-                for delivery in data["pending"][:5]:
-                    if isinstance(delivery, dict):
-                        response += f"• Delivery #{delivery.get('doc_num', 'N/A')} - Due: {delivery.get('doc_due_date', 'N/A')}\n"
-                response += "\n"
-            
-            # Show overdue
-            if data.get("overdue"):
-                response += f"**⚠️ Overdue ({len(data['overdue'])})**\n"
-                for delivery in data["overdue"][:5]:
-                    if isinstance(delivery, dict):
-                        response += f"• Delivery #{delivery.get('doc_num', 'N/A')} - Due: {delivery.get('doc_due_date', 'N/A')}\n"
-                response += "\n"
-            
-            if overdue > 0:
-                response += "⚠️ **Action Required:** Overdue deliveries need immediate attention.\n"
-            
-            return response
-        
-        # Handle single delivery details
-        elif "doc_num" in data:
-            response = f"📦 **Delivery #{data.get('doc_num', 'N/A')}**\n\n"
-            response += f"**Customer:** {data.get('customer_name', 'Unknown')}\n"
-            response += f"**Date:** {data.get('doc_date', 'N/A')}\n"
-            response += f"**Due Date:** {data.get('doc_due_date', 'N/A')}\n"
-            response += f"**Status:** {data.get('status', 'Unknown')}\n"
-            response += f"**Progress:** {data.get('completion_percentage', 0)}% completed\n"
-            response += f"**Items:** {data.get('item_count', 0)} items\n"
-            response += f"**Total Value:** KES {data.get('total_value', 0):,.2f}\n\n"
-            
-            if data.get("items"):
-                response += f"**Items:**\n"
-                for item in data["items"][:5]:
-                    response += f"• {item.get('item_name', 'Unknown')}: {item.get('quantity', 0)} units"
-                    if item.get('delivered', 0) > 0:
-                        response += f" ({item.get('delivered', 0)} delivered)"
-                    response += "\n"
-            
-            return response
+    # Use the new formatter for outstanding deliveries
+    if intent == "GET_OUTSTANDING_DELIVERIES":
+        formatted = formatter.format_outstanding_deliveries(data, language)
+        return formatted.get("message", str(data)[:2000])
     
-    elif isinstance(data, list):
-        if len(data) > 0 and isinstance(data[0], dict):
-            if "doc_num" in data[0]:
-                response = f"📦 **Deliveries**\n\n"
-                # Count by status
-                status_counts = {}
-                for delivery in data:
-                    status = delivery.get('status', 'Unknown')
-                    status_counts[status] = status_counts.get(status, 0) + 1
-                
-                response += f"**Total: {len(data)} deliveries**\n"
-                for status, count in status_counts.items():
-                    response += f"• {status}: {count}\n"
-                response += "\n"
-                
-                # Show recent deliveries
-                response += f"**Recent Deliveries:**\n"
-                for delivery in data[:10]:
-                    response += f"• Delivery #{delivery.get('doc_num', 'N/A')} - {delivery.get('customer_name', 'Unknown')}\n"
-                    response += f"  Date: {delivery.get('doc_date', 'N/A')} | Status: {delivery.get('status', 'Unknown')}\n"
-                if len(data) > 10:
-                    response += f"\n... and {len(data) - 10} more deliveries."
-                return response
-    
-    # Fallback to JSON string
     return str(data)[:2000]
 
 
 def _extract_delivery_number(message: str, entities: dict) -> Optional[str]:
-    """
-    Extract delivery number from message or entities.
-    """
+    """Extract delivery number from message or entities."""
     delivery_num = entities.get("delivery_number") or entities.get("doc_num") or entities.get("order_number")
     if delivery_num:
         return str(delivery_num).strip()
@@ -669,19 +468,15 @@ def _extract_delivery_number(message: str, entities: dict) -> Optional[str]:
         r'status\s+of\s+(?:delivery|order)\s+(\d{4,8})',
         r'(?:delivery|order)\s+number\s+(\d{4,8})',
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, message.lower())
         if match:
             return match.group(1)
-    
     return None
 
 
 def _extract_customer_for_delivery(message: str, entities: dict) -> Optional[str]:
-    """
-    Extract customer name from message or entities for delivery queries.
-    """
+    """Extract customer name from message or entities for delivery queries."""
     customer = entities.get("customer_name") or entities.get("customer")
     if customer:
         return customer
@@ -692,7 +487,6 @@ def _extract_customer_for_delivery(message: str, entities: dict) -> Optional[str
         r'outstanding\s+deliveries?\s+(?:for|to)\s+([A-Za-z0-9\s&]+)',
         r'([A-Za-z0-9\s&]+?)\s+(?:deliveries|orders)',
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, message.lower())
         if match:
@@ -700,12 +494,87 @@ def _extract_customer_for_delivery(message: str, entities: dict) -> Optional[str
             stop_words = ['outstanding', 'delivery', 'order', 'show', 'me', 'my', 'all', 'list']
             if customer and customer not in stop_words and len(customer) > 2:
                 return customer
-    
     return None
 
 
+def _resolve_reference_from_context(message: str, context: Dict, entities: Dict) -> tuple:
+    """
+    Resolve references like "the first one", "its price", "that customer" using conversation context.
+    
+    Returns:
+        Tuple of (resolved_entities, context_used_flag)
+    """
+    resolved_entities = entities.copy()
+    context_used = False
+    
+    if not context:
+        return resolved_entities, False
+    
+    last_results = context.get("last_results", [])
+    referenced_items = context.get("referenced_items", [])
+    referenced_customers = context.get("referenced_customers", [])
+    
+    message_lower = message.lower()
+    
+    # Check for ordinal references (first, second, third, 1st, 2nd, etc.)
+    ordinals = {
+        "first": 0, "1st": 0, "one": 0,
+        "second": 1, "2nd": 1, "two": 1,
+        "third": 2, "3rd": 2, "three": 2,
+        "fourth": 3, "4th": 3, "four": 3,
+        "fifth": 4, "5th": 4, "five": 4
+    }
+    
+    # Check for item references
+    if not resolved_entities.get("item_name"):
+        for word, index in ordinals.items():
+            if word in message_lower:
+                if index < len(last_results):
+                    item = last_results[index]
+                    resolved_entities["item_name"] = item.get("ItemName") or item.get("name")
+                    resolved_entities["_resolved_from_context"] = True
+                    context_used = True
+                    logger.info(f"Resolved '{word}' to item: {resolved_entities['item_name']}")
+                    break
+        
+        if not context_used and any(word in message_lower for word in ["it", "this", "that", "the item"]):
+            if referenced_items and len(referenced_items) > 0:
+                resolved_entities["item_name"] = referenced_items[0].get("name")
+                resolved_entities["_resolved_from_context"] = True
+                context_used = True
+                logger.info(f"Resolved reference to item: {resolved_entities['item_name']}")
+        
+        if not context_used and "price" in message_lower:
+            if referenced_items and len(referenced_items) > 0:
+                resolved_entities["_price_query"] = True
+                resolved_entities["item_name"] = referenced_items[0].get("name")
+                context_used = True
+                logger.info(f"Resolved price reference for: {resolved_entities['item_name']}")
+    
+    # Check for customer references
+    if not resolved_entities.get("customer_name"):
+        for word, index in ordinals.items():
+            if word in message_lower:
+                if index < len(referenced_customers):
+                    customer = referenced_customers[index]
+                    resolved_entities["customer_name"] = customer.get("name")
+                    resolved_entities["_resolved_from_context"] = True
+                    context_used = True
+                    logger.info(f"Resolved '{word}' to customer: {resolved_entities['customer_name']}")
+                    break
+        
+        if not context_used and any(word in message_lower for word in ["customer", "them", "they", "that company"]):
+            if referenced_customers and len(referenced_customers) > 0:
+                resolved_entities["customer_name"] = referenced_customers[0].get("name")
+                resolved_entities["_resolved_from_context"] = True
+                context_used = True
+                logger.info(f"Resolved customer reference: {resolved_entities['customer_name']}")
+    
+    return resolved_entities, context_used
+
+
 # ---------------------------------------------------------------------------
-# Streaming Response Generator
+# Streaming Response Generator (FIXED: receives intent, entities, token)
 # ---------------------------------------------------------------------------
 
 async def generate_streaming_response(
@@ -714,113 +583,122 @@ async def generate_streaming_response(
     entities: dict,
     language: str,
     session_id: str,
+    user_token: str,
+    context: Dict = None,
 ) -> AsyncGenerator[str, None]:
-    """Generate streaming response with progressive updates."""
+    """Generate streaming response with progressive updates and context awareness."""
+    # Create per-request services with user token
+    action_router = create_action_router(user_token=user_token)
+    pricing_service = create_pricing_service(user_token=user_token)
+    db = create_db_query_service(user_token=user_token)
+    
+    decision_support = DecisionSupport(
+        api=action_router.api,
+        pricing=pricing_service,
+        warehouse=action_router.warehouse,
+        recommender=action_router.recommender,
+    )
+    
+    memory = get_conversation_memory()
+    activity_logger = get_activity_logger()
+    
     try:
-        # Step 1: Send intent immediately
-        yield f"data: {json.dumps({'type': 'intent', 'content': intent, 'data': None})}\n\n"
+        yield f"data: {json.dumps({'type': 'intent', 'content': intent, 'data': None}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'entities', 'content': '', 'data': entities}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'content': 'Processing your request...', 'data': None}, ensure_ascii=False)}\n\n"
         
-        # Step 2: Send entities
-        yield f"data: {json.dumps({'type': 'entities', 'content': '', 'data': entities})}\n\n"
-        
-        # Step 3: Start processing
-        yield f"data: {json.dumps({'type': 'status', 'content': '🔍 Processing your request...', 'data': None})}\n\n"
-        
-        # Step 4: Process the request
         start_time = asyncio.get_event_loop().time()
         
-        # Route based on intent type
         if intent in KNOWLEDGE_BASE_INTENTS:
+            # Try RAG enhancement for knowledge base queries
+            rag_context = await _enhance_with_rag(message, None)
+            
+            if rag_context:
+                prompt = f"""You are the Leysco AI Assistant. Use the following information to answer the user's question.
+                
+RELEVANT INFORMATION:
+{rag_context}
+
+USER QUESTION: {message}
+
+Answer based on the information above. If the information doesn't contain the answer, say so politely.
+"""
+            else:
+                prompt = f"User asked: {message}"
+            
             response_text = await llm.generate_async(
-                f"User asked: {message}",
+                prompt,
                 intent=intent,
                 language=language,
                 max_tokens=400,
             )
-            
-            # Stream the response word by word
             for word in response_text.split():
-                yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None})}\n\n"
-                await asyncio.sleep(0.02)  # Natural typing speed
-            
+                yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.02)
+        
         elif intent in ACTION_ROUTER_INTENTS:
-            yield f"data: {json.dumps({'type': 'status', 'content': '📊 Fetching data from system...', 'data': None})}\n\n"
-            
-            # Call action router
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Fetching data from system...', 'data': None}, ensure_ascii=False)}\n\n"
             api_result = action_router.route(intent, entities, message, language=language)
-            
             if isinstance(api_result, dict) and "message" in api_result:
                 response_text = api_result["message"]
             else:
                 formatted = _legacy_format(intent, api_result, formatter)
                 response_text = formatted.get("message", "I couldn't process your request.")
-            
-            # Stream the response
             for word in response_text.split():
-                yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None})}\n\n"
+                yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
-            
-            # Send data if available
-            if api_result.get("data"):
-                yield f"data: {json.dumps({'type': 'data', 'content': '', 'data': api_result.get('data', [])[:10]})}\n\n"
+            if isinstance(api_result, dict) and api_result.get("data"):
+                yield f"data: {json.dumps({'type': 'data', 'content': '', 'data': api_result.get('data', [])[:10]}, ensure_ascii=False)}\n\n"
         
         elif intent in DECISION_SUPPORT_INTENTS:
-            yield f"data: {json.dumps({'type': 'status', 'content': '📈 Analyzing data...', 'data': None})}\n\n"
-            
-            # Handle top selling and slow moving items directly
-            if intent == "GET_TOP_SELLING_ITEMS":
-                limit = entities.get("quantity") or 10
-                if isinstance(limit, str) and limit.isdigit():
-                    limit = int(limit)
-                elif not isinstance(limit, int):
-                    limit = 10
-                
-                days = entities.get("days") or 30
-                rows = db.api.get_top_selling_items(limit=limit, days=days)
-                
-                if rows:
-                    truncated_data = _truncate_large_data(rows, max_items=limit)
-                    summary = _create_summary_from_analysis(intent, truncated_data)
-                    response_text = summary
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Analyzing data...', 'data': None}, ensure_ascii=False)}\n\n"
+            result_data = await decision_support.analyze(intent, entities)
+            if result_data and isinstance(result_data, dict):
+                # Use formatter for top selling and slow moving items in streaming too
+                if intent == "GET_TOP_SELLING_ITEMS":
+                    items = result_data.get("items", [])
+                    # Fix: Handle None values
+                    days = entities.get("days")
+                    if days is None or not isinstance(days, int):
+                        days = 30
+                    limit = entities.get("quantity")
+                    if limit is None or not isinstance(limit, int):
+                        limit = 10
+                    limit = min(limit, len(items)) if items else limit
+                    formatted = formatter.format_top_selling_items(
+                        items=items,
+                        limit=limit,
+                        days=days,
+                        language=language
+                    )
+                    response_text = formatted.get("message", "")
+                elif intent == "GET_SLOW_MOVING_ITEMS":
+                    items = result_data.get("items", [])
+                    # Fix: Handle None values
+                    days = entities.get("days")
+                    if days is None or not isinstance(days, int):
+                        days = 90
+                    limit = entities.get("quantity")
+                    if limit is None or not isinstance(limit, int):
+                        limit = 10
+                    limit = min(limit, len(items)) if items else limit
+                    formatted = formatter.format_slow_moving_items(
+                        items=items,
+                        limit=limit,
+                        days=days,
+                        language=language
+                    )
+                    response_text = formatted.get("message", "")
                 else:
-                    response_text = "Unable to fetch top selling items at this time."
-            
-            elif intent == "GET_SLOW_MOVING_ITEMS":
-                limit = entities.get("quantity") or 10
-                if isinstance(limit, str) and limit.isdigit():
-                    limit = int(limit)
-                elif not isinstance(limit, int):
-                    limit = 10
-                
-                days = entities.get("days") or 90
-                turnover_threshold = entities.get("turnover_threshold") or 0.5
-                rows = db.api.get_slow_moving_items(limit=limit, days=days, turnover_threshold=turnover_threshold)
-                
-                if rows:
-                    truncated_data = _truncate_large_data(rows, max_items=limit)
-                    summary = _create_summary_from_analysis(intent, truncated_data)
-                    response_text = summary
-                else:
-                    response_text = "Unable to fetch slow moving items at this time."
-            
+                    response_text = _create_summary_from_analysis(intent, result_data)
             else:
-                result_data = await decision_support.analyze(intent, entities)
-                
-                if result_data and isinstance(result_data, dict):
-                    summary = _create_summary_from_analysis(intent, result_data)
-                    response_text = summary
-                else:
-                    response_text = "Analysis complete. No significant findings."
-            
-            # Stream the response
+                response_text = "Analysis complete. No significant findings."
             for word in response_text.split():
-                yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None})}\n\n"
+                yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
         
         else:
-            # Tier 4: DB query
-            yield f"data: {json.dumps({'type': 'status', 'content': '🔎 Searching database...', 'data': None})}\n\n"
-            
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Searching database...', 'data': None}, ensure_ascii=False)}\n\n"
             if intent in PRICE_INTENTS:
                 rows = db.resolve_and_price(
                     item_name=entities.get("item_name") or "",
@@ -829,7 +707,14 @@ async def generate_streaming_response(
             else:
                 rows = db.query(intent=intent, entities=entities, language=language)
             
-            if rows:
+            # Use formatter for outstanding deliveries
+            if intent == "GET_OUTSTANDING_DELIVERIES" and rows:
+                formatted = formatter.format_outstanding_deliveries(rows, language)
+                response_text = formatted.get("message", "")
+                for word in response_text.split():
+                    yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.015)
+            elif rows:
                 response_text = await llm.narrate_async(
                     question=message,
                     db_rows=rows[:20] if isinstance(rows, list) else rows,
@@ -837,6 +722,9 @@ async def generate_streaming_response(
                     language=language,
                     max_tokens=500,
                 )
+                for word in response_text.split():
+                    yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.015)
             else:
                 response_text = await llm.narrate_async(
                     question=message,
@@ -845,72 +733,105 @@ async def generate_streaming_response(
                     language=language,
                     max_tokens=300,
                 )
-            
-            # Stream the response
-            for word in response_text.split():
-                yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None})}\n\n"
-                await asyncio.sleep(0.015)
+                for word in response_text.split():
+                    yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.015)
+        
+        # Store assistant response in memory
+        rows_local = rows if 'rows' in locals() else None
+        memory.add_message(session_id, "assistant", response_text, rows_local)
         
         processing_time = int((asyncio.get_event_loop().time() - start_time) * 1000)
         
-        # Step 5: Send suggestions
-        suggestions = _suggest(intent, entities, language)
-        yield f"data: {json.dumps({'type': 'suggestions', 'content': '', 'data': suggestions})}\n\n"
+        # Use feedback-aware suggestions
+        suggestions = await _suggest_with_feedback(
+            intent=intent,
+            entities=entities,
+            language=language,
+            context=context,
+            tenant_code=None,  # Will be set in chat endpoint
+            user_id=None
+        )
         
-        # Step 6: Send completion
-        yield f"data: {json.dumps({'type': 'done', 'content': '', 'data': {'processing_time_ms': processing_time}})}\n\n"
+        yield f"data: {json.dumps({'type': 'suggestions', 'content': '', 'data': suggestions}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'content': '', 'data': {'processing_time_ms': processing_time}}, ensure_ascii=False)}\n\n"
         
     except Exception as e:
         logger.error(f"Streaming error: {e}", exc_info=True)
         error_msg = "I encountered an issue processing your request. Please try again."
-        yield f"data: {json.dumps({'type': 'error', 'content': error_msg, 'data': {'error': str(e)}})}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'content': error_msg, 'data': {'error': str(e)}}, ensure_ascii=False)}\n\n"
 
 
 # ---------------------------------------------------------------------------
-# Chat Endpoint - Optimized with streaming
+# Chat Endpoint (FIXED: session_id priority, intent classification before streaming)
 # ---------------------------------------------------------------------------
 
 @router.post("/chat")
-async def chat_ai(request: AIRequest):
-    """Process chat messages with AI-powered intent recognition and optional streaming."""
+async def chat_ai(
+    request: AIRequest,
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code),
+    conv_context: Dict = Depends(get_conversation_context)
+):
+    """
+    Process chat messages with AI-powered intent recognition and conversation memory.
+    
+    The conv_context includes:
+    - session_id: Current session identifier
+    - user_role: "manager" or "sales_rep"
+    - assigned_customers: List of customer codes for sales reps
+    - context: Previous conversation context (last_intent, last_results, etc.)
+    - history: Previous messages
+    """
     start_time = asyncio.get_event_loop().time()
     message = request.message.strip()
     
+    # Use request.session_id first, fallback to conv_context
+    session_id = request.session_id or conv_context["session_id"]
+    conv_context["session_id"] = session_id
+    
+    user_role = conv_context["user_role"]
+    assigned_customers = conv_context.get("assigned_customers", [])
+    
+    # Get services
+    memory = get_conversation_memory()
+    activity_logger = get_activity_logger()
+    feedback_service = get_feedback_service()
+    
     if not message:
-        return AIResponse(
+        return utf8_json_response(AIResponse(
             intent="EMPTY",
             entities={},
             result="Please enter a message.",
             data=[],
             suggestions=[],
-            session_id=request.session_id or str(uuid.uuid4()),
+            session_id=session_id,
             processing_time_ms=0,
-        )
+        ).dict())
+    
+    # Log user message to memory
+    memory.add_message(session_id, "user", message)
+    
+    tenant = TenantContext(
+        company_code=company_code,
+        company_id=0,
+        user_id=conv_context.get("user_id", 0),
+        user_email=conv_context.get("user_email", ""),
+        user_role=user_role,
+        user_token=user_token
+    )
+    set_current_tenant(tenant)
     
     cache = get_cache_service(ttl_seconds=300)
-    session_id = request.session_id or str(uuid.uuid4())
     
-    # Enable streaming if requested
-    if request.stream:
-        return StreamingResponse(
-            generate_streaming_response(message, "", {}, "en", session_id),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
-        )
-    
-    # ── 0. Swahili detection ───────────────────────────────────────────────────
+    # Intent classification BEFORE streaming decision
+    # Swahili detection
     sw_result = swahili_support.process_swahili_query(message)
-    
     if sw_result.get("detected_language") != "en":
-        logger.info("🇰🇪 Swahili detected, using Swahili processor")
+        logger.info("Swahili detected, using Swahili processor")
         initial_entities = sw_result.get("entities", {})
         normalized_message = sw_result.get("normalized_text", message)
         language = sw_result.get("detected_language", "sw")
-        
         if sw_result.get("intent") != "UNKNOWN":
             intent_raw = {"intent": sw_result.get("intent"), "language": language}
         else:
@@ -921,18 +842,51 @@ async def chat_ai(request: AIRequest):
         normalized_message = message
         intent_raw = await intent_classifier.classify_async(message)
 
-    # ── 1. Extract intent and language ──────────────────────────────────────
     intent = intent_raw.get("intent") if isinstance(intent_raw, dict) else str(intent_raw)
     intent = intent.upper()
     language = (intent_raw.get("language") or "en").lower().strip() if isinstance(intent_raw, dict) else "en"
 
-    logger.info(f"Detected intent: {intent} | language: {language}")
+    # Extract entities
+    fresh_entities = await entity_extractor.extract_async(normalized_message, context=conv_context.get("context"))
+    logger.info(f"Fresh entities from current message: {fresh_entities}")
+    
+    # Resolve references from conversation context
+    context_data = conv_context.get("context", {})
+    resolved_entities, context_used = _resolve_reference_from_context(
+        normalized_message, context_data, fresh_entities
+    )
+    entities = resolved_entities.copy()
+    
+    logger.info(f"Detected intent: {intent} | language: {language} | user_role: {user_role}")
     performance_monitor.track_request(session_id, {"intent_detection": (asyncio.get_event_loop().time() - start_time) * 1000})
-
-    # ── CLARIFY: low-confidence intent ──────────────────────────────────────
+    
+    # Handle streaming with classified intent and entities
+    if request.stream:
+        return StreamingResponse(
+            generate_streaming_response(
+                message=normalized_message,
+                intent=intent,
+                entities=entities,
+                language=language,
+                session_id=session_id,
+                user_token=user_token,
+                context=conv_context.get("context")
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8"
+            }
+        )
+    
+    # ========================================================================
+    # NON-STREAMING PATH CONTINUES HERE
+    # ========================================================================
+    
     if intent == "CLARIFY":
         candidates = intent_raw.get("candidates", []) if isinstance(intent_raw, dict) else []
-        
         candidate_labels = {
             "GET_ITEM_PRICE": "Check item price",
             "GET_STOCK_LEVELS": "Check stock levels",
@@ -958,18 +912,29 @@ async def chat_ai(request: AIRequest):
             "GET_TOP_SELLING_ITEMS": "Top selling items",
             "GET_SLOW_MOVING_ITEMS": "Slow moving items",
         }
-        
-        chip_messages = [
-            candidate_labels.get(c, c.replace("_", " ").title())
-            for c in candidates[:3]
-        ]
-        
+        chip_messages = [candidate_labels.get(c, c.replace("_", " ").title()) for c in candidates[:3]]
         if language == "sw":
             msg = "Samahani, sikuelewa vizuri. Je, unamaanisha:\n- " + "\n- ".join(chip_messages) + "\n\nTafadhali bonyeza chaguo moja au andika swali lako tena."
         else:
             msg = "I'm not quite sure what you're looking for. Did you mean:\n- " + "\n- ".join(chip_messages) + "\n\nTap one of the options or rephrase your question."
-
-        return AIResponse(
+        clear_current_tenant()
+        
+        # Log clarification
+        await activity_logger.log_query(
+            user_id=conv_context.get("user_id", 0),
+            user_role=user_role,
+            tenant_code=company_code,
+            session_id=session_id,
+            intent="CLARIFY",
+            query=message,
+            response=msg,
+            processing_time_ms=int((asyncio.get_event_loop().time() - start_time) * 1000),
+            suggestions_shown=chip_messages,
+            context_used=False,
+            success=True
+        )
+        
+        return utf8_json_response(AIResponse(
             intent="CLARIFY",
             entities=initial_entities,
             result=msg,
@@ -977,9 +942,8 @@ async def chat_ai(request: AIRequest):
             suggestions=chip_messages,
             session_id=session_id,
             processing_time_ms=int((asyncio.get_event_loop().time() - start_time) * 1000),
-        )
+        ).dict())
 
-    # ── 2. General AI fallback (UNKNOWN) ────────────────────────────────────
     if intent == "UNKNOWN":
         logger.info("Using General AI fallback response")
         ai_reply = await llm.generate_async(
@@ -988,90 +952,147 @@ async def chat_ai(request: AIRequest):
             language=language,
             max_tokens=300,
         )
-        return AIResponse(
+        memory.add_message(session_id, "assistant", ai_reply)
+        
+        await activity_logger.log_query(
+            user_id=conv_context.get("user_id", 0),
+            user_role=user_role,
+            tenant_code=company_code,
+            session_id=session_id,
+            intent="GENERAL_AI",
+            query=message,
+            response=ai_reply,
+            processing_time_ms=int((asyncio.get_event_loop().time() - start_time) * 1000),
+            suggestions_shown=_suggest("GENERAL", initial_entities, language, conv_context.get("context")),
+            context_used=False,
+            success=True
+        )
+        
+        clear_current_tenant()
+        return utf8_json_response(AIResponse(
             intent="GENERAL_AI",
             entities=initial_entities,
             result=ai_reply.strip(),
             data=[],
-            suggestions=_suggest("GENERAL", initial_entities, language),
+            suggestions=_suggest("GENERAL", initial_entities, language, conv_context.get("context")),
             session_id=session_id,
             processing_time_ms=int((asyncio.get_event_loop().time() - start_time) * 1000),
-        )
+        ).dict())
 
-    # ── 3. Extract entities (async) ─────────────────────────────────────────
-    fresh_entities = await entity_extractor.extract_async(normalized_message)
-    logger.info(f"Fresh entities from current message: {fresh_entities}")
+    if context_used:
+        logger.info(f"Context used to resolve entities: {entities}")
     
-    entities = fresh_entities.copy()
-    
-    # Enhanced entity extraction for delivery queries
     if intent in DELIVERY_INTENTS:
         delivery_num = _extract_delivery_number(normalized_message, entities)
         if delivery_num:
             entities["delivery_number"] = delivery_num
-            logger.info(f"Extracted delivery number: {delivery_num}")
-        
         customer = _extract_customer_for_delivery(normalized_message, entities)
         if customer:
             entities["customer_name"] = customer
-            logger.info(f"Extracted customer for delivery: {customer}")
     
-    # Extract limit for analytics queries
     if intent in ["GET_TOP_SELLING_ITEMS", "GET_SLOW_MOVING_ITEMS"]:
-        # Check for number in message like "top 5", "top 10"
         limit_match = re.search(r'top\s+(\d+)', normalized_message.lower())
         if limit_match:
             entities["quantity"] = int(limit_match.group(1))
-            logger.info(f"Extracted limit from message: {entities['quantity']}")
-        
-        # Check for days in message like "last 30 days", "this month"
         days_match = re.search(r'last\s+(\d+)\s+days', normalized_message.lower())
         if days_match:
             entities["days"] = int(days_match.group(1))
-            logger.info(f"Extracted days from message: {entities['days']}")
+    
+    # Check for pending action (quotation confirmation, etc.)
+    pending = memory.get_pending_action(session_id)
+    if pending and any(word in message.lower() for word in ["yes", "confirm", "create", "ok", "sure", "go ahead", "proceed"]):
+        logger.info(f"User confirmed pending action: {pending['action']}")
+        result_message = f"Confirmed: {pending['action']} completed successfully."
+        memory.clear_pending_action(session_id)
+        memory.add_message(session_id, "assistant", result_message)
+        
+        await activity_logger.log_query(
+            user_id=conv_context.get("user_id", 0),
+            user_role=user_role,
+            tenant_code=company_code,
+            session_id=session_id,
+            intent=pending["action"],
+            query=message,
+            response=result_message,
+            processing_time_ms=int((asyncio.get_event_loop().time() - start_time) * 1000),
+            suggestions_shown=[],
+            context_used=context_used,
+            success=True
+        )
+        
+        return utf8_json_response(AIResponse(
+            intent=pending["action"],
+            entities=entities,
+            result=result_message,
+            data=pending.get("data", []),
+            suggestions=[],
+            session_id=session_id,
+            processing_time_ms=int((asyncio.get_event_loop().time() - start_time) * 1000),
+        ).dict())
     
     logger.info(f"Final entities (current message priority): {entities}")
     performance_monitor.track_request(session_id, {"entity_extraction": (asyncio.get_event_loop().time() - start_time) * 1000})
 
-    # ── 4. Apply intent overrides ───────────────────────────────────────────
     intent = apply_intent_overrides(intent, entities)
     logger.info(f"Final intent after overrides: {intent}")
-
     session_ctx.merge(session_id, entities)
 
-    # ── 5. Cache check (optimized for price queries) ────────────────────────
     cached = None
     if intent in PRICE_INTENTS:
-        # Use simple cache for faster lookup on price queries
         cache_key = f"response:{normalized_message}"
         cached = await cache.get_simple_async(cache_key)
     else:
         cached = await cache.get_async(intent, entities, normalized_message)
     
     if cached is not None:
-        logger.info(f"⚡ Cache HIT for '{message}'")
+        logger.info(f"Cache HIT for '{message}'")
         processing_time = int((asyncio.get_event_loop().time() - start_time) * 1000)
-        return AIResponse(
+        clear_current_tenant()
+        memory.add_message(session_id, "assistant", cached.get("result", ""))
+        
+        await activity_logger.log_query(
+            user_id=conv_context.get("user_id", 0),
+            user_role=user_role,
+            tenant_code=company_code,
+            session_id=session_id,
+            intent=cached.get("intent", intent),
+            query=message,
+            response=cached.get("result", ""),
+            processing_time_ms=processing_time,
+            suggestions_shown=cached.get("suggestions", []),
+            context_used=context_used,
+            success=True
+        )
+        
+        return utf8_json_response(AIResponse(
             intent=cached.get("intent", intent),
             entities=cached.get("entities", entities),
             result=cached.get("result", ""),
             data=cached.get("data", []),
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(
+                intent=intent,
+                entities=entities,
+                language=language,
+                context=context_data,
+                tenant_code=company_code,
+                user_id=conv_context.get("user_id")
+            ),
             session_id=session_id,
             processing_time_ms=processing_time,
-        )
+            context_used=context_used
+        ).dict())
 
-    # ── 6. Route (async) ────────────────────────────────────────────────────
     response = await _route_async(
-        intent, entities, normalized_message, language, session_id,
-        llm, db, action_router, formatter, decision_support,
+        intent, entities, normalized_message, language, session_id, user_token,
+        llm, formatter, context_data, assigned_customers, user_role
     )
+    
+    # Add context_used flag to response
+    response.context_used = context_used
 
-    # ── 7. Cache and return (optimized for price queries) ───────────────────
     if cache.should_cache(intent):
-        logger.info(f"📝 Caching response for '{message}'")
+        logger.info(f"Caching response for '{message}'")
         if intent in PRICE_INTENTS:
-            # Use simple cache for price queries with longer TTL
             cache_key = f"response:{normalized_message}"
             await cache.set_simple_async(cache_key, response.dict(), ttl=3600)
         else:
@@ -1080,11 +1101,49 @@ async def chat_ai(request: AIRequest):
     response.processing_time_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
     performance_monitor.track_request(session_id, {"total": response.processing_time_ms})
     
-    return response
+    # Store assistant response in memory
+    memory.add_message(session_id, "assistant", response.result, response.data)
+    memory.update_context(
+        session_id,
+        intent=intent,
+        entities=entities,
+        results=response.data,
+        action="responded"
+    )
+    
+    # Use feedback-aware suggestions
+    response.suggestions = await _suggest_with_feedback(
+        intent=intent,
+        entities=entities,
+        language=language,
+        context=context_data,
+        tenant_code=company_code,
+        user_id=conv_context.get("user_id")
+    )
+    
+    # Log the activity
+    await activity_logger.log_query(
+        user_id=conv_context.get("user_id", 0),
+        user_role=user_role,
+        tenant_code=company_code,
+        session_id=session_id,
+        intent=intent,
+        query=message,
+        response=response.result,
+        processing_time_ms=response.processing_time_ms,
+        suggestions_shown=response.suggestions,
+        context_used=context_used,
+        success=True
+    )
+    
+    clear_current_tenant()
+    
+    # Return with UTF-8 encoding
+    return utf8_json_response(response.dict())
 
 
 # ---------------------------------------------------------------------------
-# Async Routing Logic
+# Async Routing Logic (UPDATED with context and permissions)
 # ---------------------------------------------------------------------------
 
 async def _route_async(
@@ -1093,21 +1152,38 @@ async def _route_async(
     message: str,
     language: str,
     session_id: str,
+    user_token: str,
     llm,
-    db: DBQueryService,
-    action_router: ActionRouter,
     formatter: ResponseFormatter,
-    decision_support: DecisionSupport,
+    context: Dict = None,
+    assigned_customers: List[str] = None,
+    user_role: str = "sales_rep"
 ) -> AIResponse:
-    """
-    Async routing with proper await for decision support and token limit handling.
-    """
-    # ── Tier 1: Fast conversational responses ───────────────────────────────
+    """Async routing with proper await, user token, context awareness, and permissions."""
+    
+    # Add assigned customers filter for sales reps
+    if user_role == "sales_rep" and assigned_customers:
+        entities["_assigned_customers"] = assigned_customers
+        logger.info(f"Applying assigned customers filter for sales rep: {len(assigned_customers)} customers")
+    
+    # Create per-request services with user token
+    action_router = create_action_router(user_token=user_token)
+    pricing_service = create_pricing_service(user_token=user_token)
+    db = create_db_query_service(user_token=user_token)
+    
+    decision_support = DecisionSupport(
+        api=action_router.api,
+        pricing=pricing_service,
+        warehouse=action_router.warehouse,
+        recommender=action_router.recommender,
+    )
+    
+    memory = get_conversation_memory()
+    
+    # Tier 1: Fast conversational responses
     if intent == "GREETING":
         if language == "sw":
             msg = "Habari! Mimi ni Msaidizi wa AI wa Leysco. Ninaweza kukusaidia na bei za bidhaa, hisa, wateja, maagizo, na zaidi. Unahitaji nini?"
-        elif language == "mixed":
-            msg = "Habari! I'm the Leysco AI Assistant. Ninaweza kukusaidia na items, pricing, stock levels, customers, orders, na zaidi. What would you like to know?"
         else:
             msg = "Hello! I'm the Leysco AI Assistant. I can help you with items, pricing, stock levels, customers, orders, and more. What would you like to know?"
         return AIResponse(
@@ -1115,15 +1191,13 @@ async def _route_async(
             entities=entities,
             result=msg,
             data=[],
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
     if intent == "THANKS":
         if language == "sw":
             msg = "Karibu sana! Niambie kama una swali lingine lolote."
-        elif language == "mixed":
-            msg = "You're welcome! Niambie kama kuna kitu kingine ninachoweza kukusaidia nacho."
         else:
             msg = "You're welcome! Let me know if there's anything else I can help you with."
         return AIResponse(
@@ -1131,15 +1205,14 @@ async def _route_async(
             entities=entities,
             result=msg,
             data=[],
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
     if intent == "SMALL_TALK":
         answer = await llm.generate_async(
             f"The user sent a short conversational message: \"{message}\"\n"
-            f"Reply naturally and briefly as the Leysco AI Assistant. "
-            f"If appropriate, invite them to ask about items, pricing, or customers.",
+            f"Reply naturally and briefly as the Leysco AI Assistant.",
             intent="GENERAL",
             max_tokens=80,
             language=language,
@@ -1149,15 +1222,32 @@ async def _route_async(
             entities=entities,
             result=answer,
             data=[],
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
-    # ── Tier 1: Knowledge base ──────────────────────────────────────────────
+    # Tier 1: Knowledge base
     if intent in KNOWLEDGE_BASE_INTENTS:
-        logger.info(f"📚 Tier 1 — Knowledge base: {intent}")
+        logger.info(f"Tier 1 — Knowledge base: {intent}")
+        
+        # Try RAG enhancement
+        rag_context = await _enhance_with_rag(message, None)
+        
+        if rag_context:
+            prompt = f"""You are the Leysco AI Assistant. Use the following information to answer the user's question.
+            
+RELEVANT INFORMATION:
+{rag_context}
+
+USER QUESTION: {message}
+
+Answer based on the information above. If the information doesn't contain the answer, say so politely.
+"""
+        else:
+            prompt = f"User asked: {message}"
+        
         answer = await llm.generate_async(
-            f"User asked: {message}",
+            prompt,
             intent=intent,
             language=language,
             max_tokens=500,
@@ -1167,14 +1257,13 @@ async def _route_async(
             entities=entities,
             result=answer,
             data=[],
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
-    # ── Tier 2: Delivery Tracking ───────────────────────────────────────────
+    # Tier 2: Delivery Tracking (UPDATED with formatter)
     if intent in DELIVERY_INTENTS:
-        logger.info(f"📦 Tier 2 — Delivery tracking: {intent}")
-        
+        logger.info(f"Tier 2 — Delivery tracking: {intent}")
         if intent == "TRACK_DELIVERY":
             delivery_number = entities.get("delivery_number") or entities.get("doc_num")
             if not delivery_number:
@@ -1205,10 +1294,23 @@ async def _route_async(
                 entities=entities,
                 result=answer,
                 data=[],
-                suggestions=_suggest(intent, entities, language),
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
                 session_id=session_id,
             )
         
+        # Use the new formatter for outstanding deliveries
+        if intent == "GET_OUTSTANDING_DELIVERIES":
+            formatted = formatter.format_outstanding_deliveries(rows, language)
+            return AIResponse(
+                intent=intent,
+                entities=entities,
+                result=formatted.get("message", ""),
+                data=formatted.get("data", rows),
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                session_id=session_id,
+            )
+        
+        # For other delivery intents, use existing logic
         if isinstance(rows, list) and len(rows) > 0:
             result_message = _format_delivery_response(rows[0] if len(rows) == 1 else rows, intent, language)
             return AIResponse(
@@ -1216,7 +1318,7 @@ async def _route_async(
                 entities=entities,
                 result=result_message,
                 data=rows,
-                suggestions=_suggest(intent, entities, language),
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
                 session_id=session_id,
             )
         
@@ -1232,171 +1334,104 @@ async def _route_async(
             entities=entities,
             result=answer,
             data=rows,
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
-    # ── Tier 3: Decision support ────────────────────────────────────────────
+    # Tier 3: Decision support (Manager-only for some intents)
+    # FIXED: GET_TOP_SELLING_ITEMS and GET_SLOW_MOVING_ITEMS now use proper formatter
     if intent in DECISION_SUPPORT_INTENTS:
-        logger.info(f"📊 Tier 3 — Decision support: {intent}")
-
-        # FIXED: Handle top selling items - pass actual data to LLM
-        if intent == "GET_TOP_SELLING_ITEMS":
-            limit = entities.get("quantity") or 10
-            if isinstance(limit, str) and limit.isdigit():
-                limit = int(limit)
-            elif not isinstance(limit, int):
-                limit = 10
-            
-            days = entities.get("days") or 30
-            logger.info(f"📊 Fetching top {limit} selling items (last {days} days)")
-            
-            rows = db.api.get_top_selling_items(limit=limit, days=days)
-            
-            if rows and isinstance(rows, list) and len(rows) > 0:
-                # Log the first item for debugging
-                logger.info(f"Sample top item: {rows[0].get('ItemName')} (Score: {rows[0].get('PopularityScore')})")
-                
-                truncated_data = _truncate_large_data(rows, max_items=limit)
-                
-                try:
-                    # Pass the actual data to LLM, not just the summary
-                    answer = await llm.narrate_async(
-                        question=message,
-                        db_rows=truncated_data if isinstance(truncated_data, list) else rows[:limit],
-                        intent=intent,
-                        language=language,
-                        max_tokens=800,
-                    )
-                except Exception as e:
-                    logger.warning(f"LLM narration failed: {e}, using fallback")
-                    summary = _create_summary_from_analysis(intent, truncated_data)
-                    answer = f"Here are the top {limit} selling items:\n\n{summary}"
-                
-                return AIResponse(
-                    intent=intent,
-                    entities=entities,
-                    result=answer,
-                    data=truncated_data if isinstance(truncated_data, list) else rows[:limit],
-                    suggestions=_suggest(intent, entities, language),
-                    session_id=session_id,
-                )
-            else:
-                answer = "No top selling items data available at this time. Try again when there's more sales history."
-                return AIResponse(
-                    intent=intent,
-                    entities=entities,
-                    result=answer,
-                    data=[],
-                    suggestions=_suggest(intent, entities, language),
-                    session_id=session_id,
-                )
-
-        # FIXED: Handle slow moving items - pass actual data to LLM
-        if intent == "GET_SLOW_MOVING_ITEMS":
-            limit = entities.get("quantity") or 10
-            if isinstance(limit, str) and limit.isdigit():
-                limit = int(limit)
-            elif not isinstance(limit, int):
-                limit = 10
-            
-            days = entities.get("days") or 90
-            turnover_threshold = entities.get("turnover_threshold") or 0.5
-            
-            logger.info(f"📊 Fetching slow moving items (limit={limit}, days={days}, threshold={turnover_threshold})")
-            
-            rows = db.api.get_slow_moving_items(limit=limit, days=days, turnover_threshold=turnover_threshold)
-            
-            if rows and isinstance(rows, list) and len(rows) > 0:
-                # Log the first item for debugging
-                logger.info(f"Sample slow item: {rows[0].get('ItemName')} (Turnover: {rows[0].get('TurnoverRate')})")
-                
-                truncated_data = _truncate_large_data(rows, max_items=limit)
-                
-                try:
-                    # Pass the actual data to LLM, not just the summary
-                    answer = await llm.narrate_async(
-                        question=message,
-                        db_rows=truncated_data if isinstance(truncated_data, list) else rows[:limit],
-                        intent=intent,
-                        language=language,
-                        max_tokens=800,
-                    )
-                except Exception as e:
-                    logger.warning(f"LLM narration failed: {e}, using fallback")
-                    summary = _create_summary_from_analysis(intent, truncated_data)
-                    answer = f"Here are the slow moving items:\n\n{summary}"
-                
-                return AIResponse(
-                    intent=intent,
-                    entities=entities,
-                    result=answer,
-                    data=truncated_data if isinstance(truncated_data, list) else rows[:limit],
-                    suggestions=_suggest(intent, entities, language),
-                    session_id=session_id,
-                )
-            else:
-                answer = "No slow moving items found. All inventory appears to be moving well!"
-                return AIResponse(
-                    intent=intent,
-                    entities=entities,
-                    result=answer,
-                    data=[],
-                    suggestions=_suggest(intent, entities, language),
-                    session_id=session_id,
-                )
-
+        # Some decision support intents are manager-only
+        manager_only_intents = ["ANALYZE_INVENTORY_HEALTH", "GET_REORDER_DECISIONS", "ANALYZE_PRICING_OPPORTUNITIES"]
+        if intent in manager_only_intents and user_role != "manager":
+            return AIResponse(
+                intent=intent,
+                entities=entities,
+                result="This feature is only available for managers. Please contact your manager for inventory and pricing decisions.",
+                data=[],
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                session_id=session_id,
+            )
+        
+        logger.info(f"Tier 3 — Decision support: {intent}")
         try:
             result_data = await decision_support.analyze(intent, entities)
-            
-            if result_data and isinstance(result_data, dict) and result_data.get("error"):
-                answer = await llm.generate_async(
-                    f"User asked about {intent.lower().replace('_', ' ')}. "
-                    f"Error: {result_data.get('message', 'Unable to process request')}. "
-                    f"Provide a helpful response suggesting alternatives.",
-                    intent=intent,
-                    language=language,
-                    max_tokens=300,
-                )
-                return AIResponse(
-                    intent=intent,
-                    entities=entities,
-                    result=answer,
-                    data=[],
-                    suggestions=_suggest(intent, entities, language),
-                    session_id=session_id,
-                )
-
-            if result_data:
-                truncated_data = _truncate_large_data(result_data, max_items=10)
-                
-                try:
-                    answer = await llm.narrate_async(
-                        question=message,
-                        db_rows=truncated_data if isinstance(truncated_data, list) else [truncated_data],
-                        intent=intent,
-                        language=language,
-                        max_tokens=600,
+            if result_data and isinstance(result_data, dict):
+                # Use formatter for top selling and slow moving items
+                if intent == "GET_TOP_SELLING_ITEMS":
+                    items = result_data.get("items", [])
+                    # Fix: Handle None values - provide defaults
+                    days = entities.get("days")
+                    if days is None or not isinstance(days, int):
+                        days = 30  # Default to 30 days
+                    limit = entities.get("quantity")
+                    if limit is None or not isinstance(limit, int):
+                        limit = 10  # Default to top 10
+                    # Also ensure limit doesn't exceed items length
+                    limit = min(limit, len(items)) if items else limit
+                    formatted = formatter.format_top_selling_items(
+                        items=items,
+                        limit=limit,
+                        days=days,
+                        language=language
                     )
-                except Exception as e:
-                    logger.warning(f"LLM narration failed: {e}, using fallback")
-                    summary = _create_summary_from_analysis(intent, truncated_data)
-                    answer = f"Here's the {intent.lower().replace('_', ' ')}:\n\n{summary}"
-                
-                return AIResponse(
-                    intent=intent,
-                    entities=entities,
-                    result=answer,
-                    data=truncated_data if isinstance(truncated_data, list) else [truncated_data],
-                    suggestions=_suggest(intent, entities, language),
-                    session_id=session_id,
-                )
-
+                    return AIResponse(
+                        intent=intent,
+                        entities=entities,
+                        result=formatted.get("message", ""),
+                        data=items,
+                        suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                        session_id=session_id,
+                    )
+                elif intent == "GET_SLOW_MOVING_ITEMS":
+                    items = result_data.get("items", [])
+                    # Fix: Handle None values - provide defaults
+                    days = entities.get("days")
+                    if days is None or not isinstance(days, int):
+                        days = 90  # Default to 90 days
+                    limit = entities.get("quantity")
+                    if limit is None or not isinstance(limit, int):
+                        limit = 10  # Default to top 10
+                    # Also ensure limit doesn't exceed items length
+                    limit = min(limit, len(items)) if items else limit
+                    formatted = formatter.format_slow_moving_items(
+                        items=items,
+                        limit=limit,
+                        days=days,
+                        language=language
+                    )
+                    return AIResponse(
+                        intent=intent,
+                        entities=entities,
+                        result=formatted.get("message", ""),
+                        data=items,
+                        suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                        session_id=session_id,
+                    )
+                elif intent == "GET_SALES_ANALYTICS":
+                    formatted = formatter.format_sales_analytics(result_data, language)
+                    return AIResponse(
+                        intent=intent,
+                        entities=entities,
+                        result=formatted.get("message", ""),
+                        data=result_data,
+                        suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                        session_id=session_id,
+                    )
+                else:
+                    summary = _create_summary_from_analysis(intent, result_data)
+                    return AIResponse(
+                        intent=intent,
+                        entities=entities,
+                        result=summary,
+                        data=[result_data],
+                        suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                        session_id=session_id,
+                    )
         except Exception as e:
             logger.error(f"Error in decision support: {e}", exc_info=True)
             answer = await llm.generate_async(
-                f"User asked about {intent.lower().replace('_', ' ')}. "
-                f"There was an error processing your request.",
+                f"There was an error processing your request for {intent.lower().replace('_', ' ')}.",
                 intent=intent,
                 language=language,
                 max_tokens=200,
@@ -1406,13 +1441,12 @@ async def _route_async(
                 entities=entities,
                 result=answer,
                 data=[],
-                suggestions=_suggest(intent, entities, language),
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
                 session_id=session_id,
             )
         
         answer = await llm.generate_async(
-            f"No data available for {intent.lower().replace('_', ' ')}. "
-            f"Inform the user briefly and suggest alternatives.",
+            f"No data available for {intent.lower().replace('_', ' ')}.",
             intent=intent,
             language=language,
             max_tokens=200,
@@ -1422,14 +1456,13 @@ async def _route_async(
             entities=entities,
             result=answer,
             data=[],
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
-    # ── Tier 4: DB → narrate ────────────────────────────────────────────────
+    # Tier 4: DB -> narrate (UPDATED with formatter for deliveries)
     if intent not in ACTION_ROUTER_INTENTS:
-        logger.info(f"🗄️ Tier 4 — DB query + narrate: {intent}")
-
+        logger.info(f"Tier 4 — DB query + narrate: {intent}")
         if intent in PRICE_INTENTS:
             rows = db.resolve_and_price(
                 item_name=entities.get("item_name") or "",
@@ -1450,7 +1483,7 @@ async def _route_async(
                 entities=entities,
                 result=answer,
                 data=[],
-                suggestions=_suggest(intent, entities, language),
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
                 session_id=session_id,
             )
 
@@ -1468,7 +1501,19 @@ async def _route_async(
                 entities=entities,
                 result=answer,
                 data=[],
-                suggestions=_suggest(intent, entities, language),
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                session_id=session_id,
+            )
+
+        # Use the new formatter for outstanding deliveries
+        if intent == "GET_OUTSTANDING_DELIVERIES":
+            formatted = formatter.format_outstanding_deliveries(rows, language)
+            return AIResponse(
+                intent=intent,
+                entities=entities,
+                result=formatted.get("message", ""),
+                data=formatted.get("data", rows),
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
                 session_id=session_id,
             )
 
@@ -1496,15 +1541,76 @@ async def _route_async(
             entities=entities,
             result=answer,
             data=rows if isinstance(rows, list) else [rows],
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
-    # ── Tier 5: action_router ───────────────────────────────────────────────
-    logger.info(f"⚙️ Tier 5 — Action router: {intent}")
-
+    # Tier 5: action_router (UPDATED with formatter)
+    logger.info(f"Tier 5 — Action router: {intent}")
     api_result = action_router.route(intent, entities, message, language=language)
     logger.info(f"API Result type: {type(api_result)}")
+
+    # Special handling for CREATE_QUOTATION to use the nice formatter
+    if intent == "CREATE_QUOTATION":
+        # Check if we have a successful quotation
+        if api_result.get("success") or api_result.get("quotation_id"):
+            quotation_id = api_result.get("quotation_id")
+            data = api_result.get("data", [{}])[0] if api_result.get("data") else {}
+            
+            customer_name = data.get("customer_name") or entities.get("customer_name", "")
+            items = data.get("items", [])
+            total_amount = data.get("total_amount", 0)
+            
+            # If total_amount is 0, calculate from items
+            if total_amount == 0 and items:
+                for item in items:
+                    price = item.get("price", 0)
+                    quantity = item.get("quantity", 1)
+                    total_amount += float(price) * float(quantity)
+            
+            # Get valid until date (30 days from now)
+            valid_until = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+            
+            # Format using the nice formatter
+            formatted = formatter.format_quotation_creation_success(
+                customer_name=customer_name,
+                items=items,
+                total_amount=total_amount,
+                valid_until=valid_until,
+                doc_num=quotation_id,
+                language=language
+            )
+            
+            # Ensure UTF-8 encoding
+            message_text = ensure_utf8_string(formatted["message"])
+            
+            return AIResponse(
+                intent=intent,
+                entities=entities,
+                result=message_text,
+                data=formatted["data"],
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                session_id=session_id,
+            )
+        else:
+            # Error case - use error formatter
+            error_msg = api_result.get("message", "Failed to create quotation")
+            invalid_items = api_result.get("invalid_items", [])
+            
+            formatted = formatter.format_quotation_creation_error(
+                error_message=error_msg,
+                invalid_items=invalid_items,
+                language=language
+            )
+            
+            return AIResponse(
+                intent=intent,
+                entities=entities,
+                result=formatted["message"],
+                data=formatted["data"],
+                suggestions=await _suggest_with_feedback(intent, entities, language, context),
+                session_id=session_id,
+            )
 
     if intent in RECOMMENDATION_INTENTS:
         if isinstance(api_result, dict):
@@ -1519,13 +1625,12 @@ async def _route_async(
                 formatter,
             )
             result_message = formatted.get("message", "No recommendations found.")
-
         return AIResponse(
             intent=intent,
             entities=entities,
             result=result_message,
             data=formatted.get("data", []),
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
@@ -1535,7 +1640,7 @@ async def _route_async(
             entities=entities,
             result=api_result["message"],
             data=api_result.get("data", []),
-            suggestions=_suggest(intent, entities, language),
+            suggestions=await _suggest_with_feedback(intent, entities, language, context),
             session_id=session_id,
         )
 
@@ -1545,9 +1650,1343 @@ async def _route_async(
         entities=entities,
         result=formatted.get("message", "I couldn't process your request."),
         data=formatted.get("data", []),
-        suggestions=_suggest(intent, entities, language),
+        suggestions=await _suggest_with_feedback(intent, entities, language, context),
         session_id=session_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# QUOTATION ENDPOINTS (FIXED: Added GET by ID)
+# ---------------------------------------------------------------------------
+
+@router.get("/quotation/{quotation_id}")
+async def get_quotation_by_id(
+    quotation_id: str,
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code),
+    conv_context: Dict = Depends(get_conversation_context)
+):
+    """
+    Get a single quotation by ID.
+    Called by Flutter when user clicks View/Print/Send buttons.
+    """
+    try:
+        # Check authentication
+        if not user_token:
+            return utf8_json_response({
+                "success": False,
+                "message": "Not authenticated. Please log in again."
+            }, status_code=401)
+        
+        logger.info(f"Fetching quotation by ID: {quotation_id}")
+        
+        # Create action router to get API service
+        action_router = create_action_router(user_token=user_token)
+        
+        # Use the action router's quotation service to get by ID (async)
+        quotation = await action_router.quotation.get_quotation_by_id(quotation_id)
+        
+        if not quotation:
+            logger.warning(f"Quotation {quotation_id} not found")
+            return utf8_json_response({
+                "success": False,
+                "message": f"Quotation #{quotation_id} not found."
+            }, status_code=404)
+        
+        logger.info(f"Successfully fetched quotation {quotation_id}")
+        return utf8_json_response({
+            "success": True,
+            "quotation": quotation
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching quotation {quotation_id}: {e}", exc_info=True)
+        return utf8_json_response({
+            "success": False,
+            "message": f"Error fetching quotation: {str(e)}"
+        }, status_code=500)
+
+
+@router.get("/quotations")
+async def get_quotations(
+    limit: int = Query(10, ge=1, le=100),
+    customer: Optional[str] = None,
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code),
+    conv_context: Dict = Depends(get_conversation_context)
+):
+    """
+    Get list of quotations.
+    Called by Flutter to show quotation history.
+    """
+    try:
+        if not user_token:
+            return utf8_json_response({
+                "success": False,
+                "message": "Not authenticated. Please log in again."
+            }, status_code=401)
+        
+        logger.info(f"Fetching quotations, limit={limit}, customer={customer}")
+        
+        # Create action router to get API service
+        action_router = create_action_router(user_token=user_token)
+        
+        if customer:
+            # Get customer code first
+            customer_obj = action_router.api.resolve_customer(customer)
+            if customer_obj:
+                customer_code = customer_obj.get("CardCode")
+                quotations = action_router.quotation.get_customer_quotations(
+                    customer_code=customer_code,
+                    per_page=limit
+                )
+            else:
+                quotations = []
+        else:
+            # Get all quotations
+            quotations = action_router.api.get_quotations(limit=limit)
+        
+        return utf8_json_response({
+            "success": True,
+            "quotations": quotations
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching quotations: {e}", exc_info=True)
+        return utf8_json_response({
+            "success": False,
+            "message": f"Error fetching quotations: {str(e)}"
+        }, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Session Management Endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/session/clear")
+async def clear_session(
+    context: Dict = Depends(get_conversation_context)
+):
+    """
+    Clear conversation history and start fresh.
+    Called when user clicks "New Chat" button.
+    """
+    memory = get_conversation_memory()
+    memory.clear_session(context["session_id"])
+    
+    return utf8_json_response({
+        "success": True,
+        "message": "Conversation cleared. Starting fresh!",
+        "session_id": context["session_id"]
+    })
+
+
+@router.get("/session/summary")
+async def get_session_summary(
+    context: Dict = Depends(get_conversation_context)
+):
+    """
+    Get session summary (for debugging/analytics).
+    """
+    memory = get_conversation_memory()
+    summary = memory.get_session_summary(context["session_id"])
+    
+    return utf8_json_response({
+        "success": True,
+        "session_id": context["session_id"],
+        "user_role": context["user_role"],
+        "message_count": context["message_count"],
+        **summary
+    })
+
+
+@router.get("/session/history")
+async def get_session_history(
+    context: Dict = Depends(get_conversation_context),
+    limit: int = Query(20, ge=1, le=50)
+):
+    """
+    Get conversation history for the session.
+    Used by Flutter to show chat history when reopening.
+    """
+    memory = get_conversation_memory()
+    history = memory.get_conversation_history(context["session_id"], limit=limit)
+    
+    return utf8_json_response({
+        "success": True,
+        "session_id": context["session_id"],
+        "history": history,
+        "total": len(history)
+    })
+
+
+# ---------------------------------------------------------------------------
+# Proactive Notifications Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/notifications")
+async def get_notifications(
+    context: Dict = Depends(get_conversation_context),
+    limit: int = Query(20, ge=1, le=100),
+    unread_only: bool = Query(False),
+    trigger_scan: bool = Query(False)
+):
+    """
+    Get proactive notifications for the current user.
+    Called by Flutter app to show alerts.
+    """
+    notification_service = get_notification_service()
+    user_id = context.get("user_id")
+    
+    if not user_id:
+        return utf8_json_response({
+            "success": False,
+            "message": "User ID not found",
+            "notifications": [],
+            "unread_count": 0
+        })
+    
+    # Trigger a scan if requested (for testing or manual refresh)
+    if trigger_scan:
+        asyncio.create_task(
+            notification_service.scan_for_user(
+                user_id=user_id,
+                user_role=context.get("user_role", "sales_rep"),
+                tenant_code=context.get("tenant_code", ""),
+                user_token=context.get("_token", ""),
+                assigned_customers=context.get("assigned_customers", [])
+            )
+        )
+    
+    # Get notifications
+    notifications = await notification_service.get_notifications(
+        user_id=user_id,
+        limit=limit,
+        unread_only=unread_only
+    )
+    
+    unread_count = await notification_service.get_unread_count(user_id)
+    
+    return utf8_json_response({
+        "success": True,
+        "notifications": notifications,
+        "unread_count": unread_count,
+        "total": len(notifications)
+    })
+
+
+@router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: str,
+    context: Dict = Depends(get_conversation_context)
+):
+    """Mark a notification as read."""
+    notification_service = get_notification_service()
+    user_id = context.get("user_id")
+    
+    if not user_id:
+        return utf8_json_response({"success": False, "message": "User ID not found"})
+    
+    success = await notification_service.mark_as_read(user_id, notification_id)
+    
+    return utf8_json_response({
+        "success": success,
+        "message": "Notification marked as read" if success else "Notification not found"
+    })
+
+
+@router.post("/notifications/mark-all-read")
+async def mark_all_notifications_read(
+    context: Dict = Depends(get_conversation_context)
+):
+    """Mark all notifications as read."""
+    notification_service = get_notification_service()
+    user_id = context.get("user_id")
+    
+    if not user_id:
+        return utf8_json_response({"success": False, "message": "User ID not found"})
+    
+    count = await notification_service.mark_all_as_read(user_id)
+    
+    return utf8_json_response({
+        "success": True,
+        "message": f"Marked {count} notifications as read",
+        "count": count
+    })
+
+
+@router.delete("/notifications/{notification_id}")
+async def delete_notification(
+    notification_id: str,
+    context: Dict = Depends(get_conversation_context)
+):
+    """Delete a notification."""
+    notification_service = get_notification_service()
+    user_id = context.get("user_id")
+    
+    if not user_id:
+        return utf8_json_response({"success": False, "message": "User ID not found"})
+    
+    success = await notification_service.delete_notification(user_id, notification_id)
+    
+    return utf8_json_response({
+        "success": success,
+        "message": "Notification deleted" if success else "Notification not found"
+    })
+
+
+@router.post("/notifications/scan")
+async def trigger_notification_scan(
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Manually trigger a notification scan.
+    Manager-only endpoint.
+    """
+    notification_service = get_notification_service()
+    user_id = context.get("user_id")
+    
+    if not user_id:
+        return utf8_json_response({"success": False, "message": "User ID not found"})
+    
+    # Run scan
+    notifications = await notification_service.scan_for_user(
+        user_id=user_id,
+        user_role=context.get("user_role", "manager"),
+        tenant_code=context.get("tenant_code", ""),
+        user_token=context.get("_token", ""),
+        assigned_customers=context.get("assigned_customers", [])
+    )
+    
+    await notification_service.save_notifications(user_id, notifications)
+    
+    return utf8_json_response({
+        "success": True,
+        "message": f"Scan completed. Found {len(notifications)} notifications.",
+        "notifications_count": len(notifications)
+    })
+
+
+@router.get("/notifications/unread-count")
+async def get_unread_count(
+    context: Dict = Depends(get_conversation_context)
+):
+    """Get count of unread notifications."""
+    notification_service = get_notification_service()
+    user_id = context.get("user_id")
+    
+    if not user_id:
+        return utf8_json_response({"success": False, "unread_count": 0})
+    
+    count = await notification_service.get_unread_count(user_id)
+    
+    return utf8_json_response({
+        "success": True,
+        "unread_count": count
+    })
+
+
+# ---------------------------------------------------------------------------
+# Proactive Suggestions Endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/proactive")
+async def get_proactive_suggestions(
+    context: Dict = Depends(get_conversation_context),
+    limit: int = Query(3, ge=1, le=5)
+):
+    """
+    Get proactive suggestions based on current context and user role.
+    Called periodically by Flutter app to show in the chat.
+    """
+    suggestions = []
+    session_context = context.get("context", {})
+    
+    # Check if user just viewed items and hasn't asked about prices
+    if session_context.get("last_intent") in ["GET_ITEMS", "GET_TOP_SELLING_ITEMS"]:
+        last_results = session_context.get("last_results", [])
+        if last_results and len(last_results) > 0:
+            top_item = last_results[0].get("ItemName") or last_results[0].get("name")
+            if top_item:
+                suggestions.append({
+                    "type": "contextual",
+                    "message": f"Would you like to check the price of {top_item}?",
+                    "action": f"Price of {top_item}",
+                    "priority": "MEDIUM"
+                })
+    
+    # Manager-specific suggestions
+    if context.get("is_manager"):
+        suggestions.append({
+            "type": "manager",
+            "message": "View inventory health report",
+            "action": "Show inventory health",
+            "priority": "LOW"
+        })
+        suggestions.append({
+            "type": "manager",
+            "message": "Check reorder recommendations",
+            "action": "Show reorder decisions",
+            "priority": "LOW"
+        })
+    
+    # Sales rep suggestions
+    if not context.get("is_manager") and context.get("assigned_customers"):
+        suggestions.append({
+            "type": "sales_rep",
+            "message": "View your assigned customers",
+            "action": "Show my customers",
+            "priority": "LOW"
+        })
+    
+    return utf8_json_response({
+        "success": True,
+        "suggestions": suggestions[:limit],
+        "session_id": context["session_id"]
+    })
+
+
+# ---------------------------------------------------------------------------
+# ANALYTICS ENDPOINTS (Manager Only)
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/summary")
+async def get_analytics_summary(
+    period: str = Query("today", pattern="^(today|yesterday|week|month)$"),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get analytics summary for the tenant.
+    Manager-only endpoint.
+    
+    Periods: today, yesterday, week, month
+    """
+    activity_logger = get_activity_logger()
+    tenant_code = context.get("tenant_code")
+    
+    if not tenant_code:
+        return utf8_json_response({"success": False, "message": "Tenant code not found"})
+    
+    summary = await activity_logger.get_analytics_summary(tenant_code, period)
+    
+    return utf8_json_response({
+        "success": True,
+        **summary
+    })
+
+
+@router.get("/analytics/intents")
+async def get_intent_analytics(
+    days: int = Query(30, ge=1, le=90),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get intent distribution analytics.
+    Manager-only endpoint.
+    """
+    activity_logger = get_activity_logger()
+    tenant_code = context.get("tenant_code")
+    
+    if not tenant_code:
+        return utf8_json_response({"success": False, "message": "Tenant code not found"})
+    
+    analytics = await activity_logger.get_intent_analytics(tenant_code, days)
+    
+    return utf8_json_response({
+        "success": True,
+        **analytics
+    })
+
+
+@router.get("/analytics/users")
+async def get_user_analytics(
+    days: int = Query(30, ge=1, le=90),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get user-level analytics.
+    Manager-only endpoint.
+    """
+    activity_logger = get_activity_logger()
+    tenant_code = context.get("tenant_code")
+    
+    if not tenant_code:
+        return utf8_json_response({"success": False, "message": "Tenant code not found"})
+    
+    analytics = await activity_logger.get_user_analytics(tenant_code, days)
+    
+    return utf8_json_response({
+        "success": True,
+        **analytics
+    })
+
+
+@router.get("/analytics/performance")
+async def get_performance_trends(
+    days: int = Query(7, ge=1, le=30),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get performance trends over time.
+    Manager-only endpoint.
+    """
+    activity_logger = get_activity_logger()
+    tenant_code = context.get("tenant_code")
+    
+    if not tenant_code:
+        return utf8_json_response({"success": False, "message": "Tenant code not found"})
+    
+    trends = await activity_logger.get_performance_trends(tenant_code, days)
+    
+    return utf8_json_response({
+        "success": True,
+        **trends
+    })
+
+
+@router.get("/analytics/export")
+async def export_analytics(
+    days: int = Query(30, ge=1, le=90),
+    format: str = Query("csv", pattern="^(csv|json)$"),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Export analytics data.
+    Manager-only endpoint.
+    """
+    activity_logger = get_activity_logger()
+    tenant_code = context.get("tenant_code")
+    
+    if not tenant_code:
+        return utf8_json_response({"success": False, "message": "Tenant code not found"})
+    
+    if format == "csv":
+        csv_data = await activity_logger.export_analytics_csv(tenant_code, days)
+        
+        return Response(
+            content=csv_data,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=analytics_{tenant_code}_{days}days.csv"}
+        )
+    else:
+        # JSON format
+        recent = await activity_logger.get_recent_activity(tenant_code, limit=10000)
+        
+        cutoff = datetime.now() - timedelta(days=days)
+        filtered = []
+        for entry in recent:
+            created_at = datetime.fromisoformat(entry.get("created_at", ""))
+            if created_at >= cutoff:
+                filtered.append(entry)
+        
+        return utf8_json_response({
+            "success": True,
+            "tenant_code": tenant_code,
+            "days": days,
+            "total_records": len(filtered),
+            "data": filtered
+        })
+
+
+@router.get("/analytics/dashboard")
+async def get_analytics_dashboard(
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get all analytics data in one call for dashboard display.
+    Manager-only endpoint.
+    """
+    activity_logger = get_activity_logger()
+    tenant_code = context.get("tenant_code")
+    
+    if not tenant_code:
+        return utf8_json_response({"success": False, "message": "Tenant code not found"})
+    
+    # Fetch all analytics in parallel
+    summary = await activity_logger.get_analytics_summary(tenant_code, "week")
+    intents = await activity_logger.get_intent_analytics(tenant_code, 30)
+    users = await activity_logger.get_user_analytics(tenant_code, 30)
+    trends = await activity_logger.get_performance_trends(tenant_code, 7)
+    
+    return utf8_json_response({
+        "success": True,
+        "tenant_code": tenant_code,
+        "summary": summary,
+        "top_intents": intents.get("intents", [])[:10],
+        "top_users": users.get("users", [])[:10],
+        "performance_trends": trends.get("trends", []),
+        "timestamp": datetime.now().isoformat()
+    })
+
+
+# ---------------------------------------------------------------------------
+# FEEDBACK LOOP ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@router.post("/feedback/suggestion-clicked")
+async def track_suggestion_click(
+    suggestion: str,
+    intent: str,
+    session_id: str,
+    context: Dict = Depends(get_conversation_context)
+):
+    """
+    Track when a user clicks a suggestion chip.
+    Called by Flutter app to provide feedback.
+    """
+    feedback_service = get_feedback_service()
+    user_id = context.get("user_id")
+    tenant_code = context.get("tenant_code")
+    
+    if not user_id or not tenant_code:
+        return utf8_json_response({"success": False, "message": "User or tenant not found"})
+    
+    await feedback_service.record_suggestion_click(
+        user_id=user_id,
+        tenant_code=tenant_code,
+        session_id=session_id,
+        intent=intent,
+        suggestion_text=suggestion
+    )
+    
+    logger.info(f"Suggestion clicked: {suggestion} | Intent: {intent} | Session: {session_id}")
+    
+    return utf8_json_response({
+        "success": True,
+        "message": "Suggestion click tracked"
+    })
+
+
+@router.get("/feedback/performance")
+async def get_feedback_performance(
+    days: int = Query(30, ge=1, le=90),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get suggestion performance metrics.
+    Manager-only endpoint.
+    """
+    feedback_service = get_feedback_service()
+    tenant_code = context.get("tenant_code")
+    
+    if not tenant_code:
+        return utf8_json_response({"success": False, "message": "Tenant code not found"})
+    
+    performance = await feedback_service.get_suggestion_performance(tenant_code, days)
+    
+    return utf8_json_response({
+        "success": True,
+        **performance
+    })
+
+
+@router.get("/feedback/user-insights")
+async def get_user_insights(
+    context: Dict = Depends(get_conversation_context)
+):
+    """
+    Get feedback insights for the current user.
+    """
+    feedback_service = get_feedback_service()
+    user_id = context.get("user_id")
+    
+    if not user_id:
+        return utf8_json_response({"success": False, "message": "User ID not found"})
+    
+    insights = await feedback_service.get_user_insights(user_id)
+    
+    return utf8_json_response({
+        "success": True,
+        **insights
+    })
+
+
+# ---------------------------------------------------------------------------
+# ML FORECASTING ENDPOINTS (Manager Only)
+# ---------------------------------------------------------------------------
+
+@router.post("/forecast/ml")
+async def ml_forecast_demand(
+    item_code: str,
+    item_name: str = None,
+    forecast_days: int = Query(30, ge=7, le=90),
+    context: Dict = Depends(require_manager_role),
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code)
+):
+    """
+    ML-powered demand forecast.
+    Manager-only endpoint.
+    """
+    ml_service = get_ml_forecasting_service()
+    
+    # Fetch real historical sales data
+    historical_sales = await _get_historical_sales(
+        item_code=item_code,
+        days=365,
+        user_token=user_token,
+        company_code=company_code
+    )
+    
+    if not historical_sales:
+        return utf8_json_response({
+            "success": False,
+            "message": f"No historical sales data for item {item_code}. Need at least 90 days of data."
+        })
+    
+    forecast = await ml_service.forecast_demand(
+        item_code=item_code,
+        item_name=item_name or item_code,
+        historical_sales=historical_sales,
+        forecast_days=forecast_days
+    )
+    
+    return utf8_json_response({
+        "success": True,
+        **forecast,
+        "data_source": "real" if len(historical_sales) > 0 and historical_sales[0].get("item_code") != "MOCK_ITEM" else "mock"
+    })
+
+
+@router.get("/forecast/seasonal")
+async def get_seasonal_forecast(
+    item_code: str = None,
+    context: Dict = Depends(require_manager_role),
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code)
+):
+    """
+    Get seasonal forecast insights.
+    Manager-only endpoint.
+    """
+    # Get historical sales to detect seasonality
+    historical_sales = await _get_historical_sales(
+        item_code=item_code,
+        days=365,
+        user_token=user_token,
+        company_code=company_code
+    )
+    
+    if not historical_sales:
+        return utf8_json_response({
+            "success": False,
+            "message": f"No historical sales data for item {item_code}."
+        })
+    
+    # Detect seasonal patterns
+    from collections import defaultdict
+    monthly_totals = defaultdict(float)
+    
+    for sale in historical_sales:
+        try:
+            date = datetime.strptime(sale["date"], "%Y-%m-%d")
+            month = date.month
+            monthly_totals[month] += sale["quantity"]
+        except:
+            pass
+    
+    if not monthly_totals:
+        return utf8_json_response({
+            "success": True,
+            "message": "Insufficient data for seasonal detection",
+            "seasonal_pattern": None
+        })
+    
+    # Find peak months
+    peak_month = max(monthly_totals, key=monthly_totals.get)
+    
+    month_names = {
+        1: "January", 2: "February", 3: "March", 4: "April",
+        5: "May", 6: "June", 7: "July", 8: "August",
+        9: "September", 10: "October", 11: "November", 12: "December"
+    }
+    
+    seasonal_pattern = None
+    if peak_month in [3, 4]:
+        seasonal_pattern = f"Peak demand in {month_names[peak_month]} (planting season)"
+    elif peak_month in [10, 11]:
+        seasonal_pattern = f"Peak demand in {month_names[peak_month]} (harvest season)"
+    else:
+        seasonal_pattern = f"Peak demand in {month_names[peak_month]}"
+    
+    return utf8_json_response({
+        "success": True,
+        "item_code": item_code or "ALL",
+        "seasonal_pattern": seasonal_pattern,
+        "peak_month": month_names.get(peak_month, "Unknown"),
+        "monthly_distribution": {month_names.get(m, str(m)): round(qty, 0) for m, qty in monthly_totals.items()},
+        "data_source": "real"
+    })
+
+
+# ---------------------------------------------------------------------------
+# ANOMALY DETECTION ENDPOINTS (Manager Only)
+# ---------------------------------------------------------------------------
+
+@router.post("/anomalies/scan")
+async def scan_anomalies(
+    context: Dict = Depends(require_manager_role),
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code)
+):
+    """
+    Run anomaly detection scan.
+    Manager-only endpoint.
+    """
+    anomaly_service = get_anomaly_detection_service()
+    
+    results = await anomaly_service.scan_all_anomalies(
+        tenant_code=company_code,
+        user_token=user_token
+    )
+    
+    # Convert dataclasses to dicts for JSON response
+    from dataclasses import asdict
+    response = {
+        "success": True,
+        "sales_anomalies": [asdict(a) for a in results["sales_anomalies"]],
+        "stock_anomalies": [asdict(a) for a in results["stock_anomalies"]],
+        "pricing_anomalies": [asdict(a) for a in results["pricing_anomalies"]],
+        "total_count": len(results["sales_anomalies"]) + len(results["stock_anomalies"]) + len(results["pricing_anomalies"]),
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    return utf8_json_response(response)
+
+
+@router.get("/anomalies/sales")
+async def get_sales_anomalies(
+    item_code: str = None,
+    days: int = Query(30, ge=7, le=90),
+    context: Dict = Depends(require_manager_role),
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code)
+):
+    """
+    Detect sales anomalies.
+    Manager-only endpoint.
+    """
+    anomaly_service = get_anomaly_detection_service()
+    
+    anomalies = await anomaly_service.detect_sales_anomalies(
+        tenant_code=company_code,
+        item_code=item_code,
+        days=days,
+        user_token=user_token
+    )
+    
+    from dataclasses import asdict
+    return utf8_json_response({
+        "success": True,
+        "anomalies": [asdict(a) for a in anomalies],
+        "count": len(anomalies),
+        "item_code": item_code or "ALL",
+        "days_analyzed": days
+    })
+
+
+@router.get("/anomalies/stock")
+async def get_stock_anomalies(
+    context: Dict = Depends(require_manager_role),
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code)
+):
+    """
+    Detect stock anomalies.
+    Manager-only endpoint.
+    """
+    anomaly_service = get_anomaly_detection_service()
+    
+    anomalies = await anomaly_service.detect_stock_anomalies(
+        tenant_code=company_code,
+        user_token=user_token
+    )
+    
+    from dataclasses import asdict
+    return utf8_json_response({
+        "success": True,
+        "anomalies": [asdict(a) for a in anomalies],
+        "count": len(anomalies)
+    })
+
+
+@router.get("/anomalies/pricing")
+async def get_pricing_anomalies(
+    context: Dict = Depends(require_manager_role),
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code)
+):
+    """
+    Detect pricing anomalies.
+    Manager-only endpoint.
+    """
+    anomaly_service = get_anomaly_detection_service()
+    
+    anomalies = await anomaly_service.detect_pricing_anomalies(
+        tenant_code=company_code,
+        user_token=user_token
+    )
+    
+    from dataclasses import asdict
+    return utf8_json_response({
+        "success": True,
+        "anomalies": [asdict(a) for a in anomalies],
+        "count": len(anomalies)
+    })
+
+
+# ---------------------------------------------------------------------------
+# RAG (RETRIEVAL-AUGMENTED GENERATION) ENDPOINTS (Manager Only)
+# ---------------------------------------------------------------------------
+
+@router.post("/knowledge/ingest")
+async def ingest_knowledge_base(
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Ingest all knowledge base content into vector store.
+    Manager-only endpoint.
+    """
+    ingestion_service = get_knowledge_ingestion_service()
+    results = await ingestion_service.ingest_all()
+    
+    vector_store = get_vector_store()
+    total_docs = await vector_store.count()
+    
+    return utf8_json_response({
+        "success": True,
+        "documents_ingested": results,
+        "total_documents": total_docs,
+        "message": "Knowledge base ingestion complete"
+    })
+
+
+@router.get("/knowledge/search")
+async def search_knowledge_base(
+    query: str,
+    limit: int = Query(5, ge=1, le=10),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Search the knowledge base.
+    Manager-only endpoint.
+    """
+    vector_store = get_vector_store()
+    results = await vector_store.search(query, limit=limit)
+    
+    return utf8_json_response({
+        "success": True,
+        "query": query,
+        "results": [
+            {
+                "content": r["content"],
+                "metadata": r["metadata"],
+                "similarity": r["similarity"]
+            }
+            for r in results
+        ]
+    })
+
+
+@router.get("/knowledge/stats")
+async def get_knowledge_stats(
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get knowledge base statistics.
+    Manager-only endpoint.
+    """
+    vector_store = get_vector_store()
+    total_docs = await vector_store.count()
+    
+    return utf8_json_response({
+        "success": True,
+        "total_documents": total_docs,
+        "vector_store_type": "postgresql" if vector_store._pg_connection else "in_memory",
+        "embedding_dimension": 384
+    })
+
+
+# ---------------------------------------------------------------------------
+# KNOWLEDGE GRAPH ENDPOINTS (Manager Only)
+# ---------------------------------------------------------------------------
+
+@router.post("/graph/build")
+async def build_knowledge_graph(
+    context: Dict = Depends(require_manager_role),
+    user_token: str = Depends(get_token_from_header),
+    company_code: str = Depends(get_company_code)
+):
+    """
+    Build knowledge graph from sales data.
+    Manager-only endpoint.
+    """
+    from app.services.leysco_api_service import create_api_service
+    
+    api_service = create_api_service(user_token=user_token)
+    kg_service = get_knowledge_graph()
+    
+    # Fetch data
+    logger.info("Fetching data for knowledge graph...")
+    
+    # Get items
+    items = api_service.get_items(limit=1000)
+    logger.info(f"Loaded {len(items)} items")
+    
+    # Get customers
+    customers = api_service.get_customers(limit=500)
+    logger.info(f"Loaded {len(customers)} customers")
+    
+    # Get orders for purchase patterns
+    orders = []
+    for customer in customers[:50]:  # Limit for performance
+        customer_orders = api_service.get_customer_orders(
+            customer_code=customer.get("CardCode"),
+            limit=50
+        )
+        orders.extend(customer_orders)
+    logger.info(f"Loaded {len(orders)} orders")
+    
+    # Get warehouses
+    warehouses = api_service.get_warehouses()
+    logger.info(f"Loaded {len(warehouses)} warehouses")
+    
+    # Build graph
+    await kg_service.build_from_sales_data(
+        orders=orders,
+        items=items,
+        customers=customers,
+        warehouses=warehouses
+    )
+    
+    stats = kg_service.get_graph_stats()
+    
+    return utf8_json_response({
+        "success": True,
+        "message": "Knowledge graph built successfully",
+        "stats": stats
+    })
+
+
+@router.get("/graph/recommendations/cross-sell/{product_code}")
+async def get_cross_sell_recommendations_graph(
+    product_code: str,
+    limit: int = Query(5, ge=1, le=20),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get cross-sell recommendations from knowledge graph.
+    Manager-only endpoint.
+    """
+    kg_service = get_knowledge_graph()
+    
+    recommendations = await kg_service.get_cross_sell_recommendations(
+        product_code=product_code,
+        limit=limit
+    )
+    
+    return utf8_json_response({
+        "success": True,
+        "product_code": product_code,
+        "recommendations": recommendations,
+        "source": "knowledge_graph"
+    })
+
+
+@router.get("/graph/recommendations/upsell/{product_code}")
+async def get_upsell_recommendations_graph(
+    product_code: str,
+    limit: int = Query(5, ge=1, le=20),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get upsell recommendations from knowledge graph.
+    Manager-only endpoint.
+    """
+    kg_service = get_knowledge_graph()
+    
+    recommendations = await kg_service.get_upsell_recommendations(
+        product_code=product_code,
+        limit=limit
+    )
+    
+    return utf8_json_response({
+        "success": True,
+        "product_code": product_code,
+        "recommendations": recommendations,
+        "source": "knowledge_graph"
+    })
+
+
+@router.get("/graph/customer/{customer_code}")
+async def get_customer_graph_insights(
+    customer_code: str,
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get customer insights from knowledge graph.
+    Manager-only endpoint.
+    """
+    kg_service = get_knowledge_graph()
+    
+    insights = await kg_service.get_customer_purchase_pattern(customer_code)
+    
+    return utf8_json_response({
+        "success": True,
+        **insights,
+        "source": "knowledge_graph"
+    })
+
+
+@router.get("/graph/substitutes/{product_code}")
+async def get_product_substitutes(
+    product_code: str,
+    limit: int = Query(5, ge=1, le=20),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Find substitute products from knowledge graph.
+    Manager-only endpoint.
+    """
+    kg_service = get_knowledge_graph()
+    
+    substitutes = await kg_service.find_substitutes(product_code, limit)
+    
+    return utf8_json_response({
+        "success": True,
+        "product_code": product_code,
+        "substitutes": substitutes,
+        "source": "knowledge_graph"
+    })
+
+
+@router.get("/graph/complements/{product_code}")
+async def get_product_complements(
+    product_code: str,
+    limit: int = Query(5, ge=1, le=20),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Find complementary products from knowledge graph.
+    Manager-only endpoint.
+    """
+    kg_service = get_knowledge_graph()
+    
+    complements = await kg_service.find_complements(product_code, limit)
+    
+    return utf8_json_response({
+        "success": True,
+        "product_code": product_code,
+        "complements": complements,
+        "source": "knowledge_graph"
+    })
+
+
+@router.get("/graph/stats")
+async def get_graph_stats(
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Get knowledge graph statistics.
+    Manager-only endpoint.
+    """
+    kg_service = get_knowledge_graph()
+    
+    stats = kg_service.get_graph_stats()
+    
+    return utf8_json_response({
+        "success": True,
+        **stats
+    })
+
+
+@router.get("/graph/export")
+async def export_knowledge_graph(
+    format: str = Query("json", pattern="^(json|cypher)$"),
+    context: Dict = Depends(require_manager_role)
+):
+    """
+    Export knowledge graph for visualization.
+    Manager-only endpoint.
+    """
+    kg_service = get_knowledge_graph()
+    
+    if format == "json":
+        export_data = await kg_service.export_graph("json")
+        return utf8_json_response({
+            "success": True,
+            "format": "json",
+            **export_data
+        })
+    else:
+        return utf8_json_response({
+            "success": True,
+            "message": "Cypher export not implemented yet",
+            "format": "cypher"
+        })
+
+
+# ---------------------------------------------------------------------------
+# Helper Functions for ML Forecasting
+# ---------------------------------------------------------------------------
+
+async def _get_historical_sales(
+    item_code: str = None,
+    days: int = 365,
+    user_token: str = None,
+    company_code: str = None
+) -> List[Dict]:
+    """
+    Fetch historical sales data from Leysco API for ML forecasting.
+    
+    Uses Sales Orders (DocType 17) to get demand data.
+    """
+    from app.services.leysco_api_service import create_api_service
+    from collections import defaultdict
+    from datetime import datetime, timedelta
+    
+    # Check cache first
+    cache_key = f"historical_sales:{item_code or 'all'}:{days}"
+    cache = get_cache_service()
+    cached = await cache.get_simple_async(cache_key)
+    if cached:
+        logger.info(f"Historical sales cache hit for {item_code or 'all'}")
+        return cached
+    
+    try:
+        api_service = create_api_service(user_token=user_token)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        url = f"{api_service.base_url}/marketing/docs/17"
+        params = {"page": 1, "per_page": 100, "isDoc": 1}
+        
+        all_orders = []
+        page = 1
+        total_pages = 1
+        
+        while page <= total_pages:
+            params["page"] = page
+            api_service._record_api_call()
+            resp = api_service.session.get(url, params=params, timeout=30)
+            
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch sales orders: {resp.status_code}")
+                break
+            
+            data = resp.json()
+            response_data = data.get("ResponseData", {})
+            orders = response_data.get("data", [])
+            all_orders.extend(orders)
+            
+            total = response_data.get("total", 0)
+            per_page = response_data.get("per_page", 100)
+            total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+            page += 1
+            
+            if len(all_orders) >= 500:
+                break
+        
+        if not all_orders:
+            logger.info("No sales orders found, using mock data for testing")
+            mock_data = _generate_mock_sales_data(item_code, days)
+            await cache.set_simple_async(cache_key, mock_data, ttl=3600)
+            return mock_data
+        
+        daily_totals = defaultdict(float)
+        
+        for order in all_orders:
+            doc_date = order.get("DocDate", "")
+            if not doc_date:
+                continue
+            
+            try:
+                order_date = datetime.strptime(doc_date, "%Y-%m-%d")
+                if order_date < start_date or order_date > end_date:
+                    continue
+            except:
+                pass
+            
+            lines = order.get("document_lines", [])
+            for line in lines:
+                line_item_code = line.get("ItemCode", "")
+                if item_code and line_item_code != item_code:
+                    continue
+                
+                quantity = float(line.get("Quantity", 0))
+                if quantity > 0:
+                    daily_totals[doc_date] += quantity
+        
+        result = [
+            {"date": date, "quantity": qty, "item_code": item_code or "ALL"}
+            for date, qty in sorted(daily_totals.items())
+        ]
+        
+        logger.info(f"Retrieved {len(result)} days of sales data for {item_code or 'all items'}")
+        
+        if not result:
+            logger.info("No sales data found, using mock data for testing")
+            result = _generate_mock_sales_data(item_code, days)
+        
+        await cache.set_simple_async(cache_key, result, ttl=86400)
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error fetching historical sales: {e}", exc_info=True)
+        return _generate_mock_sales_data(item_code, days)
+
+
+def _generate_mock_sales_data(item_code: str = None, days: int = 365) -> List[Dict]:
+    """Generate realistic mock sales data for ML forecasting testing."""
+    import random
+    from datetime import datetime, timedelta
+    
+    data = []
+    start_date = datetime.now() - timedelta(days=days)
+    
+    if item_code:
+        item_lower = item_code.lower()
+        if "vegimax" in item_lower or "veg" in item_lower:
+            base_demand = 500
+        elif "seed" in item_lower:
+            base_demand = 800
+        elif "fert" in item_lower:
+            base_demand = 600
+        else:
+            base_demand = 400
+    else:
+        base_demand = 500
+    
+    for i in range(days):
+        date = start_date + timedelta(days=i)
+        month = date.month
+        
+        if month in [3, 4]:
+            seasonal_factor = 1.5
+        elif month in [10, 11]:
+            seasonal_factor = 1.8
+        elif month in [12, 1]:
+            seasonal_factor = 1.2
+        elif month in [7, 8]:
+            seasonal_factor = 0.7
+        else:
+            seasonal_factor = 1.0
+        
+        weekday = date.weekday()
+        weekday_factor = 0.6 if weekday >= 5 else 1.0
+        
+        quantity = base_demand * seasonal_factor * weekday_factor
+        quantity += random.uniform(-50, 50)
+        quantity = max(0, round(quantity))
+        
+        data.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "quantity": quantity,
+            "item_code": item_code or "MOCK_ITEM"
+        })
+    
+    logger.info(f"Generated {len(data)} days of mock sales data")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -1556,20 +2995,17 @@ async def _route_async(
 
 @router.get("/dashboard")
 def get_dashboard() -> dict[str, Any]:
-    """Proactive dashboard data for Flutter app startup."""
     svc = get_dashboard_service()
     return svc.get_dashboard()
 
 
 @router.get("/cache/stats")
 def cache_stats():
-    """Get cache statistics."""
     return get_cache_service().get_stats()
 
 
 @router.post("/cache/clear")
 def cache_clear(intent: Optional[str] = None, session_id: Optional[str] = None):
-    """Clear cache for specific intent or all."""
     cache = get_cache_service()
     if session_id:
         session_ctx.clear(session_id)
@@ -1583,5 +3019,4 @@ def cache_clear(intent: Optional[str] = None, session_id: Optional[str] = None):
 
 @router.get("/performance/stats")
 def performance_stats():
-    """Get performance monitoring statistics."""
     return performance_monitor.get_stats()

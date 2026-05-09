@@ -11,18 +11,42 @@ Access from your browser or laptop Postman via:
     http://<your-backend-ip>:8000/debug/...
 
 ⚠  REMOVE or gate behind an env flag before production.
+
+MODIFIED FOR PHASE 1: Added user token support for all debug endpoints
 """
 
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request, Depends
+from fastapi.responses import JSONResponse
 
-from app.services.leysco_api_service import LeyscoAPIService
-from app.services.pricing_service import PricingService
+from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.pricing_service import PricingService, create_pricing_service
+from app.api.dependencies import get_token_from_header
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ------------------------------------------------------------------
+# Helper to get authenticated services
+# ------------------------------------------------------------------
+
+async def get_authenticated_api_service(request: Request):
+    """Get authenticated LeyscoAPIService from request token."""
+    token = await get_token_from_header(request)
+    if token:
+        return create_api_service(token)
+    return LeyscoAPIService()
+
+
+async def get_authenticated_pricing_service(request: Request):
+    """Get authenticated PricingService from request token."""
+    token = await get_token_from_header(request)
+    if token:
+        return create_pricing_service(token)
+    return PricingService()
 
 
 # ------------------------------------------------------------------
@@ -30,7 +54,8 @@ router = APIRouter()
 # ------------------------------------------------------------------
 
 @router.get("/price/{item_code}")
-def debug_price(
+async def debug_price(
+    request: Request,
     item_code: str,
     sap_list_num: Optional[int] = Query(None, description="Specific SAP ListNum to query"),
 ):
@@ -41,7 +66,7 @@ def debug_price(
         /debug/price/FGHY0478
         /debug/price/FGHY0478?sap_list_num=17
     """
-    svc = PricingService()
+    svc = await get_authenticated_pricing_service(request)
 
     if sap_list_num:
         result = svc.get_price(item_code=item_code, sap_list_num=sap_list_num)
@@ -60,14 +85,14 @@ def debug_price(
 
 
 @router.get("/price-lists")
-def debug_price_lists():
+async def debug_price_lists(request: Request):
     """
     Show all loaded price lists with their SAP ListNum → API id mapping.
     Useful for understanding which lists are active and which 500.
 
     Example: /debug/price-lists
     """
-    svc = PricingService()
+    svc = await get_authenticated_pricing_service(request)
     lists = sorted(svc._list_by_sap_num.values(), key=lambda x: x.get("id", 0))
     return {
         "total": len(lists),
@@ -95,7 +120,8 @@ def debug_price_lists():
 
 
 @router.get("/price-list/{api_id}")
-def debug_price_list_items(
+async def debug_price_list_items(
+    request: Request,
     api_id: int,
     search: Optional[str] = Query(None, description="Item code or name to search"),
     per_page: int = Query(20, description="Records per page"),
@@ -111,12 +137,20 @@ def debug_price_list_items(
     import requests
     from app.core.config import settings
 
+    # Get token from request
+    token = await get_token_from_header(request)
+    if not token:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Authentication required. Please provide a valid Bearer token."}
+        )
+
     url    = f"{settings.LEYSCO_API_BASE_URL.rstrip('/')}/item/base-prices/price-list/{api_id}"
     params = {"per_page": per_page}
     if search:
         params["search"] = search
 
-    headers = {"Authorization": f"Bearer {settings.LEYSCO_API_TOKEN}"}
+    headers = {"Authorization": f"Bearer {token}"}
     resp    = requests.get(url, params=params, headers=headers, timeout=20)
 
     return {
@@ -131,7 +165,7 @@ def debug_price_list_items(
 # ------------------------------------------------------------------
 
 @router.get("/customer/{name}")
-def debug_customer(name: str):
+async def debug_customer(request: Request, name: str):
     """
     Look up a customer and show their full pricing context.
 
@@ -139,8 +173,8 @@ def debug_customer(name: str):
         /debug/customer/magomano
         /debug/customer/SMD
     """
-    api = LeyscoAPIService()
-    svc = PricingService()
+    api = await get_authenticated_api_service(request)
+    svc = await get_authenticated_pricing_service(request)
 
     customer = api.get_customer_by_name(name)
     if not customer:
@@ -170,7 +204,7 @@ def debug_customer(name: str):
 
 
 @router.get("/customer-price/{customer_name}/{item_code}")
-def debug_customer_price(customer_name: str, item_code: str):
+async def debug_customer_price(request: Request, customer_name: str, item_code: str):
     """
     Full pricing resolution for a customer + item.
     Shows the exact chain walked and where the price was found.
@@ -178,8 +212,8 @@ def debug_customer_price(customer_name: str, item_code: str):
     Example:
         /debug/customer-price/magomano/FGHY0478
     """
-    api      = LeyscoAPIService()
-    svc      = PricingService()
+    api = await get_authenticated_api_service(request)
+    svc = await get_authenticated_pricing_service(request)
     customer = api.get_customer_by_name(customer_name)
 
     if not customer:
@@ -205,7 +239,7 @@ def debug_customer_price(customer_name: str, item_code: str):
 # ------------------------------------------------------------------
 
 @router.get("/probe-special-prices")
-def probe_special_prices():
+async def probe_special_prices(request: Request):
     """
     Test all known candidate endpoints for special/customer-specific prices.
     Returns the status code of each so we know which endpoints exist.
@@ -215,8 +249,16 @@ def probe_special_prices():
     import requests
     from app.core.config import settings
 
+    # Get token from request
+    token = await get_token_from_header(request)
+    if not token:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Authentication required. Please provide a valid Bearer token."}
+        )
+
     base    = settings.LEYSCO_API_BASE_URL.rstrip("/")
-    headers = {"Authorization": f"Bearer {settings.LEYSCO_API_TOKEN}"}
+    headers = {"Authorization": f"Bearer {token}"}
     timeout = 8
 
     candidates = [
@@ -252,14 +294,14 @@ def probe_special_prices():
 # ------------------------------------------------------------------
 
 @router.get("/warehouses")
-def debug_warehouses():
+async def debug_warehouses(request: Request):
     """
     Show all warehouses with full details from the API.
     Reveals what fields are available for warehouse features.
     
     Example: /debug/warehouses
     """
-    api = LeyscoAPIService()
+    api = await get_authenticated_api_service(request)
     warehouses = api.get_warehouses()
     
     return {
@@ -270,13 +312,13 @@ def debug_warehouses():
 
 
 @router.get("/warehouse/{whscode}/stock")
-def debug_warehouse_stock(whscode: str):
+async def debug_warehouse_stock(request: Request, whscode: str):
     """
     Show all items in a specific warehouse with stock levels.
     
     Example: /debug/warehouse/KDISPAT1/stock
     """
-    api = LeyscoAPIService()
+    api = await get_authenticated_api_service(request)
     
     # Get inventory report filtered by warehouse
     inventory = api.get_inventory_report(search="")
@@ -312,3 +354,29 @@ def debug_warehouse_stock(whscode: str):
         "total_committed": sum(i["Committed"] for i in items),
         "items": items[:50],  # Top 50 by quantity
     }
+
+
+# ------------------------------------------------------------------
+# HEALTH CHECK
+# ------------------------------------------------------------------
+
+@router.get("/health")
+async def debug_health(request: Request):
+    """
+    Check if API service is properly authenticated.
+    
+    Example: /debug/health
+    """
+    token = await get_token_from_header(request)
+    if token:
+        return {
+            "authenticated": True,
+            "token_preview": f"{token[:15]}...{token[-5:]}" if len(token) > 20 else "***",
+            "message": "Token present - API calls will be authenticated"
+        }
+    else:
+        return {
+            "authenticated": False,
+            "token_preview": None,
+            "message": "No token found - API calls will fail"
+        }

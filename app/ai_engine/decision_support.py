@@ -5,6 +5,8 @@ Decision Support Module — Fixed with proper API field handling
 Added customer segmentation for FIND_CUSTOMERS_BY_ITEM intent
 Fixed competitor price check to filter out non-sellable items and search broader
 Improved reorder decisions with better urgency classification and actionable recommendations
+ADDED: GET_SALES_ANALYTICS handler for real sales data
+ADDED: GET_TOP_SELLING_ITEMS and GET_SLOW_MOVING_ITEMS handlers using real API data
 """
 
 import logging
@@ -235,7 +237,7 @@ class DecisionSupport:
             elif intent == "PRICE_ALERT":
                 result = await self.price_alert(entities)
             
-            # NEW: FIND_CUSTOMERS_BY_ITEM - Customer segmentation
+            # FIND_CUSTOMERS_BY_ITEM - Customer segmentation
             elif intent == "FIND_CUSTOMERS_BY_ITEM":
                 item_name = entities.get("item_name")
                 limit = entities.get("quantity") or 10
@@ -243,6 +245,84 @@ class DecisionSupport:
                     result = {"error": "Item name is required for customer segmentation"}
                 else:
                     result = await self.find_customers_by_item(item_name, limit)
+            
+            # =========================================================
+            # GET_SALES_ANALYTICS - Real sales data
+            # =========================================================
+            elif intent == "GET_SALES_ANALYTICS":
+                result = await self.get_sales_analytics(entities)
+            
+            # =========================================================
+            # GET_TOP_SELLING_ITEMS - Real sales data from API
+            # =========================================================
+            elif intent == "GET_TOP_SELLING_ITEMS":
+                limit = entities.get("quantity") or 10
+                days = entities.get("days") or 30
+                logger.info(f"📊 Getting top {limit} selling items for last {days} days")
+                
+                result = self.api.get_top_selling_items(limit=limit, days=days)
+                
+                if result:
+                    # Format the result properly
+                    result = {
+                        "analysis_type": "top_selling_items",
+                        "items": result,
+                        "total_items": len(result),
+                        "period_days": days,
+                        "period_description": f"Last {days} days",
+                        "note": f"Top {len(result)} selling items based on actual sales orders",
+                        "success": True
+                    }
+                    logger.info(f"✅ Retrieved {len(result.get('items', []))} top selling items from API")
+                else:
+                    result = {
+                        "error": True,
+                        "analysis_type": "top_selling_items",
+                        "message": "No top selling items found for this period",
+                        "items": [],
+                        "suggestions": [
+                            "Try a different period (e.g., 'last 90 days')",
+                            "Check if there are sales in the system",
+                            "Ask about specific items"
+                        ]
+                    }
+            
+            # =========================================================
+            # GET_SLOW_MOVING_ITEMS - Real sales data from API
+            # =========================================================
+            elif intent == "GET_SLOW_MOVING_ITEMS":
+                limit = entities.get("quantity") or 10
+                days = entities.get("days") or 90
+                threshold = entities.get("turnover_threshold") or 0.5
+                logger.info(f"📊 Getting {limit} slow moving items over {days} days with threshold {threshold}")
+                
+                result = self.api.get_slow_moving_items(limit=limit, days=days, turnover_threshold=threshold)
+                
+                if result:
+                    # Format the result properly
+                    result = {
+                        "analysis_type": "slow_moving_items",
+                        "items": result,
+                        "total_items": len(result),
+                        "period_days": days,
+                        "period_description": f"Last {days} days",
+                        "turnover_threshold": threshold,
+                        "note": f"{len(result)} slow moving items identified based on sales orders and inventory levels",
+                        "success": True
+                    }
+                    logger.info(f"✅ Retrieved {len(result.get('items', []))} slow moving items from API")
+                else:
+                    result = {
+                        "error": True,
+                        "analysis_type": "slow_moving_items",
+                        "message": "No slow moving items found for this period. This is good - inventory is moving well!",
+                        "items": [],
+                        "suggestions": [
+                            "Try a longer period (e.g., 'last 180 days')",
+                            "Check if there are sufficient sales orders",
+                            "Verify inventory data is up to date"
+                        ]
+                    }
             
             else:
                 result = {
@@ -285,7 +365,70 @@ class DecisionSupport:
             }
 
     # =========================================================
-    # NEW: CUSTOMER SEGMENTATION - FIND CUSTOMERS BY ITEM
+    # GET_SALES_ANALYTICS - Real sales data
+    # =========================================================
+    
+    async def get_sales_analytics(self, entities: dict) -> Dict[str, Any]:
+        """
+        Get real sales analytics data from the API.
+        
+        Args:
+            entities: Dictionary containing period, limit, etc.
+        
+        Returns:
+            Dictionary with sales analytics data
+        """
+        period = entities.get("period", "last_30_days")
+        limit = entities.get("quantity") or 100
+        
+        # Check for period in entities or derive from message
+        if "7 days" in str(entities.get("_original_query", "")).lower() or "weekly" in str(entities.get("_original_query", "")).lower():
+            period = "last_7_days"
+        elif "30 days" in str(entities.get("_original_query", "")).lower() or "monthly" in str(entities.get("_original_query", "")).lower():
+            period = "last_30_days"
+        elif "90 days" in str(entities.get("_original_query", "")).lower() or "quarterly" in str(entities.get("_original_query", "")).lower():
+            period = "last_90_days"
+        elif "365 days" in str(entities.get("_original_query", "")).lower() or "yearly" in str(entities.get("_original_query", "")).lower():
+            period = "last_365_days"
+        
+        logger.info(f"📊 Getting sales analytics for period: {period}, limit: {limit}")
+        
+        try:
+            # Call the API service
+            analytics = self.api.get_sales_analytics(period=period, limit=limit)
+            
+            if analytics and len(analytics) > 0:
+                result = analytics[0]
+                result["analysis_type"] = "sales_analytics"
+                result["success"] = True
+                
+                logger.info(f"✅ Sales analytics retrieved: {result.get('summary', {}).get('total_transactions', 0)} orders, KES {result.get('summary', {}).get('total_revenue', 0):,.2f}")
+                return result
+            else:
+                return {
+                    "error": True,
+                    "analysis_type": "sales_analytics",
+                    "message": "No sales data available for the selected period",
+                    "suggestions": [
+                        "Try a different period (e.g., 'last 90 days')",
+                        "Check back later when more sales data is available",
+                        "Ask about specific items or customers"
+                    ],
+                    "period": period
+                }
+                
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Error in get_sales_analytics: {e}", exc_info=True)
+            return {
+                "error": True,
+                "analysis_type": "sales_analytics",
+                "message": f"Failed to retrieve sales analytics: {str(e)}",
+                "suggestions": ["Please try again later", "Contact support if issue persists"]
+            }
+
+    # =========================================================
+    # CUSTOMER SEGMENTATION - FIND CUSTOMERS BY ITEM
     # =========================================================
     
     async def find_customers_by_item(self, item_name: str, limit: int = 10) -> Dict[str, Any]:
@@ -1270,7 +1413,7 @@ class DecisionSupport:
             }
 
     # =========================================================
-    # FIXED: GET REORDER DECISIONS (Token optimized)
+    # GET REORDER DECISIONS (Token optimized)
     # =========================================================
 
     def get_reorder_decisions(

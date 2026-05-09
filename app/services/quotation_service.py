@@ -15,6 +15,9 @@ FIX SUMMARY
 5. FIXED: Better response parsing for successful quotation creation.
 6. ADDED: Formatted success message with item details, customer name, total, and validity.
 7. UPDATED: Uses ResponseFormatter for consistent message formatting.
+8. ADDED: get_quotation_by_id() method as alias for get_quotation_by_number() for compatibility.
+9. FIXED: Made get_quotation_by_number and get_quotation_by_id async to work with FastAPI.
+10. ADDED: get_latest_quotation_for_customer() to fetch the most recent quotation for a customer.
 """
 
 import requests
@@ -23,6 +26,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 import json
 import re
+import asyncio
 
 from app.ai_engine.response_formatter import ResponseFormatter
 
@@ -73,7 +77,7 @@ class QuotationService:
     def clear_cache(self):
         self._endpoint_cache = None
         self._endpoint_cache_time = None
-        logger.info("🧹 Cleared quotation endpoint discovery cache")
+        logger.info("Cleared quotation endpoint discovery cache")
         return True
 
     # ==========================================================
@@ -82,13 +86,13 @@ class QuotationService:
     def _is_login_page_response(self, response: requests.Response) -> bool:
         if response.status_code == 200 and 'text/html' in response.headers.get('Content-Type', ''):
             if 'Sign In' in response.text or 'login' in response.text.lower() or 'Welcome Back' in response.text:
-                logger.warning("⚠️ Session expired - received login page redirect")
+                logger.warning("Session expired - received login page redirect")
                 return True
         return False
 
     def _check_response_auth(self, response: requests.Response, endpoint: str) -> bool:
         if self._is_login_page_response(response):
-            logger.error(f"❌ Authentication failed for {endpoint} - session expired")
+            logger.error(f"Authentication failed for {endpoint} - session expired")
             return False
         return True
 
@@ -122,17 +126,17 @@ class QuotationService:
                 )
                 
                 if is_sellable and not is_packing:
-                    logger.info(f"✅ Found sellable item: {item_name} ({item_code})")
+                    logger.info(f"Found sellable item: {item_name} ({item_code})")
                     return item
             
             # Second pass: find any sellable item (even if it might be packing)
             for item in items:
                 if item.get("SellItem") == "Y":
-                    logger.info(f"⚠️ Found sellable but possibly packing item: {item.get('ItemName')} ({item.get('ItemCode')})")
+                    logger.info(f"Found sellable but possibly packing item: {item.get('ItemName')} ({item.get('ItemCode')})")
                     return item
             
             # No sellable items found
-            logger.info(f"❌ No sellable items found for: {search_term}")
+            logger.info(f"No sellable items found for: {search_term}")
             return None
             
         except Exception as e:
@@ -146,10 +150,10 @@ class QuotationService:
         """Discover the correct endpoint for quotation creation."""
         if not force_refresh and self._endpoint_cache and self._endpoint_cache_time:
             if (datetime.now() - self._endpoint_cache_time) < timedelta(hours=1):
-                logger.info("📦 Using cached quotation endpoint discovery")
+                logger.info("Using cached quotation endpoint discovery")
                 return self._endpoint_cache
 
-        logger.info("🔍 Discovering quotation endpoints...")
+        logger.info("Discovering quotation endpoints...")
 
         if hasattr(self.api, 'discover_endpoints'):
             discovery = self.api.discover_endpoints(force_refresh)
@@ -158,7 +162,7 @@ class QuotationService:
             if "documents" in discovery and discovery["documents"].get("create"):
                 if "/quotation" in discovery["documents"]["create"]:
                     result["documents_endpoint"] = discovery["documents"]["create"]
-                    logger.info(f"📄 Found documents endpoint: {discovery['documents']['create']}")
+                    logger.info(f"Found documents endpoint: {discovery['documents']['create']}")
 
             result["doc_type"] = 23
             result["doc_type_name"] = "Quotations"
@@ -166,7 +170,7 @@ class QuotationService:
             if not result.get("create"):
                 result["create"] = f"{self.base_url}{self.KNOWN_POST_ENDPOINTS[0]}"
                 result["_fallback_used"] = True
-                logger.warning(f"⚠️ Using hardcoded fallback: {result['create']}")
+                logger.warning(f"Using hardcoded fallback: {result['create']}")
 
             self._endpoint_cache = result
             self._endpoint_cache_time = datetime.now()
@@ -190,7 +194,7 @@ class QuotationService:
 
                 if resp.status_code == 200 and 'text/html' in resp.headers.get('Content-Type', ''):
                     if 'Sign In' in resp.text or 'login' in resp.text:
-                        logger.info(f"🔒 Endpoint exists but requires authentication: {full_url}")
+                        logger.info(f"Endpoint exists but requires authentication: {full_url}")
                         result["available_endpoints"].append({
                             "url": rel_endpoint,
                             "auth_required": True,
@@ -207,14 +211,14 @@ class QuotationService:
                         endpoint_info["type"] = "documents"
                         if 'POST' in methods and not result["documents_create"]:
                             result["documents_create"] = full_url
-                            logger.info(f"✅ OPTIONS confirmed POST documents endpoint: {full_url}")
+                            logger.info(f"OPTIONS confirmed POST documents endpoint: {full_url}")
 
                     result["available_endpoints"].append(endpoint_info)
 
                     if 'POST' in methods and not result["create"]:
                         result["create"] = full_url
                         result["supported_methods"] = methods
-                        logger.info(f"✅ OPTIONS confirmed POST endpoint: {full_url}")
+                        logger.info(f"OPTIONS confirmed POST endpoint: {full_url}")
 
             except Exception as e:
                 logger.debug(f"Could not OPTIONS-test {full_url}: {e}")
@@ -222,12 +226,12 @@ class QuotationService:
 
         if not result["create"] and result["documents_create"]:
             result["create"] = result["documents_create"]
-            logger.info(f"📄 Using documents endpoint as primary: {result['documents_create']}")
+            logger.info(f"Using documents endpoint as primary: {result['documents_create']}")
 
         if not result["create"]:
             result["create"] = f"{self.base_url}{self.KNOWN_POST_ENDPOINTS[0]}"
             result["_fallback_used"] = True
-            logger.warning(f"⚠️ Using hardcoded fallback: {result['create']}")
+            logger.warning(f"Using hardcoded fallback: {result['create']}")
 
         self._endpoint_cache = result
         self._endpoint_cache_time = datetime.now()
@@ -311,7 +315,7 @@ class QuotationService:
                         continue
                         
             except Exception as e:
-                logger.warning(f"⚠️ Could not validate item {item_code}: {e}")
+                logger.warning(f"Could not validate item {item_code}: {e}")
 
             valid_items.append(item)
 
@@ -408,15 +412,15 @@ class QuotationService:
     def _pick_payload(self, endpoint: str, formatted: Dict[str, Any]) -> Dict[str, Any]:
         """Choose the best payload format for a given endpoint URL."""
         if "documents" in endpoint:
-            logger.info("📤 Using 'documents' payload format")
+            logger.info("Using 'documents' payload format")
             return formatted["documents"]
         if "quotations" in endpoint or "sales" in endpoint:
-            logger.info("📤 Using 'sales_app' payload format")
+            logger.info("Using 'sales_app' payload format")
             return formatted["sales_app"]
         if "marketing" in endpoint:
-            logger.info("📤 Using 'sap' payload format")
+            logger.info("Using 'sap' payload format")
             return formatted["sap"]
-        logger.info("📤 Using 'simplified' payload format")
+        logger.info("Using 'simplified' payload format")
         return formatted["simplified"]
 
     # ==========================================================
@@ -439,7 +443,7 @@ class QuotationService:
         invalid_items: List[Dict] = []
 
         try:
-            logger.info(f"📝 Creating quotation for customer: {customer_code}")
+            logger.info(f"Creating quotation for customer: {customer_code}")
 
             if not items:
                 return ResponseFormatter.format_quotation_creation_error(
@@ -495,7 +499,7 @@ class QuotationService:
                     endpoints_to_try.append(full)
 
             if not endpoints_to_try:
-                logger.warning("⚠️ No POST endpoints to try for quotations")
+                logger.warning("No POST endpoints to try for quotations")
                 return self._get_web_fallback_response(
                     customer_code, valid_items, invalid_items,
                     additional_note="No POST endpoint configured." if language != "sw"
@@ -508,12 +512,12 @@ class QuotationService:
                 customer_code, valid_items, comments, valid_until_days
             )
 
-            logger.info(f"📤 Will try {len(endpoints_to_try)} endpoint(s) for quotation creation")
+            logger.info(f"Will try {len(endpoints_to_try)} endpoint(s) for quotation creation")
             last_error = None
 
             for endpoint_url in endpoints_to_try:
                 payload = self._pick_payload(endpoint_url, formatted)
-                logger.info(f"   → POST {endpoint_url}")
+                logger.info(f"   -> POST {endpoint_url}")
 
                 try:
                     response = requests.post(
@@ -555,7 +559,7 @@ class QuotationService:
                     except Exception:
                         result = {"raw_response": response.text}
 
-                    logger.info(f"📥 Quotation API response: {str(result)[:500]}")
+                    logger.info(f"Quotation API response: {str(result)[:500]}")
 
                     # Extract document details
                     doc_entry = None
@@ -585,6 +589,23 @@ class QuotationService:
                         total_amount = formatted["summary"]["total_amount"]
                         valid_until = formatted["summary"]["valid_until"]
                         
+                        # If we didn't get a doc_num, try to fetch the latest quotation
+                        if not doc_num:
+                            logger.info("No DocNum in response, fetching latest quotation for customer...")
+                            # Use asyncio to run this synchronously since we're in a sync method
+                            try:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                latest = loop.run_until_complete(
+                                    self.get_latest_quotation_for_customer(customer_code, language)
+                                )
+                                loop.close()
+                                if latest:
+                                    doc_num = latest.get("DocNum")
+                                    logger.info(f"Retrieved latest quotation number: {doc_num}")
+                            except Exception as e:
+                                logger.warning(f"Could not fetch latest quotation: {e}")
+                        
                         # Use ResponseFormatter to format the success message
                         formatted_response = ResponseFormatter.format_quotation_creation_success(
                             customer_name=customer_name,
@@ -595,7 +616,7 @@ class QuotationService:
                             language=language
                         )
                         
-                        logger.info(f"✅ Quotation created successfully via {endpoint_url}")
+                        logger.info(f"Quotation created successfully via {endpoint_url}")
                         
                         response_data = {
                             "success": True,
@@ -641,7 +662,7 @@ class QuotationService:
                 last_error = {"status": response.status_code, "endpoint": endpoint_url, "details": error_json}
 
             # All endpoints exhausted
-            logger.warning("⚠️ All POST endpoints failed for quotations")
+            logger.warning("All POST endpoints failed for quotations")
             additional_note = (
                 "The API only supports viewing quotations (GET), not creating them (POST)."
                 if language != "sw"
@@ -656,14 +677,14 @@ class QuotationService:
             return result
 
         except requests.Timeout:
-            logger.error("❌ Quotation creation timed out")
+            logger.error("Quotation creation timed out")
             return ResponseFormatter.format_quotation_creation_error(
                 "Request timed out. Please try again.",
                 invalid_items,
                 language=language
             )
         except Exception as e:
-            logger.exception("❌ Quotation creation failed unexpectedly")
+            logger.exception("Quotation creation failed unexpectedly")
             return ResponseFormatter.format_quotation_creation_error(
                 str(e),
                 invalid_items,
@@ -671,11 +692,63 @@ class QuotationService:
             )
 
     # ==========================================================
-    # GET LATEST QUOTATION
+    # GET LATEST QUOTATION FOR CUSTOMER (ASYNC)
+    # ==========================================================
+    async def get_latest_quotation_for_customer(self, customer_code: str, language: str = "en") -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent quotation for a customer.
+        This is useful after creating a quotation when the API doesn't return the ID.
+        """
+        try:
+            params = {
+                "CardCode": customer_code,
+                "page": 1,
+                "per_page": 1,
+                "isDoc": 1
+            }
+            
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: requests.get(
+                    f"{self.base_url}/marketing/docs/{self.SAP_OBJECT_CODE}",
+                    headers=self.headers,
+                    params=params,
+                    timeout=self.timeout,
+                )
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Handle string response
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except:
+                        logger.error(f"Failed to parse response as JSON: {data[:200]}")
+                        return None
+                
+                quotations = data.get("ResponseData", data.get("data", [])) if isinstance(data, dict) else data
+                
+                if quotations and len(quotations) > 0:
+                    latest = quotations[0]
+                    doc_status = latest.get("DocStatus")
+                    if doc_status in self.STATUS_MAP:
+                        latest["StatusText"] = self.STATUS_MAP[doc_status].get(language, self.STATUS_MAP[doc_status]["en"])
+                    return latest
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error getting latest quotation for customer {customer_code}: {e}")
+            return None
+
+    # ==========================================================
+    # GET LATEST QUOTATION (Sync version - for backward compatibility)
     # ==========================================================
     def get_latest_quotation(self, customer_code: str, language: str = "en") -> Optional[Dict[str, Any]]:
         """
-        Get the most recent quotation for a customer.
+        Get the most recent quotation for a customer (synchronous version).
         Useful after creating a quotation when DocNum isn't returned.
         """
         try:
@@ -702,18 +775,11 @@ class QuotationService:
                     doc_status = latest.get("DocStatus")
                     if doc_status in self.STATUS_MAP:
                         latest["StatusText"] = self.STATUS_MAP[doc_status].get(language, self.STATUS_MAP[doc_status]["en"])
-                    
-                    doc_entry = latest.get("DocEntry")
-                    if doc_entry:
-                        full_quotation = self.get_quotation(str(doc_entry), language)
-                        if full_quotation:
-                            return full_quotation
-                    
                     return latest
             
             return None
         except Exception as e:
-            logger.error(f"Error getting latest quotation for {customer_code}: {e}")
+            logger.error(f"Error getting latest quotation for customer {customer_code}: {e}")
             return None
 
     # ==========================================================
@@ -745,23 +811,23 @@ class QuotationService:
                 "api_available": False,
                 "message": "Kuunda nukuu kupitia API haiwezekani. Tafadhali tumia wavuti.",
                 "web_interface_instructions": {
-                    "title": "📋 Unda Nukuu Kwenye Wavuti",
+                    "title": "Unda Nukuu Kwenye Wavuti",
                     "steps": [
-                        f"1️⃣ Nenda kwenye **Mauzo → Nukuu** kwenye wavuti ya Leysco",
-                        f"2️⃣ Bofya kitufe cha **'Nukuu Mpya'**",
-                        f"3️⃣ Chagua mteja: **{customer_name}** ({customer_code})",
-                        f"4️⃣ Ongeza bidhaa zifuatazo:",
+                        f"1. Nenda kwenye **Mauzo -> Nukuu** kwenye wavuti ya Leysco",
+                        f"2. Bofya kitufe cha **'Nukuu Mpya'**",
+                        f"3. Chagua mteja: **{customer_name}** ({customer_code})",
+                        f"4. Ongeza bidhaa zifuatazo:",
                     ],
                     "items": [
-                        f"   • {item.get('ItemName', item['ItemCode'])} - {item['Quantity']} vitengo @ "
+                        f"   - {item.get('ItemName', item['ItemCode'])} - {item['Quantity']} vitengo @ "
                         f"KES {item['Price']:,.2f} = KES {item['Quantity'] * item['Price']:,.2f}"
                         for item in valid_items
                     ],
                     "total": f"**Jumla ya Kiasi: KES {total_amount:,.2f}**",
                     "additional_steps": [
-                        "5️⃣ Weka muda wa uhalali (kawaida: siku 30)",
-                        "6️⃣ Ongeza maoni au maelezo yoyote",
-                        "7️⃣ Hifadhi na tuma kwa mteja",
+                        "5. Weka muda wa uhalali (kawaida: siku 30)",
+                        "6. Ongeza maoni au maelezo yoyote",
+                        "7. Hifadhi na tuma kwa mteja",
                     ],
                 },
                 "quotation_summary": {
@@ -775,30 +841,30 @@ class QuotationService:
                 "language": language,
             }
             if is_auth_issue:
-                response["auth_instructions"] = "🔑 Tafadhali ingia tena kwenye wavuti ya Leysco kwanza."
+                response["auth_instructions"] = "Tafadhali ingia tena kwenye wavuti ya Leysco kwanza."
         else:
             response = {
                 "success": False,
                 "api_available": False,
                 "message": "Quotation creation via API is not available. Please use the web interface.",
                 "web_interface_instructions": {
-                    "title": "📋 Create Quotation in Web Interface",
+                    "title": "Create Quotation in Web Interface",
                     "steps": [
-                        f"1️⃣ Go to **Sales → Quotations** in the Leysco web application",
-                        f"2️⃣ Click **'New Quotation'** button",
-                        f"3️⃣ Select customer: **{customer_name}** ({customer_code})",
-                        f"4️⃣ Add the following items:",
+                        f"1. Go to **Sales -> Quotations** in the Leysco web application",
+                        f"2. Click **'New Quotation'** button",
+                        f"3. Select customer: **{customer_name}** ({customer_code})",
+                        f"4. Add the following items:",
                     ],
                     "items": [
-                        f"   • {item.get('ItemName', item['ItemCode'])} - {item['Quantity']} units @ "
+                        f"   - {item.get('ItemName', item['ItemCode'])} - {item['Quantity']} units @ "
                         f"KES {item['Price']:,.2f} = KES {item['Quantity'] * item['Price']:,.2f}"
                         for item in valid_items
                     ],
                     "total": f"**Total Amount: KES {total_amount:,.2f}**",
                     "additional_steps": [
-                        "5️⃣ Set validity period (default: 30 days)",
-                        "6️⃣ Add any comments or notes",
-                        "7️⃣ Save and send to customer",
+                        "5. Set validity period (default: 30 days)",
+                        "6. Add any comments or notes",
+                        "7. Save and send to customer",
                     ],
                 },
                 "quotation_summary": {
@@ -812,7 +878,7 @@ class QuotationService:
                 "language": language,
             }
             if is_auth_issue:
-                response["auth_instructions"] = "🔑 Please log in to the Leysco web application first."
+                response["auth_instructions"] = "Please log in to the Leysco web application first."
 
         if additional_note and not is_auth_issue:
             response["note"] = additional_note
@@ -822,13 +888,13 @@ class QuotationService:
             if language == "sw":
                 response[key] = {
                     "count": len(invalid_items),
-                    "items": [f"• {i.get('ItemName', i['ItemCode'])}: {i['reason']}" for i in invalid_items[:5]],
+                    "items": [f"- {i.get('ItemName', i['ItemCode'])}: {i['reason']}" for i in invalid_items[:5]],
                     "note":  "Bidhaa hizi zimerukwa kwa sababu hazina bei au si za kuuzwa.",
                 }
             else:
                 response[key] = {
                     "count": len(invalid_items),
-                    "items": [f"• {i.get('ItemName', i['ItemCode'])}: {i['reason']}" for i in invalid_items[:5]],
+                    "items": [f"- {i.get('ItemName', i['ItemCode'])}: {i['reason']}" for i in invalid_items[:5]],
                     "note":  "These items were skipped because they are not sellable or have no price.",
                 }
             if len(invalid_items) > 5:
@@ -900,7 +966,7 @@ class QuotationService:
                     ds = q.get("DocStatus")
                     if ds in self.STATUS_MAP:
                         q["StatusText"] = self.STATUS_MAP[ds].get(language, self.STATUS_MAP[ds]["en"])
-                logger.info(f"✅ Retrieved {len(quotations)} quotations for {customer_code}")
+                logger.info(f"Retrieved {len(quotations)} quotations for {customer_code}")
                 return quotations
 
             logger.error(f"Failed to get quotations for {customer_code}: {response.status_code}")
@@ -940,28 +1006,85 @@ class QuotationService:
             return None
 
     # ==========================================================
-    # GET QUOTATION BY NUMBER
+    # GET QUOTATION BY NUMBER (ASYNC)
     # ==========================================================
-    def get_quotation_by_number(self, doc_num: str, language: str = "en") -> Optional[Dict[str, Any]]:
+    async def get_quotation_by_number(self, doc_num: str, language: str = "en") -> Optional[Dict[str, Any]]:
+        """
+        Get a quotation by its document number.
+        Async version to work with FastAPI.
+        """
         try:
-            params   = {"page": 1, "per_page": 50, "search": doc_num}
-            response = requests.get(
-                f"{self.base_url}/marketing/docs/{self.SAP_OBJECT_CODE}",
-                headers=self.headers,
-                params=params,
-                timeout=self.timeout,
+            params = {"page": 1, "per_page": 50, "search": doc_num}
+            
+            # Run the blocking request in a thread pool
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: requests.get(
+                    f"{self.base_url}/marketing/docs/{self.SAP_OBJECT_CODE}",
+                    headers=self.headers,
+                    params=params,
+                    timeout=self.timeout,
+                )
             )
+            
             if response.status_code == 200:
-                data       = response.json()
+                data = response.json()
+                
+                # Handle string response
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except:
+                        logger.error(f"Failed to parse response as JSON: {data[:200]}")
+                        return None
+                
                 quotations = data.get("ResponseData", data.get("data", [])) if isinstance(data, dict) else data
-                for q in quotations:
-                    if str(q.get("DocNum")) == str(doc_num):
-                        ds = q.get("DocStatus")
+                
+                # If quotations is a string, try to parse it
+                if isinstance(quotations, str):
+                    try:
+                        quotations = json.loads(quotations)
+                    except:
+                        pass
+                
+                if quotations and isinstance(quotations, list):
+                    for q in quotations:
+                        if isinstance(q, dict) and str(q.get("DocNum")) == str(doc_num):
+                            ds = q.get("DocStatus")
+                            if ds in self.STATUS_MAP:
+                                q["StatusText"] = self.STATUS_MAP[ds].get(language, self.STATUS_MAP[ds]["en"])
+                            return q
+                elif isinstance(quotations, dict):
+                    # If it's a single quotation object
+                    if str(quotations.get("DocNum")) == str(doc_num):
+                        ds = quotations.get("DocStatus")
                         if ds in self.STATUS_MAP:
-                            q["StatusText"] = self.STATUS_MAP[ds].get(language, self.STATUS_MAP[ds]["en"])
-                        return q
+                            quotations["StatusText"] = self.STATUS_MAP[ds].get(language, self.STATUS_MAP[ds]["en"])
+                        return quotations
+                
                 logger.warning(f"Quotation {doc_num} not found")
-            return None
+                return None
+            else:
+                logger.error(f"Failed to fetch quotation {doc_num}: {response.status_code}")
+                return None
         except Exception as e:
             logger.error(f"Error searching for quotation {doc_num}: {e}")
             return None
+
+    # ==========================================================
+    # GET QUOTATION BY ID (ASYNC)
+    # ==========================================================
+    async def get_quotation_by_id(self, quotation_id: str, language: str = "en") -> Optional[Dict[str, Any]]:
+        """
+        Get a single quotation by ID (DocNum).
+        Async version to work with FastAPI.
+        
+        Args:
+            quotation_id: The document number of the quotation
+            language: Language for status text ("en" or "sw")
+            
+        Returns:
+            Quotation data as dict, or None if not found
+        """
+        return await self.get_quotation_by_number(quotation_id, language)

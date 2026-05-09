@@ -68,6 +68,20 @@ _SELL_OUT_PHRASES = {
     "customer that buys", "customer segment for", "who purchases",
 }
 
+# =========================================================
+# CHURN RISK PHRASES (NEW)
+# =========================================================
+_CHURN_RISK_PHRASES = {
+    "churn risk", "churning", "at risk", "risk of leaving",
+    "customer health", "health score", "unhealthy customers",
+    "likely to leave", "likely to churn", "churn prediction",
+    "churn analysis", "churn alert", "churn warning",
+    "customers at risk", "risk customers", "high risk customers",
+    "medium risk customers", "low risk customers", "health check",
+    "customer health check", "health report", "customer wellbeing",
+    "churn score", "attrition risk", "loyalty risk",
+}
+
 # Top selling phrases
 TOP_SELLING_PHRASES = {
     "top selling", "best selling", "most popular", "top items", 
@@ -180,7 +194,17 @@ _COMMON_PRODUCTS = [
 # Enhanced Fast-path patterns for natural language understanding
 FAST_PATH_PATTERNS = [
     # =========================================================
-    # CRITICAL: Quotation creation patterns (HIGHEST PRIORITY)
+    # CRITICAL: CHURN RISK PATTERNS (HIGHEST PRIORITY)
+    # =========================================================
+    (r'(?:show|list|get|view|display)\s+(?:customers|wateja)\s+(?:at|with|having)\s+(?:churn|churn risk|risk|customer health)', "GET_CUSTOMER_HEALTH"),
+    (r'(?:churn\s+risk|customer\s+health|health\s+score).*(?:customers|wateja)', "GET_CUSTOMER_HEALTH"),
+    (r'^(?:show|list|get)\s+(?:me\s+)?(?:the\s+)?(?:customer health|churn risk)\s*(?:report|analysis)?$', "GET_CUSTOMER_HEALTH"),
+    (r'customers?\s+(?:at|with)\s+risk\s+(?:of\s+)?(?:churn|leaving)', "GET_CUSTOMER_HEALTH"),
+    (r'who\s+is\s+(?:likely|about)\s+to\s+(?:leave|churn)', "GET_CUSTOMER_HEALTH"),
+    (r'(?:high|medium|low)\s+risk\s+customers', "GET_CUSTOMER_HEALTH"),
+    
+    # =========================================================
+    # CRITICAL: Quotation creation patterns
     # =========================================================
     (r'^create\s+(?:a\s+)?quotation\s+(?:for\s+)?([A-Za-z0-9\s]+)(?:\s+with\s+|\s+containing\s+|\s+including\s+)(.+)', "CREATE_QUOTATION"),
     (r'^make\s+(?:a\s+)?quotation\s+(?:for\s+)?([A-Za-z0-9\s]+)(?:\s+with\s+|\s+containing\s+)(.+)', "CREATE_QUOTATION"),
@@ -244,7 +268,7 @@ FAST_PATH_PATTERNS = [
     (r'(?:how many|what(?:\'s| is)? the (?:stock|quantity|inventory)|do you have|is there|are there).*(?:of|for|on)\s+([a-zA-Z0-9\-\(\)\s]+?)(?:\s+in stock|\s+available)?$', "GET_STOCK_LEVELS"),
     (r'(?:stock|hisa|available).*(?:of|for|ya)\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_STOCK_LEVELS"),
     
-    # Natural language customer queries (MUST include "customer" keyword - won't match "Leysco")
+    # Natural language customer queries
     (r'(?:show|get|view|tell me about).*(?:customer|client|mteja)\s+(?:details|info|information|maelezo).*(?:for|of|about|ya)\s+([A-Za-z][A-Za-z\s]+)$', "GET_CUSTOMER_DETAILS"),
     (r'(?:who is|customer info for)\s+([A-Za-z][A-Za-z\s]+)$', "GET_CUSTOMER_DETAILS"),
     
@@ -303,7 +327,7 @@ class IntentClassifier:
         # Check cache first
         cache_key = f"fast_path:{message_lower}"
         if cache_key in self._fast_path_cache:
-            logger.info(f"⚡ Fast-path cache hit: {message_lower}")
+            logger.debug(f"Fast-path cache hit: {message_lower}")  # Changed to DEBUG
             return self._fast_path_cache[cache_key]
         
         # Check patterns
@@ -360,7 +384,7 @@ class IntentClassifier:
                 
                 result = (intent, entities)
                 self._fast_path_cache[cache_key] = result
-                logger.info(f"⚡ Fast-path matched: '{message}' → {intent}")
+                logger.info(f"⚡ Fast-path matched: '{message}' → {intent}")  # Keep as INFO
                 return result
         
         return None
@@ -374,44 +398,51 @@ class IntentClassifier:
         text = text.lower().strip()
         
         # =========================================================
-        # CRITICAL: Check for QUOTATION CREATION FIRST
-        # This must come before any other detection
+        # CRITICAL: Check for CHURN RISK first (HIGHEST PRIORITY)
+        # This must come before GET_CUSTOMERS
+        # =========================================================
+        if any(phrase in text for phrase in _CHURN_RISK_PHRASES):
+            logger.debug(f"⚡ Rule-based churn risk detected: {text}")  # Changed to DEBUG
+            return "GET_CUSTOMER_HEALTH"
+        
+        # =========================================================
+        # CRITICAL: Check for QUOTATION CREATION
         # =========================================================
         if 'quotation' in text or 'quote' in text:
             if any(w in text for w in ['create', 'make', 'generate', 'prepare', 'new', 'cash sale']):
-                logger.info(f"📝 Quotation creation detected: {text}")
+                logger.debug(f"Quotation creation detected: {text}")  # Changed to DEBUG
                 return "CREATE_QUOTATION"
         
         # =========================================================
         # Company Info (HIGH PRIORITY - before customer)
         # =========================================================
         if 'leysco' in text and any(w in text for w in ['tell me about', 'what is', 'who is', 'about']):
-            logger.info(f"🏢 Company info detected: {text}")
+            logger.debug(f"Company info detected: {text}")  # Changed to DEBUG
             return "COMPANY_INFO"
         
         if any(w in text for w in ['company info', 'company information', 'about the company', 'tell me about leysco']):
-            logger.info(f"🏢 Company info detected: {text}")
+            logger.debug(f"Company info detected: {text}")  # Changed to DEBUG
             return "COMPANY_INFO"
         
         # =========================================================
-        # CRITICAL: Check for TOP SELLING ITEMS (high priority)
+        # CRITICAL: Check for TOP SELLING ITEMS
         # =========================================================
         if any(p in text for p in TOP_SELLING_PHRASES):
-            logger.info(f"📊 Rule-based top selling detected: {text}")
+            logger.debug(f"Rule-based top selling detected: {text}")  # Changed to DEBUG
             return "GET_TOP_SELLING_ITEMS"
         
         # =========================================================
-        # CRITICAL: Check for SALES ANALYTICS (high priority)
+        # CRITICAL: Check for SALES ANALYTICS
         # =========================================================
         if any(p in text for p in SALES_ANALYTICS_PHRASES):
-            logger.info(f"📈 Rule-based sales analytics detected: {text}")
+            logger.debug(f"Rule-based sales analytics detected: {text}")  # Changed to DEBUG
             return "GET_SALES_ANALYTICS"
         
         # =========================================================
         # Check for SLOW MOVING ITEMS
         # =========================================================
         if any(p in text for p in SLOW_MOVING_PHRASES):
-            logger.info(f"📊 Rule-based slow moving detected: {text}")
+            logger.debug(f"Rule-based slow moving detected: {text}")  # Changed to DEBUG
             return "GET_SLOW_MOVING_ITEMS"
         
         # =========================================================
@@ -441,7 +472,7 @@ class IntentClassifier:
         
         # Sell-out / customer segmentation queries
         if any(p in text for p in _SELL_OUT_PHRASES):
-            logger.info(f"🎯 Rule-based sell-out detected: {text}")
+            logger.debug(f"Rule-based sell-out detected: {text}")  # Changed to DEBUG
             return "FIND_CUSTOMERS_BY_ITEM"
         
         sell_out_patterns = [
@@ -473,14 +504,12 @@ class IntentClassifier:
             if stripped.startswith(phrase + " "):
                 return "SMALL_TALK"
 
-        # Training modules - MOVED LOWER and made more specific
-        # Only trigger if there are explicit training keywords AND not a top selling/slow moving query
+        # Training modules
         training_keywords = ["how to", "learn", "training", "tutorial", "guide", "teach me", 
                             "walk me through", "show me how", "getting started", "beginner", 
                             "new user", "onboarding", "help me understand", "how do i", "how can i"]
         
         if any(p in text for p in training_keywords):
-            # Skip if it's already a top selling or slow moving query
             if not any(p in text for p in TOP_SELLING_PHRASES) and not any(p in text for p in SLOW_MOVING_PHRASES):
                 if any(w in text for w in ["video", "watch", "screencast", "demo"]):
                     return "TRAINING_VIDEO"
@@ -602,12 +631,15 @@ class IntentClassifier:
         ]):
             return "FORECAST_DEMAND"
 
-        # List customers
+        # List customers (but NOT churn risk)
         if any(p in text for p in [
             "customers", "clients", "buyers",
             "show me customers", "list customers", "all customers", "wateja wote"
         ]):
             if not any(phrase in text for phrase in _CROSS_SELL_PHRASES):
+                # Check again for churn to override
+                if any(phrase in text for phrase in _CHURN_RISK_PHRASES):
+                    return "GET_CUSTOMER_HEALTH"
                 return "GET_CUSTOMERS"
 
         # Contact info
@@ -615,7 +647,7 @@ class IntentClassifier:
                                     "support", "reach you", "call", "whatsapp"]):
             return "CONTACT_INFO"
 
-        # Company info (fallback - already checked above but keeping for safety)
+        # Company info (fallback)
         if any(p in text for p in ["about leysco", "tell me about", "what is leysco",
                                     "who is leysco", "leysco information"]):
             return "COMPANY_INFO"
@@ -736,11 +768,17 @@ class IntentClassifier:
             return None
 
     # -------------------------------------------------------------------------
-    # CLARIFICATION SUGGESTIONS
+    # CLARIFICATION SUGGESTIONS (with churn options)
     # -------------------------------------------------------------------------
     def _clarify_suggestions(self, text: str, language: str = "en") -> list[str]:
         text_lower = text.lower()
         sw = language in ("sw", "mixed")
+
+        # Churn risk suggestions
+        if any(w in text_lower for w in ["churn", "risk", "customer health", "at risk"]):
+            if sw:
+                return ["Onyesha wateja walio katika hatari", "Afya ya mteja", "Wateja wenye alama ya chini"]
+            return ["Show customers at churn risk", "Customer health scores", "Customers with low health score"]
 
         if any(w in text_lower for w in ["price", "cost", "bei", "how much"]):
             if sw:
@@ -813,7 +851,7 @@ class IntentClassifier:
         cache_key = f"intent:{user_message}"
         cached = await cache_service.get_simple_async(cache_key)
         if cached:
-            logger.info(f"⚡ Intent cache hit: {user_message[:50]}...")
+            logger.debug(f"Intent cache hit: {user_message[:50]}...")  # Changed to DEBUG
             return cached
 
         # ── STEP 2: Try fast-path patterns (no LLM) ──────────────────────────
@@ -828,6 +866,7 @@ class IntentClassifier:
                 original_text=user_message
             )
             await cache_service.set_simple_async(cache_key, result, ttl=300)
+            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
             return result
 
         # ── STEP 3: Swahili detection ────────────────────────────────────────
@@ -835,7 +874,7 @@ class IntentClassifier:
 
         if swahili_result["detected_language"] != "en":
             language = swahili_result["detected_language"]
-            logger.info(f"🇰🇪 Swahili detected: lang={language}")
+            logger.debug(f"Swahili detected: lang={language}")  # Changed to DEBUG
 
             if swahili_result["intent"] != "UNKNOWN":
                 intent = swahili_result["intent"]
@@ -848,18 +887,31 @@ class IntentClassifier:
                     normalized_text=swahili_result.get("normalized_text", ""),
                 )
                 await cache_service.set_simple_async(cache_key, result, ttl=300)
+                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                 return result
 
             if swahili_result.get("normalized_text"):
                 text_lower = swahili_result["normalized_text"].lower()
 
-        # ── STEP 4: Customer Segmentation / "Sell Out" queries ───────────────
+        # ── STEP 4: Check for CHURN RISK (HIGH PRIORITY) ─────────────────────
+        if any(phrase in text_lower for phrase in _CHURN_RISK_PHRASES):
+            result = _result(
+                intent="GET_CUSTOMER_HEALTH",
+                language=language,
+                confidence=_CONF["rule_fallback"],
+                original_text=user_message
+            )
+            await cache_service.set_simple_async(cache_key, result, ttl=300)
+            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
+            return result
+
+        # ── STEP 5: Customer Segmentation / "Sell Out" queries ───────────────
         is_sell_out_query = False
         
         for phrase in _SELL_OUT_PHRASES:
             if phrase in text_lower:
                 is_sell_out_query = True
-                logger.info(f"🎯 Sell-out query detected: '{phrase}'")
+                logger.debug(f"Sell-out query detected: '{phrase}'")  # Changed to DEBUG
                 break
         
         sell_out_patterns = [
@@ -906,6 +958,7 @@ class IntentClassifier:
                     entities={"item_name": product, "action": "sell_out"}
                 )
                 await cache_service.set_simple_async(cache_key, result, ttl=300)
+                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                 return result
             else:
                 result = _result(
@@ -915,33 +968,37 @@ class IntentClassifier:
                     alternatives=["Sell out which product?", "Find customers for which item?"]
                 )
                 await cache_service.set_simple_async(cache_key, result, ttl=300)
+                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                 return result
 
-        # ── STEP 5: Short query fast-path (no AI) ───────────────────────────
+        # ── STEP 6: Short query fast-path (no AI) ───────────────────────────
         if len(text_lower) < 35:
             if any(w in text_lower for w in ["hi", "hello", "hey", "jambo", "habari"]):
                 result = _result("GREETING", language, _CONF["fast_path"])
                 await cache_service.set_simple_async(cache_key, result, ttl=300)
+                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                 return result
 
             if any(w in text_lower for w in ["thanks", "thank you", "asante"]):
                 result = _result("THANKS", language, _CONF["fast_path"])
                 await cache_service.set_simple_async(cache_key, result, ttl=300)
+                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                 return result
 
-            # Add sales check for short queries
             if any(w in text_lower for w in ["sales", "revenue", "analytics"]):
                 result = _result("GET_SALES_ANALYTICS", language, _CONF["fast_path"])
                 await cache_service.set_simple_async(cache_key, result, ttl=300)
+                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                 return result
 
             stripped = text_lower.rstrip("!?.,")
             if stripped in _ACKNOWLEDGEMENT_WORDS or stripped in _FAREWELL_WORDS:
                 result = _result("SMALL_TALK", language, _CONF["fast_path"])
                 await cache_service.set_simple_async(cache_key, result, ttl=300)
+                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                 return result
 
-        # ── STEP 6: Rule-based fallback (cached) ─────────────────────────────
+        # ── STEP 7: Rule-based fallback (cached) ─────────────────────────────
         rule_intent = self._rule_based_intent(user_message)
         
         if rule_intent != "UNKNOWN":
@@ -952,9 +1009,10 @@ class IntentClassifier:
                 confidence=confidence,
             )
             await cache_service.set_simple_async(cache_key, result, ttl=300)
+            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
             return result
 
-        # ── STEP 7: AI classification (only if needed) ───────────────────────
+        # ── STEP 8: AI classification (only if needed) ───────────────────────
         try:
             prompt = self.prompt_manager.get_intent_prompt(user_message)
             response = await self.llm.generate_async(prompt)
@@ -965,23 +1023,28 @@ class IntentClassifier:
                     ai_intent = data.get("intent", "").strip().upper()
 
                     if ai_intent in _VALID_INTENTS_SET:
-                        logger.info(f"AI raw intent: {ai_intent}")
+                        logger.debug(f"AI raw intent: {ai_intent}")  # Changed to DEBUG
                         
                         # Post-AI overrides
                         original_ai = ai_intent
                         
+                        # Check for churn risk
+                        if any(phrase in text_lower for phrase in _CHURN_RISK_PHRASES):
+                            ai_intent = "GET_CUSTOMER_HEALTH"
+                            logger.debug(f"AI override: churn risk detected")  # Changed to DEBUG
+                        
                         # Check for quotation creation again
-                        if 'quotation' in text_lower or 'quote' in text_lower:
+                        elif 'quotation' in text_lower or 'quote' in text_lower:
                             if any(w in text_lower for w in ['create', 'make', 'generate', 'prepare', 'new', 'cash sale']):
                                 ai_intent = "CREATE_QUOTATION"
                         # Check for company info
                         elif 'leysco' in text_lower and any(w in text_lower for w in ['tell me about', 'what is', 'who is', 'about']):
                             ai_intent = "COMPANY_INFO"
-                            logger.info(f"🏢 AI override: company info detected")
-                        # Add sales analytics check
+                            logger.debug(f"AI override: company info detected")  # Changed to DEBUG
+                        # Check for sales analytics
                         elif any(p in text_lower for p in SALES_ANALYTICS_PHRASES):
                             ai_intent = "GET_SALES_ANALYTICS"
-                            logger.info(f"📈 AI override: sales analytics detected")
+                            logger.debug(f"AI override: sales analytics detected")  # Changed to DEBUG
                         elif any(p in text_lower for p in _SELL_OUT_PHRASES):
                             ai_intent = "FIND_CUSTOMERS_BY_ITEM"
                         elif "customer" in text_lower and "price" in text_lower:
@@ -1001,12 +1064,13 @@ class IntentClassifier:
                             confidence=confidence,
                         )
                         await cache_service.set_simple_async(cache_key, result, ttl=300)
+                        logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
                         return result
 
         except Exception as e:
             logger.warning(f"LLM intent failed: {e}")
 
-        # ── STEP 8: Final fallback to CLARIFY ────────────────────────────────
+        # ── STEP 9: Final fallback to CLARIFY ────────────────────────────────
         suggestions = self._clarify_suggestions(user_message, language)
         result = _result(
             intent="CLARIFY",
@@ -1015,6 +1079,7 @@ class IntentClassifier:
             alternatives=suggestions,
         )
         await cache_service.set_simple_async(cache_key, result, ttl=60)
+        logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
         return result
 
     # -------------------------------------------------------------------------

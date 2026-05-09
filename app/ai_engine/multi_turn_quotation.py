@@ -113,6 +113,59 @@ def _normalize_api_result(result: Any) -> List[Dict]:
     return []
 
 
+def _extract_quotation_id_from_result(result: dict) -> Optional[str]:
+    """Extract quotation ID from API result."""
+    if not result:
+        return None
+    
+    # Check direct fields
+    if result.get("DocNum"):
+        return str(result["DocNum"])
+    if result.get("quotation_id"):
+        return str(result["quotation_id"])
+    if result.get("id"):
+        return str(result["id"])
+    
+    # Check ResponseData structure
+    if "ResponseData" in result:
+        response_data = result["ResponseData"]
+        if isinstance(response_data, dict):
+            if response_data.get("DocNum"):
+                return str(response_data["DocNum"])
+            if response_data.get("id"):
+                return str(response_data["id"])
+            # Check data array
+            data = response_data.get("data", [])
+            if data and isinstance(data, list) and len(data) > 0:
+                first = data[0]
+                if isinstance(first, dict):
+                    if first.get("DocNum"):
+                        return str(first["DocNum"])
+                    if first.get("id"):
+                        return str(first["id"])
+        elif isinstance(response_data, list) and len(response_data) > 0:
+            first = response_data[0]
+            if isinstance(first, dict):
+                if first.get("DocNum"):
+                    return str(first["DocNum"])
+                if first.get("id"):
+                    return str(first["id"])
+    
+    # Check data array at root
+    data = result.get("data", [])
+    if data and isinstance(data, list) and len(data) > 0:
+        first = data[0]
+        if isinstance(first, dict):
+            if first.get("DocNum"):
+                return str(first["DocNum"])
+            if first.get("quotation_id"):
+                return str(first["quotation_id"])
+            if first.get("id"):
+                return str(first["id"])
+    
+    return None
+
+
 # ── Cached item search ───────────────────────────────────────────────────────
 
 @lru_cache(maxsize=256)
@@ -657,7 +710,10 @@ def handle_create_quotation(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _finalise(draft: dict, session_id: str, ar: Any, language: str) -> dict:
-    """Call QuotationService, clear draft, return confirmation card."""
+    """
+    Call QuotationService, clear draft, return confirmation card.
+    FIXED: Properly extracts quotation ID and includes intent for Flutter.
+    """
     try:
         result = ar.quotation.create_quotation(
             customer_code=draft["customer_code"],
@@ -673,14 +729,32 @@ def _finalise(draft: dict, session_id: str, ar: Any, language: str) -> dict:
 
     _clear_draft(session_id)
 
+    # Extract quotation ID from result
+    quotation_id = _extract_quotation_id_from_result(result)
+    
+    # Also try to get from result data if not found
+    if not quotation_id and result.get("data"):
+        data = result.get("data", [])
+        if data and isinstance(data, list) and len(data) > 0:
+            first_item = data[0]
+            if isinstance(first_item, dict):
+                quotation_id = first_item.get("DocNum") or first_item.get("quotation_id") or first_item.get("id")
+
     if result.get("message"):
         return {
             "message": result["message"],
-            "data": result.get("data", [])
+            "data": result.get("data", []),
+            "quotation_id": quotation_id,
+            "success": True,
+            "intent": "CREATE_QUOTATION"
         }
 
     if result.get("success"):
         doc_num = result.get("DocNum", "N/A")
+        # If we got empty DocNum but have quotation_id, use that
+        if (doc_num == "N/A" or doc_num == "0" or doc_num is None) and quotation_id:
+            doc_num = quotation_id
+        
         cname = draft["customer_name"]
         total = draft["running_total"]
         items = draft["items"]
@@ -700,7 +774,13 @@ def _finalise(draft: dict, session_id: str, ar: Any, language: str) -> dict:
                 text += f"  {_item_line(item)}\n"
             text += f"\n**TOTAL: {_fmt(total)}**"
 
-        return {"message": text, "data": [result]}
+        return {
+            "message": text,
+            "data": [result],
+            "quotation_id": str(doc_num) if doc_num != "N/A" else quotation_id,
+            "success": True,
+            "intent": "CREATE_QUOTATION"
+        }
 
     error = result.get("error", "Unknown error")
     if "web_interface_instructions" in result:
@@ -727,7 +807,10 @@ def _create_immediately(
     ar: Any,
     language: str,
 ) -> dict:
-    """Original single-turn path — all items came in the first message."""
+    """
+    Original single-turn path — all items came in the first message.
+    FIXED: Properly extracts quotation ID and includes intent for Flutter.
+    """
     try:
         result = ar.quotation.create_quotation(
             customer_code=customer.get("CardCode"),
@@ -741,14 +824,32 @@ def _create_immediately(
             return {"message": f"Hitilafu: {exc}", "data": []}
         return {"message": f"Error: {exc}", "data": []}
 
+    # Extract quotation ID from result
+    quotation_id = _extract_quotation_id_from_result(result)
+    
+    # Also try to get from result data if not found
+    if not quotation_id and result.get("data"):
+        data = result.get("data", [])
+        if data and isinstance(data, list) and len(data) > 0:
+            first_item = data[0]
+            if isinstance(first_item, dict):
+                quotation_id = first_item.get("DocNum") or first_item.get("quotation_id") or first_item.get("id")
+
     if result.get("message"):
         return {
             "message": result["message"],
-            "data": result.get("data", [])
+            "data": result.get("data", []),
+            "quotation_id": quotation_id,
+            "success": True,
+            "intent": "CREATE_QUOTATION"
         }
 
     if result.get("success"):
         doc_num = result.get("DocNum", "N/A")
+        # If we got empty DocNum but have quotation_id, use that
+        if (doc_num == "N/A" or doc_num == "0" or doc_num is None) and quotation_id:
+            doc_num = quotation_id
+            
         cname = customer.get("CardName")
         total = sum(i.get("Price", 0) * i.get("Quantity", 0) for i in items)
 
@@ -772,7 +873,13 @@ def _create_immediately(
             else:
                 text += f"\n\n⚠️ Skipped: {names}"
 
-        return {"message": text, "data": [result]}
+        return {
+            "message": text,
+            "data": [result],
+            "quotation_id": str(doc_num) if doc_num != "N/A" else quotation_id,
+            "success": True,
+            "intent": "CREATE_QUOTATION"
+        }
 
     error = result.get("error", "Unknown error")
     if "web_interface_instructions" in result:

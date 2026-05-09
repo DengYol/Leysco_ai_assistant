@@ -10,6 +10,10 @@ Intelligent recommendations for items and customers based on:
 - Seasonal recommendations
 - Trending products
 - Customer segmentation (who buys what)
+
+FIXED: Improved get_customers_for_item with better error handling
+FIXED: Added fallbacks for API failures
+FIXED: Enhanced None value handling in price calculations
 """
 
 import logging
@@ -604,10 +608,10 @@ class RecommendationService:
         # Deduplicate and score
         seen = set()
         for suggestion in all_suggestions:
-            code = suggestion["ItemCode"]
-            if code not in seen and code not in items:
+            code = suggestion.get("ItemCode")
+            if code and code not in seen and code not in items:
                 seen.add(code)
-                suggestion["BundleScore"] = len([s for s in all_suggestions if s["ItemCode"] == code])
+                suggestion["BundleScore"] = len([s for s in all_suggestions if s.get("ItemCode") == code])
                 suggestions.append(suggestion)
         
         # Sort by bundle score
@@ -691,135 +695,105 @@ class RecommendationService:
                     logger.info(f"📦 Returning cached customers for item {item_code} ({len(cache_entry['customers'])} customers)")
                     return cache_entry["customers"][:limit]
             
-            # Get all customers first
-            all_customers = self.api.get_all_customers(limit=2000)
-            
-            if not all_customers:
-                logger.warning("No customers found in system")
+            # Get item details first to verify item exists
+            item = self.api.get_item_by_code(item_code)
+            if not item:
+                logger.warning(f"Item {item_code} not found")
                 return []
             
-            # Track customers who bought this item
+            item_name = item.get("ItemName", item_code)
+            
+            # Use the API's get_customers_for_item method if available
+            try:
+                if hasattr(self.api, 'get_customers_for_item'):
+                    customers = self.api.get_customers_for_item(item_code=item_code, limit=limit * 2)
+                    if customers:
+                        # Add recommendation reasons
+                        for i, customer in enumerate(customers):
+                            if i == 0:
+                                customer["RecommendationReason"] = "🏆 Top buyer - highest volume customer"
+                            elif customer.get("PurchaseQuantity", 0) > 5:
+                                customer["RecommendationReason"] = "⭐ Regular purchaser - frequent buyer"
+                            else:
+                                customer["RecommendationReason"] = "✓ Previous buyer - has purchased this product"
+                        return customers[:limit]
+            except Exception as e:
+                logger.debug(f"API get_customers_for_item not available: {e}")
+            
+            # Fallback: Search through orders (limit to avoid performance issues)
             customers_with_purchases = []
-            processed_count = 0
             
-            # Process customers in batches to avoid overwhelming the API
-            batch_size = 50
-            total_batches = (len(all_customers) + batch_size - 1) // batch_size
+            # Get recent orders to find customers
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=180)  # Last 6 months
             
-            for i in range(0, len(all_customers), batch_size):
-                batch = all_customers[i:i+batch_size]
-                processed_count += len(batch)
+            try:
+                # Try to get sales analysis for this item
+                sales_data = self.api.get_sales_analysis(
+                    start_date=start_date.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d"),
+                    limit=500
+                )
                 
-                for customer in batch:
-                    customer_code = customer.get("CardCode")
-                    customer_name = customer.get("CardName")
-                    
-                    if not customer_code:
-                        continue
-                    
-                    try:
-                        # Get customer's order history
-                        orders_result = self.api.get_orders(customer_code=customer_code, limit=20)
-                        
-                        # Extract the actual orders from the response
-                        if isinstance(orders_result, dict):
-                            orders = orders_result.get("ResponseData", [])
-                        else:
-                            orders = orders_result if isinstance(orders_result, list) else []
-                        
-                        if not orders:
-                            continue
-                        
-                        # Check if any order contains this item
-                        total_quantity = 0
-                        last_purchase_date = None
-                        order_count = 0
-                        
-                        for order in orders:
-                            document_lines = order.get("DocumentLines", [])
+                if sales_data:
+                    customer_purchases = {}
+                    for sale in sales_data:
+                        sale_item_code = sale.get("ItemCode")
+                        if sale_item_code == item_code:
+                            cust_code = sale.get("CardCode")
+                            cust_name = sale.get("CardName")
+                            quantity = float(sale.get("Quantity", 0) or 0)
                             
-                            for line in document_lines:
-                                line_item_code = line.get("ItemCode")
-                                if line_item_code == item_code:
-                                    quantity = float(line.get("Quantity", 0))
-                                    total_quantity += quantity
-                                    order_count += 1
-                                    
-                                    # Track last purchase date
-                                    order_date = order.get("DocDate")
-                                    if order_date and (not last_purchase_date or order_date > last_purchase_date):
-                                        last_purchase_date = order_date
+                            if cust_code:
+                                if cust_code not in customer_purchases:
+                                    customer_purchases[cust_code] = {
+                                        "CardCode": cust_code,
+                                        "CardName": cust_name or cust_code,
+                                        "PurchaseQuantity": 0,
+                                        "LastPurchaseDate": sale.get("DocDate"),
+                                        "OrderCount": 0
+                                    }
+                                customer_purchases[cust_code]["PurchaseQuantity"] += quantity
+                                customer_purchases[cust_code]["OrderCount"] += 1
+                    
+                    # Convert to list
+                    for cust_code, data in customer_purchases.items():
+                        customers_with_purchases.append(data)
+                    
+                    if customers_with_purchases:
+                        # Sort by purchase quantity
+                        customers_with_purchases.sort(key=lambda x: x.get("PurchaseQuantity", 0), reverse=True)
                         
-                        if total_quantity > 0:
-                            # Get full customer details
-                            full_customer = self.api.get_customer_by_code(customer_code)
-                            if full_customer:
-                                full_customer["PurchaseQuantity"] = total_quantity
-                                full_customer["LastPurchaseDate"] = last_purchase_date
-                                full_customer["OrderCount"] = order_count
-                                full_customer["ItemCode"] = item_code
-                                customers_with_purchases.append(full_customer)
-                                
-                    except Exception as e:
-                        logger.debug(f"Error checking customer {customer_code}: {e}")
-                        continue
-                
-                # Log progress every 5 batches
-                if (i // batch_size) % 5 == 0:
-                    logger.info(f"Processed {processed_count}/{len(all_customers)} customers, found {len(customers_with_purchases)} so far")
+                        # Add recommendation reasons
+                        for i, cust in enumerate(customers_with_purchases[:limit]):
+                            qty = cust.get("PurchaseQuantity", 0)
+                            if i == 0 and qty > 10:
+                                cust["RecommendationReason"] = "🏆 Top buyer - highest volume customer"
+                            elif qty > 5:
+                                cust["RecommendationReason"] = "⭐ Regular purchaser - frequent buyer"
+                            else:
+                                cust["RecommendationReason"] = "✓ Previous buyer - has purchased this product"
+                        
+                        # Cache results
+                        if use_cache:
+                            self._customers_for_item_cache[item_code] = {
+                                "customers": customers_with_purchases,
+                                "timestamp": datetime.now()
+                            }
+                        
+                        logger.info(f"✅ Found {len(customers_with_purchases)} customers for {item_name}")
+                        return customers_with_purchases[:limit]
+            except Exception as e:
+                logger.debug(f"Sales analysis not available: {e}")
             
-            # Sort by purchase quantity (highest first)
-            customers_with_purchases.sort(
-                key=lambda x: x.get("PurchaseQuantity", 0), 
-                reverse=True
-            )
-            
-            logger.info(f"✅ Found {len(customers_with_purchases)} customers who bought {item_code}")
-            
-            # Add recommendation reasons based on purchase behavior
-            for i, customer in enumerate(customers_with_purchases):
-                qty = customer.get("PurchaseQuantity", 0)
-                order_count = customer.get("OrderCount", 0)
-                
-                if i == 0 and qty > 10:
-                    customer["RecommendationReason"] = "🏆 Top buyer - highest volume customer"
-                    customer["RecommendationPriority"] = "high"
-                elif qty > 5:
-                    customer["RecommendationReason"] = "⭐ Regular purchaser - frequent buyer"
-                    customer["RecommendationPriority"] = "high"
-                elif order_count > 1:
-                    customer["RecommendationReason"] = "📦 Repeat customer - bought multiple times"
-                    customer["RecommendationPriority"] = "medium"
-                else:
-                    customer["RecommendationReason"] = "✓ Previous buyer - has purchased this product"
-                    customer["RecommendationPriority"] = "low"
-                
-                # Add human-readable date
-                if customer.get("LastPurchaseDate"):
-                    try:
-                        last_date = datetime.strptime(customer["LastPurchaseDate"][:10], "%Y-%m-%d")
-                        days_ago = (datetime.now() - last_date).days
-                        customer["DaysSinceLastPurchase"] = days_ago
-                        if days_ago <= 30:
-                            customer["RecommendationReason"] += " (recent purchase)"
-                    except:
-                        pass
-            
-            # Cache the results
-            if use_cache:
-                self._customers_for_item_cache[item_code] = {
-                    "customers": customers_with_purchases,
-                    "timestamp": datetime.now()
-                }
-                logger.info(f"💾 Cached {len(customers_with_purchases)} customers for item {item_code}")
-            
-            return customers_with_purchases[:limit]
+            # Final fallback: Return empty list with suggestion
+            logger.info(f"No customers found for item {item_name}")
+            return []
             
         except Exception as e:
+            self._record_error()
             logger.error(f"Error getting customers for item {item_code}: {e}", exc_info=True)
-            # Fallback to recommended customers if something goes wrong
-            logger.info("Falling back to recommended customers")
-            return self.get_recommended_customers(limit)
+            return []
     
     def get_customers_for_item_fast(self, item_code: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
@@ -833,94 +807,7 @@ class RecommendationService:
         Returns:
             List of customers who buy this item with purchase statistics
         """
-        try:
-            logger.info(f"🚀 Fast lookup: Getting customers for item {item_code}")
-            
-            # Get sales analysis for the last 6 months
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=180)
-            
-            sales_data = self.api.get_sales_analysis(
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
-                limit=500
-            )
-            
-            if not sales_data:
-                logger.warning("No sales data available, falling back to standard method")
-                return self.get_customers_for_item(item_code, limit, use_cache=False)
-            
-            # Filter for our item and aggregate by customer
-            customer_purchases = {}
-            
-            for sale in sales_data:
-                sale_item_code = sale.get("ItemCode")
-                if sale_item_code == item_code:
-                    customer_code = sale.get("CardCode")
-                    customer_name = sale.get("CardName")
-                    quantity = float(sale.get("Quantity", 0))
-                    
-                    if customer_code:
-                        if customer_code not in customer_purchases:
-                            customer_purchases[customer_code] = {
-                                "customer_code": customer_code,
-                                "customer_name": customer_name,
-                                "total_quantity": 0,
-                                "last_purchase": sale.get("DocDate"),
-                                "order_count": 0
-                            }
-                        customer_purchases[customer_code]["total_quantity"] += quantity
-                        customer_purchases[customer_code]["order_count"] += 1
-                        
-                        # Update last purchase date if newer
-                        sale_date = sale.get("DocDate")
-                        if sale_date and (not customer_purchases[customer_code]["last_purchase"] or 
-                                          sale_date > customer_purchases[customer_code]["last_purchase"]):
-                            customer_purchases[customer_code]["last_purchase"] = sale_date
-            
-            if not customer_purchases:
-                logger.info(f"No customers found for item {item_code} in sales analysis")
-                return self.get_customers_for_item(item_code, limit, use_cache=False)
-            
-            # Convert to list and get full customer details
-            customers_list = []
-            for cust_code, cust_data in customer_purchases.items():
-                # Try to get full customer details
-                customer = self.api.get_customer_by_code(cust_code)
-                if customer:
-                    customer["PurchaseQuantity"] = cust_data["total_quantity"]
-                    customer["LastPurchaseDate"] = cust_data["last_purchase"]
-                    customer["OrderCount"] = cust_data["order_count"]
-                    customers_list.append(customer)
-                else:
-                    # Fallback to basic info
-                    customers_list.append({
-                        "CardCode": cust_code,
-                        "CardName": cust_data["customer_name"] or cust_code,
-                        "PurchaseQuantity": cust_data["total_quantity"],
-                        "LastPurchaseDate": cust_data["last_purchase"],
-                        "OrderCount": cust_data["order_count"]
-                    })
-            
-            # Sort by purchase quantity
-            customers_list.sort(key=lambda x: x.get("PurchaseQuantity", 0), reverse=True)
-            
-            # Add recommendation reasons
-            for i, customer in enumerate(customers_list):
-                qty = customer.get("PurchaseQuantity", 0)
-                if i == 0 and qty > 10:
-                    customer["RecommendationReason"] = "🏆 Top buyer - highest volume customer"
-                elif qty > 5:
-                    customer["RecommendationReason"] = "⭐ Regular purchaser - frequent buyer"
-                else:
-                    customer["RecommendationReason"] = "✓ Previous buyer - has purchased this product"
-            
-            logger.info(f"✅ Fast lookup found {len(customers_list)} customers for {item_code}")
-            return customers_list[:limit]
-            
-        except Exception as e:
-            logger.error(f"Error in fast customer lookup: {e}")
-            return self.get_customers_for_item(item_code, limit, use_cache=False)
+        return self.get_customers_for_item(item_code, limit, use_cache=True)
     
     def get_similar_customers(self, customer_code: str, limit: int = 10, use_cache: bool = True) -> List[Dict[str, Any]]:
         """
@@ -951,6 +838,7 @@ class RecommendationService:
             
             source_territory = (source_customer.get("territory") or {}).get("descript", "")
             source_group = source_customer.get("GroupCode")
+            source_city = source_customer.get("City", "")
             
             # Get all customers
             all_customers = self.api.get_customers(limit=200)
@@ -974,7 +862,6 @@ class RecommendationService:
                 
                 # Same city/region
                 city = customer.get("City", "")
-                source_city = source_customer.get("City", "")
                 if city and city == source_city:
                     score += 2
                 
@@ -1031,14 +918,15 @@ class RecommendationService:
                     "average_order_value": 0
                 }
             
-            total_value = 0
+            total_value = 0.0
             unique_items = set()
             last_order_date = None
             first_order_date = None
             product_counts = defaultdict(int)
             
             for order in orders:
-                doc_total = float(order.get("DocTotal", 0))
+                doc_total_raw = order.get("DocTotal", 0)
+                doc_total = float(doc_total_raw) if doc_total_raw is not None else 0.0
                 total_value += doc_total
                 
                 doc_date = order.get("DocDate")
@@ -1053,7 +941,9 @@ class RecommendationService:
                     item_code = line.get("ItemCode")
                     if item_code:
                         unique_items.add(item_code)
-                        product_counts[item_code] += float(line.get("Quantity", 0))
+                        qty_raw = line.get("Quantity", 0)
+                        qty = float(qty_raw) if qty_raw is not None else 0
+                        product_counts[item_code] += qty
             
             # Get top products
             top_products = sorted(product_counts.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -1086,17 +976,23 @@ class RecommendationService:
     
     def _is_sellable(self, item: Dict[str, Any]) -> bool:
         """Check if an item is sellable (not packing material, etc.)"""
+        if not item:
+            return False
+        
+        # Check SellItem flag
         if item.get("SellItem") != "Y":
             return False
         
-        group = (item.get("item_group") or {}).get("ItmsGrpNam", "").upper()
-        SKIP_GROUPS = {"PACKING MATERIAL", "RAW MATERIAL", "INTERNAL"}
+        # Check item group
+        group = (item.get("item_group") or {}).get("ItmsGrpNam", "")
+        SKIP_GROUPS = {"PACKING MATERIAL", "RAW MATERIAL", "INTERNAL", "PACKAGING"}
         
-        if group in SKIP_GROUPS:
+        if group.upper() in SKIP_GROUPS:
             return False
         
+        # Check item code prefixes
         code = item.get("ItemCode", "").upper()
-        SKIP_PREFIXES = ("RMST", "RMOP", "RMFC", "RMPA")
+        SKIP_PREFIXES = ("RMST", "RMOP", "RMFC", "RMPA", "RMPK", "PACK", "BAG", "BOX", "LABEL")
         
         if code.startswith(SKIP_PREFIXES):
             return False
@@ -1110,7 +1006,7 @@ class RecommendationService:
         sellable = []
         for item in items:
             if self._is_sellable(item):
-                price_info = self._get_price_info(item["ItemCode"])
+                price_info = self._get_price_info(item.get("ItemCode"))
                 item["Price"] = price_info.get("price")
                 item["Currency"] = price_info.get("currency", "KES")
                 sellable.append(item)
@@ -1126,16 +1022,16 @@ class RecommendationService:
         
         for item in items[:limit]:
             if self._is_sellable(item):
-                price_info = self._get_price_info(item["ItemCode"])
+                price_info = self._get_price_info(item.get("ItemCode"))
                 enhanced.append({
-                    "ItemCode": item["ItemCode"],
-                    "ItemName": item["ItemName"],
+                    "ItemCode": item.get("ItemCode"),
+                    "ItemName": item.get("ItemName"),
                     "Price": price_info.get("price"),
                     "Currency": price_info.get("currency", "KES"),
                     "SalesVolume": 0,
                     "Trend": "📈 Popular",
                     "Reason": "Popular item in our catalog",
-                    "StockStatus": self._check_stock_status(item["ItemCode"]),
+                    "StockStatus": self._check_stock_status(item.get("ItemCode")),
                     "Action": "Check stock",
                     "Type": "trending",
                     "Source": "fallback"
@@ -1145,6 +1041,9 @@ class RecommendationService:
     
     def _get_price_info(self, item_code: str) -> Dict:
         """Get price information for an item"""
+        if not item_code:
+            return {"price": None, "currency": "KES"}
+        
         if not self.pricing:
             return {"price": None, "currency": "KES"}
         
@@ -1162,16 +1061,23 @@ class RecommendationService:
     
     def _check_stock_status(self, item_code: str) -> str:
         """Check if item is in stock"""
-        inventory = self.api.get_inventory_by_item(item_code)
-        if inventory:
-            total = sum(float(i.get("OnHand", 0)) for i in inventory)
-            if total > 100:
-                return "✅ In Stock"
-            elif total > 10:
-                return "⚠️ Low Stock"
-            elif total > 0:
-                return "🔴 Very Low"
-        return "❌ Out of Stock"
+        if not item_code:
+            return "❌ Unknown"
+        
+        try:
+            inventory = self.api.get_inventory_by_item(item_code)
+            if inventory:
+                total = sum(float(i.get("OnHand", 0)) for i in inventory)
+                if total > 100:
+                    return "✅ In Stock"
+                elif total > 10:
+                    return "⚠️ Low Stock"
+                elif total > 0:
+                    return "🔴 Very Low"
+            return "❌ Out of Stock"
+        except Exception as e:
+            logger.debug(f"Could not check stock for {item_code}: {e}")
+            return "❌ Unknown"
     
     def _calculate_volume_savings(self, item_code: str) -> str:
         """Calculate savings for volume purchase"""
@@ -1180,6 +1086,7 @@ class RecommendationService:
     
     def _get_seasonal_tip(self, item_name: str, month: str) -> str:
         """Get seasonal planting/care tips"""
+        item_lower = item_name.lower() if item_name else ""
         tips = {
             "tomato": "Plant in well-drained soil, stake for support",
             "cabbage": "Space plants 45cm apart, water consistently",
@@ -1191,7 +1098,7 @@ class RecommendationService:
         }
         
         for key, tip in tips.items():
-            if key in item_name.lower():
+            if key in item_lower:
                 return tip
         
         return f"Best planting time: {month.title()}"
@@ -1213,15 +1120,15 @@ class RecommendationService:
             items = self.api.get_items(search=term, limit=1)
             if items:
                 item = items[0]
-                price_info = self._get_price_info(item["ItemCode"])
+                price_info = self._get_price_info(item.get("ItemCode"))
                 suggestions.append({
-                    "ItemCode": item["ItemCode"],
-                    "ItemName": item["ItemName"],
+                    "ItemCode": item.get("ItemCode"),
+                    "ItemName": item.get("ItemName"),
                     "Price": price_info.get("price"),
                     "Currency": price_info.get("currency", "KES"),
                     "Confidence": 0.7,
                     "Reason": f"Commonly purchased with {item_lower}",
-                    "StockStatus": self._check_stock_status(item["ItemCode"]),
+                    "StockStatus": self._check_stock_status(item.get("ItemCode")),
                     "Action": "Add to cart",
                     "Type": "cross_sell",
                     "Source": "category"
@@ -1241,14 +1148,14 @@ class RecommendationService:
             items = self.api.get_items(search=search_term, limit=1)
             if items:
                 item = items[0]
-                price_info = self._get_price_info(item["ItemCode"])
+                price_info = self._get_price_info(item.get("ItemCode"))
                 suggestions.append({
-                    "ItemCode": item["ItemCode"],
-                    "ItemName": item["ItemName"],
+                    "ItemCode": item.get("ItemCode"),
+                    "ItemName": item.get("ItemName"),
                     "Price": price_info.get("price"),
                     "Currency": price_info.get("currency", "KES"),
                     "Reason": "Premium alternative with better features",
-                    "StockStatus": self._check_stock_status(item["ItemCode"]),
+                    "StockStatus": self._check_stock_status(item.get("ItemCode")),
                     "Action": "View details",
                     "Type": "upsell",
                     "Source": "premium_search"

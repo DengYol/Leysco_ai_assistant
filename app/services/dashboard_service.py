@@ -22,6 +22,8 @@ Optimizations:
 - Async support for concurrent section loading
 - Better error handling with fallbacks
 - Configurable cache TTLs
+
+MODIFIED FOR PHASE 1: Accepts user token and passes to all services
 """
 
 from __future__ import annotations
@@ -34,8 +36,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from functools import wraps
 
-from app.services.leysco_api_service import LeyscoAPIService
-from app.services.warehouse_service import WarehouseService
+from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.warehouse_service import WarehouseService, create_warehouse_service
 from app.services.delivery_tracking_service import DeliveryTrackingService
 from app.services.cache_service import get_cache_service
 
@@ -64,8 +66,9 @@ def cache_dashboard(ttl_seconds: int = DASHBOARD_CACHE_TTL):
         def wrapper(self):
             cache = get_cache_service()
             
-            # Generate cache key
-            cache_key = f"dashboard:{datetime.now().strftime('%Y-%m-%d-%H')}"  # Hourly cache
+            # Generate cache key (include user token for isolation)
+            user_suffix = self.user_token[:8] if self.user_token else "no_token"
+            cache_key = f"dashboard:{user_suffix}:{datetime.now().strftime('%Y-%m-%d-%H')}"  # Hourly cache
             
             # Check cache
             cached = cache.get_simple(cache_key)
@@ -89,11 +92,29 @@ class DashboardService:
     """
     Aggregates proactive business alerts for the Flutter home screen.
     Optimized with caching and async support.
+    
+    MODIFIED: Now accepts user_token to properly authenticate API calls.
     """
 
-    def __init__(self) -> None:
-        self.api = LeyscoAPIService()
-        self.warehouse = WarehouseService()
+    def __init__(self, user_token: str = None) -> None:
+        """
+        Initialize DashboardService with user token.
+        
+        Args:
+            user_token: Bearer token from authenticated user
+        """
+        self.user_token = user_token
+        
+        # Create API services with the user token
+        if user_token:
+            self.api = create_api_service(user_token)
+            self.warehouse = create_warehouse_service(user_token)
+            logger.debug("DashboardService initialized with user token")
+        else:
+            logger.warning("DashboardService initialized WITHOUT user token - API calls will fail")
+            self.api = LeyscoAPIService()
+            self.warehouse = WarehouseService()
+        
         self.delivery = DeliveryTrackingService(api_service=self.api)
         
         # Stats tracking
@@ -108,6 +129,13 @@ class DashboardService:
         self._section_cache = {}
         self._section_cache_time = {}
         self._section_cache_ttl = 120  # 2 minutes
+
+    def set_user_token(self, token: str):
+        """Update user token for this instance."""
+        self.user_token = token
+        self.api.set_user_token(token)
+        self.warehouse.set_user_token(token)
+        logger.debug("DashboardService user token updated")
 
     # ------------------------------------------------------------------
     # STATS HELPERS
@@ -196,8 +224,10 @@ class DashboardService:
         Return critical and low-stock items across all warehouses.
         Optimized with section-level caching.
         """
-        # Check section cache
-        cache_key = "stock_alerts"
+        # Check section cache (include user token for isolation)
+        user_suffix = self.user_token[:8] if self.user_token else "no_token"
+        cache_key = f"stock_alerts:{user_suffix}"
+        
         if cache_key in self._section_cache:
             cache_time = self._section_cache_time.get(cache_key)
             if cache_time and (datetime.now() - cache_time).seconds < self._section_cache_ttl:
@@ -257,8 +287,10 @@ class DashboardService:
         Find deliveries that are due today or already overdue.
         Optimized with section-level caching.
         """
-        # Check section cache
-        cache_key = "delivery_alerts"
+        # Check section cache (include user token for isolation)
+        user_suffix = self.user_token[:8] if self.user_token else "no_token"
+        cache_key = f"delivery_alerts:{user_suffix}"
+        
         if cache_key in self._section_cache:
             cache_time = self._section_cache_time.get(cache_key)
             if cache_time and (datetime.now() - cache_time).seconds < self._section_cache_ttl:
@@ -344,8 +376,10 @@ class DashboardService:
         Find open quotations with no activity for _STALE_QUOTE_DAYS+ days.
         Optimized with section-level caching.
         """
-        # Check section cache
-        cache_key = "quotation_alerts"
+        # Check section cache (include user token for isolation)
+        user_suffix = self.user_token[:8] if self.user_token else "no_token"
+        cache_key = f"quotation_alerts:{user_suffix}"
+        
         if cache_key in self._section_cache:
             cache_time = self._section_cache_time.get(cache_key)
             if cache_time and (datetime.now() - cache_time).seconds < self._section_cache_ttl:
@@ -422,8 +456,10 @@ class DashboardService:
         Return the top selling items from the last 30 days.
         Optimized with section-level caching.
         """
-        # Check section cache
-        cache_key = "trending_alerts"
+        # Check section cache (include user token for isolation)
+        user_suffix = self.user_token[:8] if self.user_token else "no_token"
+        cache_key = f"trending_alerts:{user_suffix}"
+        
         if cache_key in self._section_cache:
             cache_time = self._section_cache_time.get(cache_key)
             if cache_time and (datetime.now() - cache_time).seconds < self._section_cache_ttl:
@@ -499,16 +535,55 @@ def _empty_section(name: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton
+# Factory function - creates fresh instance per request
+# ---------------------------------------------------------------------------
+
+def create_dashboard_service(user_token: str = None) -> DashboardService:
+    """
+    Create a new DashboardService instance with the user's token.
+    
+    Args:
+        user_token: The authenticated user's Bearer token
+    
+    Returns:
+        Configured DashboardService instance
+    """
+    if not user_token:
+        logger.warning("⚠️ create_dashboard_service called WITHOUT user token - data access will fail")
+    else:
+        logger.info("✅ create_dashboard_service called WITH user token")
+    
+    return DashboardService(user_token=user_token)
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED: Old singleton accessor - kept for backward compatibility
 # ---------------------------------------------------------------------------
 
 _dashboard_instance: DashboardService | None = None
 
 
-def get_dashboard_service() -> DashboardService:
-    """Get or create singleton instance."""
+def get_dashboard_service(user_token: str = None) -> DashboardService:
+    """
+    DEPRECATED: Old singleton accessor. Use create_dashboard_service() instead.
+    
+    This function is kept for backward compatibility but will log a warning.
+    For new code, use create_dashboard_service(user_token=token) to create
+    a fresh instance per request.
+    """
+    import warnings
+    warnings.warn(
+        "get_dashboard_service() is deprecated. Use create_dashboard_service(user_token=token) instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     global _dashboard_instance
     if _dashboard_instance is None:
-        _dashboard_instance = DashboardService()
-        logger.info("✅ Created new DashboardService singleton instance")
+        _dashboard_instance = DashboardService(user_token=user_token)
+        logger.warning("Using deprecated singleton pattern - create fresh instances per request for better isolation")
+    elif user_token and _dashboard_instance.user_token != user_token:
+        _dashboard_instance.set_user_token(user_token)
+        logger.debug("Updated deprecated singleton with new token")
+    
     return _dashboard_instance

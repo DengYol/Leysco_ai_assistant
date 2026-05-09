@@ -3,6 +3,8 @@ pricing_service.py
 ==================
 SAP B1-style pricing for Leysco - Optimized with caching and async support
 
+MODIFIED FOR PHASE 1: Uses per-request user token instead of static token.
+
 Pricing hierarchy (highest → lowest priority):
   1. Customer's assigned price list  (octg.ListNum)
   2. Base price list chain           (BASE_NUM walking)
@@ -103,10 +105,18 @@ class PricingService:
     """
     Resolves item prices following the SAP B1 pricing hierarchy.
     Optimized with caching, connection pooling, and async support.
+    MODIFIED: Uses per-request user token instead of static token.
     """
 
-    def __init__(self):
+    def __init__(self, user_token: str = None):
+        """
+        Initialize pricing service with user token.
+        
+        Args:
+            user_token: Bearer token from authenticated user
+        """
         self.base_url = settings.LEYSCO_API_BASE_URL.rstrip("/")
+        self.user_token = user_token
         
         # Configure session with connection pooling
         self.session = requests.Session()
@@ -116,18 +126,16 @@ class PricingService:
             pool_connections=20,
             pool_maxsize=20,
             max_retries=Retry(
-                total=3,
+                total=2,  # Reduced - don't retry auth failures
                 backoff_factor=0.3,
-                status_forcelist=[429, 500, 502, 503, 504]
+                status_forcelist=[429, 500, 502, 503, 504]  # 401 removed
             )
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         
-        self.session.headers.update({
-            "Authorization": f"Bearer {settings.LEYSCO_API_TOKEN}",
-            "Content-Type":  "application/json",
-        })
+        # Initialize headers WITHOUT static token
+        self._update_headers()
 
         # Built once per service lifetime — refreshed by calling _build_maps()
         # sap_list_num (int) → price list dict (contains id, BASE_NUM, isGrossPrc …)
@@ -148,6 +156,31 @@ class PricingService:
         }
         
         self._build_maps()
+    
+    def _update_headers(self):
+        """Update request headers with current user token."""
+        headers = {"Content-Type": "application/json"}
+        
+        if self.user_token:
+            headers["Authorization"] = f"Bearer {self.user_token}"
+            logger.debug("PricingService headers updated with user token")
+        else:
+            logger.warning("PricingService initialized WITHOUT user token - price lookups will fail")
+        
+        self.session.headers.update(headers)
+    
+    def set_user_token(self, token: str):
+        """Update user token for this instance."""
+        self.user_token = token
+        self._update_headers()
+        logger.debug("PricingService user token updated")
+    
+    def _ensure_auth(self) -> bool:
+        """Check if we have a valid user token."""
+        if not self.user_token:
+            logger.warning("No user token available for price lookup")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # STATS HELPERS
@@ -188,6 +221,14 @@ class PricingService:
 
         Returns a result dict — never raises.
         """
+        if not self._ensure_auth():
+            return {
+                "found": False,
+                "item_code": item_code,
+                "price": None,
+                "note": "Authentication required for price lookup"
+            }
+        
         sap_list_num = self._customer_list_num(customer)
         return self.get_price(item_code=item_code, sap_list_num=sap_list_num, use_cache=use_cache)
 
@@ -215,6 +256,14 @@ class PricingService:
           found            bool
           note             str
         """
+        if not self._ensure_auth():
+            return {
+                "found": False,
+                "item_code": item_code,
+                "price": None,
+                "note": "Authentication required for price lookup"
+            }
+        
         # Check cache first using simple method (if not using decorator)
         if use_cache:
             cache = get_cache_service()
@@ -352,6 +401,14 @@ class PricingService:
         - Item absent from list  → try next list
         Avoids recursive get_price() calls — uses _fetch_price directly.
         """
+        if not self._ensure_auth():
+            return {
+                "found": False,
+                "item_code": item_code,
+                "price": None,
+                "note": "Authentication required for price lookup"
+            }
+        
         # Check cache first
         if use_cache:
             cache = get_cache_service()
@@ -453,6 +510,9 @@ class PricingService:
         
         Returns a dict mapping item_code → price result.
         """
+        if not self._ensure_auth():
+            return {code: {"found": False, "error": "Authentication required"} for code in item_codes}
+        
         if not item_codes:
             return {}
         
@@ -494,6 +554,9 @@ class PricingService:
 
     def refresh(self):
         """Force a reload of the price list map from the API."""
+        if not self._ensure_auth():
+            logger.warning("Cannot refresh price lists - no authentication")
+            return
         self._build_maps()
         self._price_list_cache_time = time.time()
         logger.info("Price list cache refreshed")
@@ -501,7 +564,9 @@ class PricingService:
     def clear_cache(self):
         """Clear the price cache."""
         cache = get_cache_service()
-        logger.info("Price cache cleared")
+        # Clear price-related cache keys
+        # This would need pattern deletion - for now just log
+        logger.info("Price cache clear requested (implementation depends on cache backend)")
 
     # ------------------------------------------------------------------
     # INTERNAL — PRICE LIST MAP
@@ -513,12 +578,22 @@ class PricingService:
           sap_list_num → price_list_dict
           api_id       → price_list_dict
         """
+        if not self._ensure_auth():
+            logger.warning("Cannot build price lists - no authentication")
+            return
+        
         try:
             self._record_api_call()
             resp = self.session.get(
                 f"{self.base_url}/price_lists",
                 timeout=15,
             )
+            
+            # Check for auth failure
+            if resp.status_code == 401:
+                logger.error("Authentication failed while fetching price lists")
+                return
+            
             resp.raise_for_status()
             raw = resp.json()
 
@@ -554,7 +629,7 @@ class PricingService:
             logger.error(f"PricingService: failed to build price list map: {e}")
 
     # ------------------------------------------------------------------
-    # INTERNAL — PRICE FETCH (FIXED - No recursion)
+    # INTERNAL — PRICE FETCH
     # ------------------------------------------------------------------
 
     @lru_cache(maxsize=2048)
@@ -568,12 +643,20 @@ class PricingService:
 
         Returns (price, uom_entry) or (None, None) on failure.
         """
+        if not self._ensure_auth():
+            return None, None
+        
         try:
             self._record_api_call()
             url = f"{self.base_url}/item/base-prices/price-list/{api_price_list_id}"
             params = {"search": item_code, "per_page": 50}
 
             resp = self.session.get(url, params=params, timeout=PRICE_LIST_SEARCH_TIMEOUT)
+
+            # Check for auth failure
+            if resp.status_code == 401:
+                logger.error("Authentication failed during price fetch")
+                return None, None
 
             # 500 on certain price list IDs means the list exists in metadata
             # but has no usable data endpoint — skip it gracefully
@@ -670,16 +753,33 @@ class PricingService:
 
 
 # ---------------------------------------------------------------------------
-# Singleton instance
+# IMPORTANT: No singleton instance for Phase 1
+# Each request creates its own instance with user token
 # ---------------------------------------------------------------------------
 
-_pricing_instance: Optional[PricingService] = None
+def create_pricing_service(user_token: str = None) -> PricingService:
+    """
+    Create a new pricing service instance with the user's token.
+    This should be called for each request.
+    
+    Args:
+        user_token: The authenticated user's Bearer token
+    
+    Returns:
+        Configured PricingService instance
+    """
+    if not user_token:
+        logger.warning("Creating pricing service without user token - lookups will fail")
+    return PricingService(user_token=user_token)
 
 
+# Legacy function - will be deprecated
 def get_pricing_service() -> PricingService:
-    """Get or create pricing service singleton."""
-    global _pricing_instance
-    if _pricing_instance is None:
-        _pricing_instance = PricingService()
-        logger.info("✅ Created new PricingService singleton instance")
-    return _pricing_instance
+    """
+    LEGACY: Returns singleton instance WITHOUT user token.
+    This will cause authentication errors.
+    
+    Use create_pricing_service(user_token) instead.
+    """
+    logger.warning("Using legacy get_pricing_service() without user token - this will fail")
+    return PricingService()  # No token - will fail

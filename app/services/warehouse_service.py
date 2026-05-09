@@ -3,6 +3,8 @@ warehouse_service.py
 ====================
 Warehouse intelligence layer for Leysco ERP - Optimized with caching and async support
 
+FIXED: Now accepts user_token parameter and passes to LeyscoAPIService
+
 Features:
 1. Stock level summaries per warehouse
 2. Warehouse details (address, manager, status)
@@ -27,7 +29,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from functools import lru_cache, wraps
 from datetime import datetime, timedelta
 
-from app.services.leysco_api_service import LeyscoAPIService
+from app.services.leysco_api_service import LeyscoAPIService, create_api_service
 from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
@@ -41,14 +43,18 @@ LOW_STOCK_CACHE_TTL = 60        # 1 minute for low stock alerts
 def cache_result(ttl_seconds: int = WAREHOUSE_CACHE_TTL, key_prefix: str = ""):
     """
     Decorator to cache warehouse results.
+    Includes user token in cache key for isolation.
     """
     def decorator(func):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             cache = get_cache_service()
             
+            # Include user token in cache key for isolation
+            user_suffix = self.user_token[:8] if self.user_token else "no_token"
+            
             # Generate cache key
-            cache_str = f"{key_prefix or func.__name__}:{str(args)}:{str(sorted(kwargs.items()))}"
+            cache_str = f"{key_prefix or func.__name__}:{user_suffix}:{str(args)}:{str(sorted(kwargs.items()))}"
             cache_key = hashlib.md5(cache_str.encode()).hexdigest()
             
             # Check cache
@@ -70,8 +76,31 @@ def cache_result(ttl_seconds: int = WAREHOUSE_CACHE_TTL, key_prefix: str = ""):
 
 
 class WarehouseService:
-    def __init__(self):
-        self.api = LeyscoAPIService()
+    """
+    Service for warehouse-related operations.
+    FIXED: Now accepts user_token and creates properly authenticated API service.
+    """
+    
+    def __init__(self, user_token: str = None, api_service: LeyscoAPIService = None):
+        """
+        Initialize WarehouseService with user token.
+        
+        Args:
+            user_token: The authenticated user's Bearer token
+            api_service: Optional pre-configured API service instance
+        """
+        self.user_token = user_token
+        
+        if api_service:
+            self.api = api_service
+            logger.debug("WarehouseService initialized with existing API service")
+        elif user_token:
+            self.api = create_api_service(user_token)
+            logger.info("✅ WarehouseService initialized WITH user token")
+        else:
+            self.api = LeyscoAPIService()
+            logger.warning("⚠️ WarehouseService initialized WITHOUT user token - data access will fail")
+        
         self._inventory_cache = {}
         self._inventory_cache_time = {}
         self._inventory_cache_ttl = 120  # 2 minutes
@@ -83,6 +112,23 @@ class WarehouseService:
             "api_calls": 0,
             "errors": 0
         }
+
+    # ------------------------------------------------------------------
+    # TOKEN MANAGEMENT
+    # ------------------------------------------------------------------
+    
+    def set_user_token(self, token: str):
+        """Update user token for this service."""
+        self.user_token = token
+        self.api.set_user_token(token)
+        logger.debug("WarehouseService token updated")
+    
+    def _ensure_auth(self) -> bool:
+        """Check if we have valid authentication."""
+        if not self.user_token:
+            logger.warning("No user token available for warehouse operation")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # STATS HELPERS
@@ -110,6 +156,10 @@ class WarehouseService:
     
     def _get_inventory_cached(self, force_refresh: bool = False) -> List[Dict]:
         """Get inventory data with TTL-based caching."""
+        # Check authentication
+        if not self._ensure_auth():
+            return []
+        
         now = datetime.now()
         
         # Check if we have valid cached data
@@ -155,9 +205,15 @@ class WarehouseService:
             "all_items": [...]
         }
         """
+        if not self._ensure_auth():
+            return {"error": "Not authenticated. Please log in again."}
+        
         logger.info(f"📊 Getting stock summary for warehouse: {whscode}")
         
         inventory = self._get_inventory_cached()
+        
+        if not inventory:
+            return {"error": f"No inventory data available for warehouse {whscode}"}
         
         # Filter to this warehouse
         wh_items = [
@@ -177,7 +233,7 @@ class WarehouseService:
                 committed = itm.get("CurrentIsCommited", 0)
                 items_map[code] = {
                     "ItemCode": code,
-                    "ItemName": itm.get("ItemName"),
+                    "ItemName": itm.get("ItemName", code),
                     "OnHand": on_hand,
                     "Committed": committed,
                     "Available": on_hand - committed,
@@ -257,11 +313,15 @@ class WarehouseService:
             "has_more": bool
         }
         """
+        if not self._ensure_auth():
+            return {"error": True, "message": "Not authenticated. Please log in again."}
+        
         logger.info(f"📦 Getting items for warehouse: {whscode}")
         
         # Check cache for this warehouse's items
         cache = get_cache_service()
-        cache_key = f"warehouse_items:{whscode}:{search}:{limit}:{include_out_of_stock}"
+        user_suffix = self.user_token[:8] if self.user_token else "no_token"
+        cache_key = f"warehouse_items:{user_suffix}:{whscode}:{search}:{limit}:{include_out_of_stock}"
         cached = cache.get(cache_key, {}, "")
         if cached is not None:
             self._record_cache_hit()
@@ -270,6 +330,19 @@ class WarehouseService:
         self._record_cache_miss()
         
         inventory = self._get_inventory_cached()
+        
+        if not inventory:
+            result = {
+                "error": True,
+                "message": f"No inventory data available",
+                "warehouse_code": whscode,
+                "warehouse_name": whscode,
+                "total_items_in_warehouse": 0,
+                "items": [],
+                "has_more": False
+            }
+            cache.set(cache_key, {}, "", {"data": result})
+            return result
         
         # Filter to this warehouse
         wh_items = [
@@ -299,7 +372,7 @@ class WarehouseService:
                 committed = itm.get("CurrentIsCommited", 0)
                 items_map[code] = {
                     "ItemCode": code,
-                    "ItemName": itm.get("ItemName"),
+                    "ItemName": itm.get("ItemName", code),
                     "OnHand": on_hand,
                     "Committed": committed,
                     "Available": on_hand - committed,
@@ -381,6 +454,9 @@ class WarehouseService:
         
         Returns warehouse record with all available fields plus stock summary.
         """
+        if not self._ensure_auth():
+            return None
+        
         warehouses = self.api.get_warehouses(search=whscode)
         
         if not warehouses:
@@ -414,10 +490,14 @@ class WarehouseService:
         Search warehouses by name, code, or region.
         Optimized with caching for frequent searches.
         """
+        if not self._ensure_auth():
+            return []
+        
         # Check cache for common searches
         if not region and active_only:
             cache = get_cache_service()
-            cache_key = f"warehouse_search:{query}"
+            user_suffix = self.user_token[:8] if self.user_token else "no_token"
+            cache_key = f"warehouse_search:{user_suffix}:{query}"
             cached = cache.get(cache_key, {}, "")
             if cached is not None:
                 self._record_cache_hit()
@@ -449,7 +529,8 @@ class WarehouseService:
         # Cache results for common searches
         if not region and active_only:
             cache = get_cache_service()
-            cache.set(f"warehouse_search:{query}", {}, "", {"data": results})
+            user_suffix = self.user_token[:8] if self.user_token else "no_token"
+            cache.set(f"warehouse_search:{user_suffix}:{query}", {}, "", {"data": results})
         
         return results
     
@@ -458,8 +539,14 @@ class WarehouseService:
         Get stock summaries for all warehouses.
         Optimized with inventory caching.
         """
+        if not self._ensure_auth():
+            return []
+        
         warehouses = self.api.get_warehouses()
         inventory = self._get_inventory_cached()
+        
+        if not inventory:
+            return []
         
         summaries = []
         for wh in warehouses:
@@ -505,7 +592,13 @@ class WarehouseService:
         
         Low stock = Available < max(OnHand * threshold_pct, min_available)
         """
+        if not self._ensure_auth():
+            return []
+        
         inventory = self._get_inventory_cached()
+        
+        if not inventory:
+            return []
         
         # Filter by warehouse if specified
         if whscode:
@@ -530,7 +623,7 @@ class WarehouseService:
             if available < threshold:
                 alerts.append({
                     "ItemCode": itm.get("ItemCode"),
-                    "ItemName": itm.get("ItemName"),
+                    "ItemName": itm.get("ItemName", itm.get("ItemCode", "Unknown")),
                     "WhsCode": itm.get("WhsCode"),
                     "OnHand": on_hand,
                     "Committed": committed,
@@ -584,6 +677,9 @@ class WarehouseService:
         Returns:
             Warehouse details if found, None otherwise
         """
+        if not self._ensure_auth():
+            return None
+        
         warehouses = self.api.get_warehouses(search=query)
         
         if not warehouses:
@@ -606,6 +702,9 @@ class WarehouseService:
         """
         Check if a warehouse exists in the system.
         """
+        if not self._ensure_auth():
+            return False
+        
         warehouses = self.api.get_warehouses(search=whscode)
         
         for wh in warehouses:
@@ -673,3 +772,25 @@ class WarehouseService:
         """Force refresh of inventory data."""
         self._get_inventory_cached(force_refresh=True)
         logger.info("Inventory data refreshed")
+
+
+# =========================================================
+# Factory function
+# =========================================================
+
+def create_warehouse_service(user_token: str = None) -> WarehouseService:
+    """
+    Create a new WarehouseService instance with the user's token.
+    
+    Args:
+        user_token: The authenticated user's Bearer token
+    
+    Returns:
+        Configured WarehouseService instance
+    """
+    if not user_token:
+        logger.warning("⚠️ create_warehouse_service called WITHOUT user token - data access will fail")
+    else:
+        logger.info("✅ create_warehouse_service called WITH user token")
+    
+    return WarehouseService(user_token=user_token)

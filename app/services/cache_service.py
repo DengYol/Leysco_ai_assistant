@@ -3,6 +3,8 @@ cache_service.py
 ================
 Intelligent response caching with Redis support, async operations, and thread safety.
 Supports both in-memory (default) and Redis backends for distributed caching.
+
+UPDATED: Added Redis sorted set and hash operations for activity logging
 """
 
 import hashlib
@@ -153,6 +155,11 @@ class CacheService:
         self._memory_cache: Dict[str, Dict[str, Any]] = {}
         self._simple_cache: Dict[str, Dict[str, Any]] = {}  # Simple key-value cache
         
+        # In-memory data structures for Redis-like operations
+        self._memory_zsets: Dict[str, Dict[str, float]] = {}  # Sorted sets
+        self._memory_hashes: Dict[str, Dict[str, Any]] = {}   # Hashes
+        self._memory_expiry: Dict[str, float] = {}             # Expiry times
+        
         # Statistics
         self.hit_count = 0
         self.miss_count = 0
@@ -209,10 +216,10 @@ class CacheService:
             return  # Redis handles TTL automatically
         
         now = time.time()
-        expired_keys = []
         
         with self._lock:
             # Clean up main cache
+            expired_keys = []
             for key, data in self._memory_cache.items():
                 effective_ttl = self._get_effective_ttl(data.get("intent", ""))
                 if now - data.get("timestamp", 0) > effective_ttl:
@@ -230,8 +237,21 @@ class CacheService:
             for key in simple_expired:
                 del self._simple_cache[key]
             
-            if expired_keys or simple_expired:
-                logger.debug(f"Cleaned {len(expired_keys)} main + {len(simple_expired)} simple cache entries")
+            # Clean up hash expiry
+            hash_expired = []
+            for key, expiry in self._memory_expiry.items():
+                if now > expiry:
+                    hash_expired.append(key)
+            
+            for key in hash_expired:
+                if key in self._memory_hashes:
+                    del self._memory_hashes[key]
+                if key in self._memory_zsets:
+                    del self._memory_zsets[key]
+                del self._memory_expiry[key]
+            
+            if expired_keys or simple_expired or hash_expired:
+                logger.debug(f"Cleaned {len(expired_keys)} main + {len(simple_expired)} simple + {len(hash_expired)} hash entries")
             
             self._last_cleanup = now
 
@@ -290,7 +310,7 @@ class CacheService:
         return self.ttl_seconds
 
     # -----------------------------------------------------------------------
-    # Simple Key-Value Cache Methods (NEW)
+    # Simple Key-Value Cache Methods
     # -----------------------------------------------------------------------
     
     def get_simple(self, key: str) -> Optional[Any]:
@@ -404,6 +424,211 @@ class CacheService:
         Delete a simple cache entry (async).
         """
         return await asyncio.to_thread(self.delete_simple, key)
+
+    # -----------------------------------------------------------------------
+    # Redis Sorted Set Operations (ZSET) - For activity logging
+    # -----------------------------------------------------------------------
+    
+    async def zadd_async(self, key: str, mapping: Dict[str, float]) -> int:
+        """
+        Add members to a sorted set with scores.
+        Compatible with both Redis and memory cache.
+        """
+        if self.backend == "redis":
+            redis_client = _get_redis_client()
+            if redis_client:
+                try:
+                    return await asyncio.to_thread(redis_client.zadd, key, mapping)
+                except Exception as e:
+                    self.redis_errors += 1
+                    logger.warning(f"Redis zadd error: {e}")
+        
+        # Memory implementation
+        with self._lock:
+            if key not in self._memory_zsets:
+                self._memory_zsets[key] = {}
+            
+            for member, score in mapping.items():
+                self._memory_zsets[key][member] = score
+            
+            # Set expiry for this key
+            self._memory_expiry[key] = time.time() + 86400  # Default 24 hours
+            
+            return len(mapping)
+    
+    async def zrevrangebyscore_async(
+        self, 
+        key: str, 
+        max: float, 
+        min: float, 
+        start: int = 0, 
+        num: int = -1
+    ) -> List[str]:
+        """
+        Get members from sorted set by score range (descending).
+        """
+        if self.backend == "redis":
+            redis_client = _get_redis_client()
+            if redis_client:
+                try:
+                    return await asyncio.to_thread(
+                        redis_client.zrevrangebyscore, 
+                        key, max, min, start=start, num=num
+                    )
+                except Exception as e:
+                    self.redis_errors += 1
+                    logger.warning(f"Redis zrevrangebyscore error: {e}")
+        
+        # Memory implementation
+        with self._lock:
+            zset = self._memory_zsets.get(key, {})
+            # Filter by score range
+            filtered = [(member, score) for member, score in zset.items() if min <= score <= max]
+            # Sort by score descending
+            filtered.sort(key=lambda x: x[1], reverse=True)
+            # Apply start/num
+            if num > 0:
+                filtered = filtered[start:start+num]
+            else:
+                filtered = filtered[start:]
+            return [member for member, _ in filtered]
+    
+    async def zremrangebyrank_async(self, key: str, start: int, stop: int) -> int:
+        """
+        Remove members from sorted set by rank range.
+        """
+        if self.backend == "redis":
+            redis_client = _get_redis_client()
+            if redis_client:
+                try:
+                    return await asyncio.to_thread(redis_client.zremrangebyrank, key, start, stop)
+                except Exception as e:
+                    self.redis_errors += 1
+                    logger.warning(f"Redis zremrangebyrank error: {e}")
+        
+        # Memory implementation
+        with self._lock:
+            zset = self._memory_zsets.get(key, {})
+            # Sort by score
+            sorted_items = sorted(zset.items(), key=lambda x: x[1])
+            # Remove range
+            removed = 0
+            to_remove = []
+            for i in range(start, stop + 1):
+                if 0 <= i < len(sorted_items):
+                    to_remove.append(sorted_items[i][0])
+                    removed += 1
+            
+            for member in to_remove:
+                del zset[member]
+            
+            return removed
+
+    # -----------------------------------------------------------------------
+    # Redis Hash Operations - For activity logging
+    # -----------------------------------------------------------------------
+    
+    async def hset_async(self, key: str, value: Dict[str, Any]) -> int:
+        """
+        Set hash field(s).
+        """
+        if self.backend == "redis":
+            redis_client = _get_redis_client()
+            if redis_client:
+                try:
+                    return await asyncio.to_thread(redis_client.hset, key, mapping=value)
+                except Exception as e:
+                    self.redis_errors += 1
+                    logger.warning(f"Redis hset error: {e}")
+        
+        # Memory implementation
+        with self._lock:
+            if key not in self._memory_hashes:
+                self._memory_hashes[key] = {}
+            
+            for field, val in value.items():
+                self._memory_hashes[key][field] = val
+            
+            # Set expiry
+            self._memory_expiry[key] = time.time() + 86400
+            
+            return len(value)
+    
+    async def hgetall_async(self, key: str) -> Dict[str, Any]:
+        """
+        Get all hash fields.
+        """
+        if self.backend == "redis":
+            redis_client = _get_redis_client()
+            if redis_client:
+                try:
+                    return await asyncio.to_thread(redis_client.hgetall, key)
+                except Exception as e:
+                    self.redis_errors += 1
+                    logger.warning(f"Redis hgetall error: {e}")
+        
+        # Memory implementation
+        with self._lock:
+            # Check expiry
+            if key in self._memory_expiry and time.time() > self._memory_expiry[key]:
+                if key in self._memory_hashes:
+                    del self._memory_hashes[key]
+                if key in self._memory_zsets:
+                    del self._memory_zsets[key]
+                del self._memory_expiry[key]
+                return {}
+            
+            return self._memory_hashes.get(key, {}).copy()
+    
+    async def expire_async(self, key: str, ttl: int) -> bool:
+        """
+        Set expiry on key.
+        """
+        if self.backend == "redis":
+            redis_client = _get_redis_client()
+            if redis_client:
+                try:
+                    return await asyncio.to_thread(redis_client.expire, key, ttl)
+                except Exception as e:
+                    self.redis_errors += 1
+                    logger.warning(f"Redis expire error: {e}")
+        
+        # Memory implementation
+        with self._lock:
+            self._memory_expiry[key] = time.time() + ttl
+            return True
+    
+    async def delete_async(self, key: str) -> int:
+        """
+        Delete a key.
+        """
+        if self.backend == "redis":
+            redis_client = _get_redis_client()
+            if redis_client:
+                try:
+                    return await asyncio.to_thread(redis_client.delete, key)
+                except Exception as e:
+                    self.redis_errors += 1
+                    logger.warning(f"Redis delete error: {e}")
+        
+        # Memory implementation
+        with self._lock:
+            deleted = 0
+            if key in self._memory_hashes:
+                del self._memory_hashes[key]
+                deleted += 1
+            if key in self._memory_zsets:
+                del self._memory_zsets[key]
+                deleted += 1
+            if key in self._memory_expiry:
+                del self._memory_expiry[key]
+            if key in self._memory_cache:
+                del self._memory_cache[key]
+                deleted += 1
+            if key in self._simple_cache:
+                del self._simple_cache[key]
+                deleted += 1
+            return deleted
 
     # -----------------------------------------------------------------------
     # Core Cache Operations (Sync)
@@ -660,7 +885,10 @@ class CacheService:
             count = len(self._memory_cache)
             self._memory_cache.clear()
             self._simple_cache.clear()
-            logger.info(f"Memory cache cleared: removed {count} main + {len(self._simple_cache)} simple entries")
+            self._memory_zsets.clear()
+            self._memory_hashes.clear()
+            self._memory_expiry.clear()
+            logger.info(f"Memory cache cleared: removed {count} entries")
 
     def should_cache(self, intent: str) -> bool:
         """Determine if an intent should be cached."""
@@ -691,6 +919,8 @@ class CacheService:
                 "backend": self.backend,
                 "cache_size": len(self._memory_cache),
                 "simple_cache_size": len(self._simple_cache),
+                "zset_count": len(self._memory_zsets),
+                "hash_count": len(self._memory_hashes),
                 "max_entries": self.max_entries,
                 "hit_count": self.hit_count,
                 "miss_count": self.miss_count,

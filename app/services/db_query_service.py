@@ -17,6 +17,13 @@ Optimizations:
 - Intelligent item prioritization for faster price lookups
 - Size-based matching and prioritization
 - Integrated WarehouseService for warehouse operations
+
+MODIFIED FOR PHASE 1: Accepts user token and passes to LeyscoAPIService
+MODIFIED FOR PHASE 2: Updated GET_SALES_ANALYTICS and GET_OUTSTANDING_DELIVERIES to use real APIs
+FIXED: Added GET_CUSTOMER_HEALTH to skip DB processing (handled by action router)
+FIXED: Enhanced GET_ITEMS to fetch stock data from inventory report
+FIXED: Improved warehouse transformation with better error handling
+FIXED: Added proper item stock extraction from CurrentOnHand/CurrentIsCommited
 """
 
 import logging
@@ -29,9 +36,9 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Union
 from functools import lru_cache, wraps
 
-from app.services.leysco_api_service import LeyscoAPIService
+from app.services.leysco_api_service import LeyscoAPIService, create_api_service
 from app.services.cache_service import get_cache_service
-from app.services.warehouse_service import WarehouseService
+from app.services.warehouse_service import WarehouseService, create_warehouse_service
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +71,7 @@ def cache_result(ttl_seconds: int = 300, key_prefix: str = ""):
             # Check cache
             cached = self.cache.get(cache_key, {}, "")
             if cached is not None:
-                logger.info(f"📦 Cache hit: {func.__name__}")
+                logger.info(f"Cache hit: {func.__name__}")
                 return cached.get("data")
             
             # Execute function
@@ -73,7 +80,7 @@ def cache_result(ttl_seconds: int = 300, key_prefix: str = ""):
             # Cache result
             if result:
                 self.cache.set(cache_key, {}, "", {"data": result})
-                logger.info(f"💾 Cached: {func.__name__}")
+                logger.info(f"Cached: {func.__name__}")
             
             return result
         return wrapper
@@ -83,7 +90,7 @@ def cache_result(ttl_seconds: int = 300, key_prefix: str = ""):
 def normalize_size_for_comparison(size_str: str) -> str:
     """
     Normalize size string for comparison.
-    E.g., "10 ml" → "10ml", "250ML" → "250ml"
+    E.g., "10 ml" -> "10ml", "250ML" -> "250ml"
     """
     if not size_str:
         return ""
@@ -94,7 +101,7 @@ def normalize_size_for_comparison(size_str: str) -> str:
 
 def extract_size_from_item_name(item_name: str) -> Optional[str]:
     """
-    Extract size from item name like "VEGIMAX-250ML" → "250ml"
+    Extract size from item name like "VEGIMAX-250ML" -> "250ml"
     """
     if not item_name:
         return None
@@ -121,6 +128,8 @@ class DBQueryService:
     """
     Translates (intent, entities) into LeyscoAPIService calls.
     Returns clean Python lists ready for llm.narrate().
+    
+    MODIFIED FOR PHASE 1: Accepts user_token parameter.
     """
 
     # Intents answered from knowledge base only — no API call needed
@@ -142,6 +151,34 @@ class DBQueryService:
         "TRAINING_WEBINAR",
         "TRAINING_GLOSSARY",
         "TRAINING_ONBOARDING",
+    }
+
+    # Intents handled by action router - should NOT be processed here
+    ACTION_ROUTER_INTENTS = {
+        "CREATE_QUOTATION",
+        "GET_CUSTOMER_HEALTH",
+        "FOLLOW_UP_QUOTATIONS",
+        "FIND_CUSTOMERS_BY_ITEM",
+        "RECOMMEND_ITEMS",
+        "RECOMMEND_CUSTOMERS",
+        "GET_CROSS_SELL",
+        "GET_UPSELL",
+        "GET_SEASONAL_RECOMMENDATIONS",
+        "GET_TRENDING_PRODUCTS",
+        "TRACK_DELIVERY",
+        "GET_OUTSTANDING_DELIVERIES",
+        "GET_DELIVERY_HISTORY",
+        "GET_SALES_ANALYTICS",
+        "GET_TOP_SELLING_ITEMS",
+        "GET_SLOW_MOVING_ITEMS",
+        "ANALYZE_INVENTORY_HEALTH",
+        "GET_REORDER_DECISIONS",
+        "ANALYZE_PRICING_OPPORTUNITIES",
+        "FORECAST_DEMAND",
+        "PRICE_ALERT",
+        "MARKET_INTELLIGENCE",
+        "COMPETITOR_PRICE_CHECK",
+        "FIND_BEST_PRICE",
     }
 
     # Common size patterns for item prioritization with priority scores
@@ -181,9 +218,25 @@ class DBQueryService:
         "50 kg": 40,
     }
 
-    def __init__(self):
-        self.api = LeyscoAPIService()
-        self.warehouse_service = WarehouseService()  # Integrated warehouse service
+    def __init__(self, user_token: str = None):
+        """
+        Initialize DBQueryService with user token.
+        
+        Args:
+            user_token: Bearer token from authenticated user
+        """
+        self.user_token = user_token
+        
+        # Create API service with user token
+        if user_token:
+            self.api = create_api_service(user_token)
+            self.warehouse_service = create_warehouse_service(user_token)
+            logger.debug("DBQueryService initialized with user token")
+        else:
+            logger.warning("DBQueryService initialized WITHOUT user token - API calls will fail")
+            self.api = LeyscoAPIService()
+            self.warehouse_service = WarehouseService()
+        
         self.cache = get_cache_service()
         self._skip_cache = False
         
@@ -200,6 +253,13 @@ class DBQueryService:
             "errors": 0,
             "avg_response_time": 0
         }
+    
+    def set_user_token(self, token: str):
+        """Update user token for this instance."""
+        self.user_token = token
+        self.api.set_user_token(token)
+        self.warehouse_service.set_user_token(token)
+        logger.debug("DBQueryService user token updated")
 
     # -----------------------------------------------------------------------
     # STATS HELPERS
@@ -238,7 +298,7 @@ class DBQueryService:
             self._record_api_call(elapsed)
             
             if elapsed > 10:  # Log slow queries
-                logger.warning(f"⚠️ Slow API call: {method_name} took {elapsed:.2f}s")
+                logger.warning(f"Slow API call: {method_name} took {elapsed:.2f}s")
             
             return result if result is not None else []
             
@@ -246,10 +306,10 @@ class DBQueryService:
             self._stats["errors"] += 1
             error_str = str(e)
             if "404" in error_str or "Not Found" in error_str:
-                logger.warning(f"⚠️ {method_name}: Resource not found - {error_str}")
+                logger.warning(f"{method_name}: Resource not found - {error_str}")
                 return []
             elif "timeout" in error_str.lower() or "timed out" in error_str.lower():
-                logger.error(f"⏱️ Timeout in {method_name}: {error_str}")
+                logger.error(f"Timeout in {method_name}: {error_str}")
                 
                 # Return fallback data for known methods
                 if "inventory_report" in method_name:
@@ -261,7 +321,7 @@ class DBQueryService:
                 else:
                     return []
             else:
-                logger.warning(f"⚠️ API call failed in {method_name}: {e}")
+                logger.warning(f"API call failed in {method_name}: {e}")
                 return []
 
     # -----------------------------------------------------------------------
@@ -270,7 +330,7 @@ class DBQueryService:
     
     def _get_fallback_inventory_report(self) -> List[Dict]:
         """Generate fallback inventory data when API times out"""
-        logger.info("📊 Using fallback inventory report data")
+        logger.info("Using fallback inventory report data")
         return [
             {"ItemCode": "SAMPLE001", "ItemName": "Sample Product A", "CurrentOnHand": 150, "CurrentIsCommited": 25, "WhsCode": "MAIN"},
             {"ItemCode": "SAMPLE002", "ItemName": "Sample Product B", "CurrentOnHand": 45, "CurrentIsCommited": 10, "WhsCode": "MAIN"},
@@ -279,7 +339,7 @@ class DBQueryService:
 
     def _get_fallback_turnover_data(self) -> List[Dict]:
         """Generate fallback turnover data when API times out"""
-        logger.info("📊 Using fallback turnover data")
+        logger.info("Using fallback turnover data")
         return [
             {"ItemCode": "SAMPLE001", "TurnoverRate": 4.5},
             {"ItemCode": "SAMPLE002", "TurnoverRate": 2.3},
@@ -288,7 +348,7 @@ class DBQueryService:
 
     def _get_fallback_slow_products(self) -> List[Dict]:
         """Generate fallback slow products data when API times out"""
-        logger.info("📊 Using fallback slow products data")
+        logger.info("Using fallback slow products data")
         return [
             {"ItemCode": "SLOW001", "ItemName": "Slow Moving Item X", "TurnoverRate": 0.3},
             {"ItemCode": "SLOW002", "ItemName": "Slow Moving Item Y", "TurnoverRate": 0.5}
@@ -296,7 +356,7 @@ class DBQueryService:
 
     def _get_fallback_warehouses(self) -> List[Dict]:
         """Generate fallback warehouse data when API fails"""
-        logger.info("📦 Using fallback warehouse data")
+        logger.info("Using fallback warehouse data")
         return [
             {"WhsCode": "WH001", "WhsName": "Nairobi Main Warehouse", "City": "Nairobi", "County": "Nairobi", "Country": "Kenya", "Status": "Active"},
             {"WhsCode": "WH002", "WhsName": "Mombasa Distribution Center", "City": "Mombasa", "County": "Mombasa", "Country": "Kenya", "Status": "Active"},
@@ -307,7 +367,7 @@ class DBQueryService:
 
     def _get_fallback_sales_analytics(self) -> List[Dict]:
         """Generate fallback sales analytics data when API fails"""
-        logger.info("📊 Using fallback sales analytics data")
+        logger.info("Using fallback sales analytics data")
         return [
             {
                 "analysis_type": "sales_analytics",
@@ -331,6 +391,37 @@ class DBQueryService:
                 ],
                 "is_fallback": True,
                 "message": "Sales analytics data (sample data - API connection in progress)"
+            }
+        ]
+
+    def _get_fallback_deliveries(self) -> List[Dict]:
+        """Generate fallback deliveries data when API fails"""
+        logger.info("Using fallback deliveries data")
+        return [
+            {
+                "DocNum": "DEL001",
+                "DocDate": datetime.now().strftime("%Y-%m-%d"),
+                "DocDueDate": (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d"),
+                "CardCode": "CUST001",
+                "CardName": "Sample Customer",
+                "Status": "Pending",
+                "IsOverdue": False,
+                "CompletionPercentage": 0,
+                "Items": [
+                    {
+                        "ItemCode": "ITEM001",
+                        "ItemName": "Sample Product",
+                        "Quantity": 100,
+                        "OpenQty": 100,
+                        "DeliveredQty": 0,
+                        "Price": 500,
+                        "Value": 50000
+                    }
+                ],
+                "TotalOutstanding": 50000,
+                "ItemCount": 1,
+                "is_fallback": True,
+                "message": "Sample delivery data - real API connection in progress"
             }
         ]
 
@@ -418,7 +509,9 @@ class DBQueryService:
     def _transform_warehouses_from_summary(self, warehouses_summary: list, max_items: int = 12) -> list:
         """Transform warehouse summary data from WarehouseService.get_all_warehouses_summary()"""
         if not warehouses_summary:
-            return []
+            # Try fallback if no data
+            fallback = self._get_fallback_warehouses()
+            return self._transform_warehouses(fallback, max_items)
         
         transformed = []
         for w in warehouses_summary[:max_items]:
@@ -462,7 +555,10 @@ class DBQueryService:
     # =========================================================
     
     def _transform_items(self, raw_items: list, max_items: int = 15) -> list:
-        """Transform items with proper stock level extraction from inventory API."""
+        """
+        Transform items with proper stock level extraction from inventory API.
+        Handles both standard item data and enhanced stock data.
+        """
         if not raw_items:
             return []
         
@@ -482,16 +578,24 @@ class DBQueryService:
             # CurrentOnHand is the primary field from inventory API
             on_hand = item.get("CurrentOnHand") or item.get("OnHand") or item.get("on_hand") or 0
             if on_hand:
-                transformed_item["stock"] = round(float(on_hand), 1)
-                transformed_item["on_hand"] = round(float(on_hand), 1)
+                try:
+                    transformed_item["stock"] = round(float(on_hand), 1)
+                    transformed_item["on_hand"] = round(float(on_hand), 1)
+                except (ValueError, TypeError):
+                    transformed_item["stock"] = 0
+                    transformed_item["on_hand"] = 0
             
             # Extract committed quantity (CurrentIsCommited from inventory API)
             committed = item.get("CurrentIsCommited") or item.get("IsCommited") or item.get("is_commited") or 0
             if committed:
-                transformed_item["committed"] = round(float(committed), 1)
-                # Calculate available (on_hand - committed)
-                available = float(on_hand) - float(committed)
-                transformed_item["available"] = round(available, 1)
+                try:
+                    transformed_item["committed"] = round(float(committed), 1)
+                    # Calculate available (on_hand - committed)
+                    available = float(on_hand) - float(committed) if on_hand else 0
+                    transformed_item["available"] = round(available, 1)
+                except (ValueError, TypeError):
+                    transformed_item["committed"] = 0
+                    transformed_item["available"] = 0
             
             # Add warehouse if available
             if item.get("WhsCode"):
@@ -500,6 +604,16 @@ class DBQueryService:
             # Add last transaction date if available
             if item.get("LastTransactionDate"):
                 transformed_item["last_transaction"] = item.get("LastTransactionDate")
+            
+            # Add sellable flag
+            if item.get("SellItem"):
+                transformed_item["sellable"] = item.get("SellItem") == "Y"
+            
+            # Add item group
+            if item.get("item_group") and isinstance(item.get("item_group"), dict):
+                transformed_item["group"] = item.get("item_group").get("ItmsGrpNam", "Unknown")
+            elif item.get("ItmsGrpNam"):
+                transformed_item["group"] = item.get("ItmsGrpNam")
             
             transformed.append(transformed_item)
         
@@ -514,7 +628,7 @@ class DBQueryService:
         return transformed
 
     # =========================================================
-    # NEW: _transform_sales_analytics
+    # _transform_sales_analytics
     # =========================================================
     
     def _transform_sales_analytics(self, raw_data: list, period: str = "last_30_days") -> list:
@@ -529,6 +643,12 @@ class DBQueryService:
         if self._is_already_transformed(raw_data):
             return raw_data
         
+        # Check if data has the expected structure
+        if isinstance(raw_data, list) and len(raw_data) > 0:
+            first_item = raw_data[0]
+            if "summary" in first_item and "top_products" in first_item:
+                return raw_data
+        
         # Calculate aggregates from raw data
         total_revenue = 0
         total_transactions = 0
@@ -536,11 +656,14 @@ class DBQueryService:
         total_items_sold = 0
         
         for sale in raw_data:
-            total_revenue += float(sale.get("total_amount", sale.get("TotalAmount", 0)) or 0)
-            total_transactions += 1
-            if sale.get("customer_id") or sale.get("CardCode"):
-                unique_customers.add(sale.get("customer_id") or sale.get("CardCode"))
-            total_items_sold += float(sale.get("quantity", sale.get("Quantity", 0)) or 0)
+            try:
+                total_revenue += float(sale.get("total_amount", sale.get("DocTotal", 0)) or 0)
+                total_transactions += 1
+                if sale.get("customer_id") or sale.get("CardCode"):
+                    unique_customers.add(sale.get("customer_id") or sale.get("CardCode"))
+                total_items_sold += float(sale.get("quantity", sale.get("Quantity", 0)) or 0)
+            except (ValueError, TypeError):
+                continue
         
         avg_order_value = total_revenue / total_transactions if total_transactions > 0 else 0
         
@@ -552,8 +675,11 @@ class DBQueryService:
             if product_name:
                 if product_name not in product_sales:
                     product_sales[product_name] = {"quantity": 0, "revenue": 0}
-                product_sales[product_name]["quantity"] += float(sale.get("quantity", 0) or 0)
-                product_sales[product_name]["revenue"] += float(sale.get("amount", 0) or 0)
+                try:
+                    product_sales[product_name]["quantity"] += float(sale.get("quantity", 0) or 0)
+                    product_sales[product_name]["revenue"] += float(sale.get("amount", 0) or 0)
+                except (ValueError, TypeError):
+                    continue
         
         # Sort by revenue and take top 5
         for product, data in sorted(product_sales.items(), key=lambda x: x[1]["revenue"], reverse=True)[:5]:
@@ -594,8 +720,15 @@ class DBQueryService:
         if self._is_already_transformed(raw_data):
             return raw_data
         
-        total_revenue = sum(float(s.get("total_amount", s.get("TotalAmount", 0)) or 0) for s in raw_data)
-        total_transactions = len(raw_data)
+        total_revenue = 0
+        total_transactions = 0
+        for sale in raw_data:
+            try:
+                total_revenue += float(sale.get("total_amount", sale.get("DocTotal", 0)) or 0)
+                total_transactions += 1
+            except (ValueError, TypeError):
+                continue
+        
         avg_order = total_revenue / total_transactions if total_transactions > 0 else 0
         
         return [{
@@ -684,7 +817,7 @@ class DBQueryService:
         return transformed
 
     # =========================================================
-    # FIXED: _transform_deliveries with proper status extraction
+    # _transform_deliveries with proper status extraction
     # =========================================================
     
     def _transform_deliveries(self, raw_deliveries: list, max_items: int = 15) -> list:
@@ -707,7 +840,6 @@ class DBQueryService:
                 customer_code = delivery.get("CardCode", delivery.get("customer_code", delivery.get("CustomerCode", "")))
                 
                 # IMPORTANT: Extract status from various possible fields
-                # The API returns Status field with values like "Open", "Overdue", etc.
                 status = delivery.get("Status", delivery.get("status", "Open"))
                 
                 # Normalize status for consistent display
@@ -736,7 +868,7 @@ class DBQueryService:
                         if due_date < datetime.now() and status_display != "Completed":
                             is_overdue = True
                             status_display = "Overdue"
-                    except:
+                    except Exception:
                         pass
                 
                 # Extract quantities
@@ -745,7 +877,10 @@ class DBQueryService:
                 price = delivery.get("Price", delivery.get("price", 0))
                 
                 # Calculate total value
-                total_value = float(open_qty) * float(price) if open_qty and price else delivery.get("total_value", delivery.get("DocTotal", 0))
+                try:
+                    total_value = float(open_qty) * float(price) if open_qty and price else delivery.get("total_value", delivery.get("DocTotal", 0))
+                except (ValueError, TypeError):
+                    total_value = 0
                 
                 # Build the delivery item
                 delivery_item = {
@@ -795,8 +930,15 @@ class DBQueryService:
         
         # Add summary if truncated
         if len(raw_deliveries) > max_items:
-            total_value = sum(d.get("total_value", 0) for d in transformed)
-            overdue_count = sum(1 for d in transformed if d.get("is_overdue", False))
+            total_value = 0
+            overdue_count = 0
+            for d in transformed:
+                try:
+                    total_value += d.get("total_value", 0)
+                    if d.get("is_overdue", False):
+                        overdue_count += 1
+                except (ValueError, TypeError):
+                    pass
             transformed.append({
                 "_summary": True,
                 "total": len(raw_deliveries),
@@ -843,7 +985,7 @@ class DBQueryService:
         return [result]
 
     # -----------------------------------------------------------------------
-    # PRIVATE: Inventory Health Analysis - IMPROVED VERSION
+    # PRIVATE: Inventory Health Analysis
     # -----------------------------------------------------------------------
     
     def _transform_inventory_health(self, inventory_data: dict, turnover_data: list = None, slow_products: list = None) -> list:
@@ -894,23 +1036,23 @@ class DBQueryService:
             # Stock status classification
             if on_hand == 0:
                 out_of_stock_count += 1
-                status = "❌ OUT OF STOCK"
+                status = "OUT OF STOCK"
                 severity = "critical"
             elif available < 5:
                 critical_count += 1
-                status = "🔴 CRITICAL"
+                status = "CRITICAL"
                 severity = "critical"
             elif available < 20:
                 low_count += 1
-                status = "🟡 LOW"
+                status = "LOW"
                 severity = "warning"
             elif available < 100:
                 healthy_count += 1
-                status = "🟢 HEALTHY"
+                status = "HEALTHY"
                 severity = "good"
             else:
                 overstock_count += 1
-                status = "📦 OVERSTOCK"
+                status = "OVERSTOCK"
                 severity = "warning"
             
             # Collect critical and low items for display
@@ -940,16 +1082,16 @@ class DBQueryService:
         # Generate recommendations based on findings
         recommendations = []
         if out_of_stock_count > 0:
-            recommendations.append(f"⚠️ {out_of_stock_count} items are out of stock - Review reorder points and supplier lead times")
+            recommendations.append(f"{out_of_stock_count} items are out of stock - Review reorder points and supplier lead times")
         if critical_count > 0:
-            recommendations.append(f"🔴 {critical_count} items are critically low (<5 units available) - Immediate reorder required")
+            recommendations.append(f"{critical_count} items are critically low (<5 units available) - Immediate reorder required")
         if low_count > 0:
-            recommendations.append(f"🟡 {low_count} items are running low (<20 units available) - Schedule replenishment soon")
+            recommendations.append(f"{low_count} items are running low (<20 units available) - Schedule replenishment soon")
         if overstock_count > 0:
-            recommendations.append(f"📦 {overstock_count} items have excess stock (>100 units) - Consider promotions or markdowns")
+            recommendations.append(f"{overstock_count} items have excess stock (>100 units) - Consider promotions or markdowns")
         
         if not recommendations:
-            recommendations.append("✅ Inventory levels are well balanced - Continue monitoring")
+            recommendations.append("Inventory levels are well balanced - Continue monitoring")
         
         # Determine health status
         if health_score < 40:
@@ -1001,7 +1143,7 @@ class DBQueryService:
         if not data or len(data) <= max_items:
             return data
         
-        logger.info(f"✂️ Truncating {intent} data from {len(data)} to {max_items} items")
+        logger.info(f"Truncating {intent} data from {len(data)} to {max_items} items")
         
         if self._is_already_transformed(data):
             sample = data[:max_items]
@@ -1037,6 +1179,11 @@ class DBQueryService:
     # -----------------------------------------------------------------------
 
     def query(self, intent: str, entities: dict, language: str = "en") -> list[dict] | None:
+        # FIXED: Skip intents handled by action router
+        if intent in self.ACTION_ROUTER_INTENTS:
+            logger.info(f"🎯 {intent} handled by action router - skipping DB query")
+            return None
+        
         if intent in self.KNOWLEDGE_BASE_INTENTS:
             logger.info(f"📚 {intent} handled by knowledge base")
             return None
@@ -1047,7 +1194,7 @@ class DBQueryService:
         warehouse = (entities.get("warehouse") or "").strip()
         limit = int(entities.get("quantity") or 20)
 
-        logger.info(f"🗄️ DB query | {intent} | item='{item}' | customer='{customer}' | warehouse='{warehouse}'")
+        logger.info(f"DB query | {intent} | item='{item}' | customer='{customer}' | warehouse='{warehouse}'")
 
         try:
             data = self._dispatch(intent, item, customer, qty, warehouse, limit, language)
@@ -1069,7 +1216,7 @@ class DBQueryService:
             
             return data
         except Exception as e:
-            logger.error(f"❌ DBQueryService error for {intent}: {e}")
+            logger.error(f"DBQueryService error for {intent}: {e}")
             return []
 
     async def query_async(self, intent: str, entities: dict, language: str = "en") -> list[dict] | None:
@@ -1082,101 +1229,142 @@ class DBQueryService:
     def _dispatch(self, intent: str, item: str, customer: str, qty: float, warehouse: str, limit: int, language: str = "en") -> list[dict]:
         
         # =========================================================
-        # NEW: GET_SALES_ANALYTICS intent
+        # GET_SALES_ANALYTICS intent (USING REAL API)
         # =========================================================
         if intent == "GET_SALES_ANALYTICS":
-            logger.info(f"📊 Getting sales analytics for period: {item or 'last_30_days'}")
+            logger.info(f"Getting sales analytics for period: {item or 'last_30_days'}")
             
             # Determine period from entities or item name
             period = "last_30_days"
             if item:
                 item_lower = item.lower()
-                if "month" in item_lower:
-                    period = "last_30_days"
-                elif "week" in item_lower:
+                if "week" in item_lower or "7 days" in item_lower:
                     period = "last_7_days"
-                elif "quarter" in item_lower:
+                elif "month" in item_lower or "30 days" in item_lower:
+                    period = "last_30_days"
+                elif "quarter" in item_lower or "90 days" in item_lower:
                     period = "last_90_days"
-                elif "year" in item_lower:
+                elif "year" in item_lower or "365 days" in item_lower:
                     period = "last_365_days"
             
+            # Extract customer filter if present
+            customer_code = None
+            if customer:
+                customers = self._safe_api_call(self.api.get_customers, search=customer, limit=1)
+                if customers:
+                    customer_code = customers[0].get("CardCode")
+                    logger.info(f"Filtering sales by customer: {customer} ({customer_code})")
+            
+            # Extract item filter if present (not a period keyword)
+            item_filter = None
+            if item and not any(x in item.lower() for x in ["week", "month", "quarter", "year", "day", "days"]):
+                item_filter = item
+                logger.info(f"Filtering sales by item: {item_filter}")
+            
             try:
-                # Try to get sales data from API if available
-                # Note: This assumes there's a get_sales_analytics method in the API
-                if hasattr(self.api, 'get_sales_analytics'):
-                    raw_data = self._safe_api_call(self.api.get_sales_analytics, period=period, limit=limit)
-                    if raw_data:
-                        logger.info(f"✅ Found {len(raw_data)} sales records from API")
-                        return self._transform_sales_analytics(raw_data, period)
-                    else:
-                        logger.info("No sales data found from API, using fallback")
-                        return self._get_fallback_sales_analytics()
+                # Get real sales analytics from API
+                raw_data = self._safe_api_call(
+                    self.api.get_sales_analytics,
+                    period=period,
+                    limit=limit,
+                    customer_code=customer_code,
+                    item_code=item_filter
+                )
+                
+                if raw_data:
+                    logger.info(f"Found sales analytics data from API")
+                    # Transform the data for LLM consumption
+                    return self._transform_sales_analytics(raw_data, period)
                 else:
-                    # API method not available yet, return fallback data
-                    logger.info("get_sales_analytics method not available in API, using fallback data")
+                    logger.info("No sales data found from API, using fallback")
                     return self._get_fallback_sales_analytics()
                     
             except Exception as e:
                 logger.error(f"Error getting sales analytics: {e}")
-                # Return fallback data on error
                 return self._get_fallback_sales_analytics()
         
         # Price queries - use optimized resolve_and_price
         if intent in ["GET_ITEM_PRICE", "GET_ITEM_BASE_PRICE", "GET_CUSTOMER_PRICE"]:
             return self.resolve_and_price(item_name=item, customer_name=customer if intent == "GET_CUSTOMER_PRICE" else None)
         
-        # Items - direct search
+        # =========================================================
+        # FIXED: GET_ITEMS with stock data from inventory report
+        # =========================================================
         if intent in ["GET_ITEMS", "GET_SELLABLE_ITEMS", "GET_INVENTORY_ITEMS"]:
-            raw = self._safe_api_call(self.api.get_items, search=item, limit=min(limit, 30))
-            return self._transform_items(raw, max_items=15)
+            logger.info(f"Fetching items matching: '{item}'")
+            
+            # Get base items
+            raw = self._safe_api_call(self.api.get_items, search=item, limit=min(limit, 50))
+            
+            if raw:
+                # Enhance items with stock data from inventory report
+                inventory = self._safe_api_call(self.api.get_inventory_report, search=item, limit=min(limit, 50))
+                inventory_dict = {}
+                for inv in inventory:
+                    inv_code = inv.get("ItemCode")
+                    if inv_code:
+                        inventory_dict[inv_code] = inv
+                
+                logger.info(f"Loaded {len(raw)} items, {len(inventory_dict)} inventory records")
+                
+                for r in raw:
+                    item_code = r.get("ItemCode")
+                    if item_code and item_code in inventory_dict:
+                        inv_data = inventory_dict[item_code]
+                        r["CurrentOnHand"] = inv_data.get("CurrentOnHand", 0)
+                        r["CurrentIsCommited"] = inv_data.get("CurrentIsCommited", 0)
+                        r["LastTransactionDate"] = inv_data.get("LastTransactionDate", "")
+                        r["WhsCode"] = inv_data.get("WhsCode", "")
+                
+                return self._transform_items(raw, max_items=15)
+            
+            logger.warning(f"No items found matching '{item}'")
+            return []
         
         # Customers
         if intent == "GET_CUSTOMERS":
             raw = self._safe_api_call(self.api.get_customers, search=customer, limit=min(limit, 30))
             return self._transform_customers(raw, max_items=15)
         
-        # Stock levels - FIXED with proper size filtering
+        # =========================================================
+        # GET_STOCK_LEVELS - FIXED with proper size filtering
+        # =========================================================
         if intent == "GET_STOCK_LEVELS":
-            logger.info(f"📊 Getting stock levels for: {item or 'all items'}")
-            raw = self._safe_api_call(self.api.get_inventory_report, search=item, limit=30)
+            logger.info(f"Getting stock levels for: {item or 'all items'}")
+            raw = self._safe_api_call(self.api.get_inventory_report, search=item, limit=min(limit, 50))
             
             if raw:
-                # Filter for exact size match if size was detected (from entities)
-                # Note: entities are passed in query method, not directly here
-                # This is handled in the query method before dispatch
-                logger.info(f"✅ Found {len(raw)} stock records")
+                logger.info(f"Found {len(raw)} stock records")
                 return self._transform_items(raw, max_items=15)
             
             logger.warning(f"No stock data found for: {item}")
             return []
         
-        # Warehouses - Using WarehouseService
+        # =========================================================
+        # GET_WAREHOUSES - Using WarehouseService with fallback
+        # =========================================================
         if intent == "GET_WAREHOUSES":
-            logger.info(f"🏭 Fetching warehouses using WarehouseService...")
+            logger.info(f"Fetching warehouses using WarehouseService...")
             
             try:
-                # Get warehouse summaries with stock information
                 warehouses_summary = self.warehouse_service.get_all_warehouses_summary()
                 
                 if warehouses_summary and len(warehouses_summary) > 0:
-                    logger.info(f"✅ Found {len(warehouses_summary)} warehouses from WarehouseService")
+                    logger.info(f"Found {len(warehouses_summary)} warehouses from WarehouseService")
                     return self._transform_warehouses_from_summary(warehouses_summary, max_items=12)
                 else:
-                    # Try fallback: get basic warehouse list
                     logger.warning("No warehouse summary data, trying basic warehouse list")
                     warehouses = self.warehouse_service.search_warehouses(query=warehouse if warehouse else "")
                     if warehouses:
-                        logger.info(f"✅ Found {len(warehouses)} warehouses from search")
+                        logger.info(f"Found {len(warehouses)} warehouses from search")
                         return self._transform_warehouses(warehouses, max_items=12)
                     else:
-                        # Use fallback data
                         logger.warning("No warehouse data from API, using fallback")
                         fallback = self._get_fallback_warehouses()
                         return self._transform_warehouses(fallback, max_items=12)
                         
             except Exception as e:
                 logger.error(f"Error fetching warehouses from WarehouseService: {e}")
-                # Fallback to direct API call
                 raw = self._safe_api_call(self.api.get_warehouses, search=warehouse)
                 if raw:
                     return self._transform_warehouses(raw, max_items=12)
@@ -1184,12 +1372,13 @@ class DBQueryService:
                     fallback = self._get_fallback_warehouses()
                     return self._transform_warehouses(fallback, max_items=12)
         
-        # Low stock alerts - Using WarehouseService
+        # =========================================================
+        # GET_LOW_STOCK_ALERTS - Using WarehouseService
+        # =========================================================
         if intent == "GET_LOW_STOCK_ALERTS":
-            logger.info(f"🔔 Getting low stock alerts for warehouse: {warehouse or 'all'}")
+            logger.info(f"Getting low stock alerts for warehouse: {warehouse or 'all'}")
             
             try:
-                # Use WarehouseService for low stock alerts
                 if warehouse:
                     alerts = self.warehouse_service.get_low_stock_alerts(
                         whscode=warehouse,
@@ -1203,8 +1392,7 @@ class DBQueryService:
                     )
                 
                 if alerts:
-                    logger.info(f"✅ Found {len(alerts)} low stock alerts from WarehouseService")
-                    # Convert to format expected by _transform_low_stock
+                    logger.info(f"Found {len(alerts)} low stock alerts from WarehouseService")
                     formatted_alerts = []
                     for alert in alerts:
                         formatted_alerts.append({
@@ -1223,14 +1411,12 @@ class DBQueryService:
                     
             except Exception as e:
                 logger.error(f"Error getting low stock alerts from WarehouseService: {e}")
-                # Fallback to direct inventory processing
                 raw = self._safe_api_call(self.api.get_inventory_report, search=item, limit=200)
                 
                 if not raw:
                     logger.warning("No inventory data returned for low stock alerts")
                     return []
                 
-                # Process and filter low stock items
                 low_stock_items = []
                 for inv_item in raw:
                     on_hand = float(inv_item.get("CurrentOnHand", 0))
@@ -1262,55 +1448,71 @@ class DBQueryService:
                 return self._transform_low_stock(low_stock_items, max_items=20)
         
         # =========================================================
-        # GET_OUTSTANDING_DELIVERIES intent
+        # GET_OUTSTANDING_DELIVERIES intent (USING REAL API)
         # =========================================================
         if intent == "GET_OUTSTANDING_DELIVERIES":
-            logger.info(f"📦 Getting outstanding deliveries for customer: {customer or 'all'}, item: {item or 'all'}")
+            logger.info(f"Getting outstanding deliveries for customer: {customer or 'all'}")
             
-            # Resolve customer code if customer name provided
+            # Clean customer name
+            clean_customer = customer
+            if clean_customer:
+                prefixes_to_remove = [
+                    r'^outstanding\s+deliveries?\s+for\s+',
+                    r'^deliveries?\s+for\s+',
+                    r'^show\s+me\s+deliveries?\s+for\s+',
+                ]
+                for prefix in prefixes_to_remove:
+                    clean_customer = re.sub(prefix, '', clean_customer, flags=re.IGNORECASE)
+                clean_customer = clean_customer.strip()
+            
+            # Resolve customer code
             customer_code = None
-            if customer:
-                try:
-                    customers = self._safe_api_call(self.api.get_customers, search=customer, limit=1)
-                    if customers and len(customers) > 0:
-                        customer_code = customers[0].get("CardCode")
-                        logger.info(f"✅ Resolved customer '{customer}' to code: {customer_code}")
-                    else:
-                        logger.warning(f"⚠️ Customer '{customer}' not found")
-                except Exception as e:
-                    logger.error(f"Error resolving customer: {e}")
+            customer_name_display = clean_customer or "All Customers"
             
-            # Try to get open sales orders from API
-            try:
-                # Attempt to call get_open_sales_orders if available
-                if hasattr(self.api, 'get_open_sales_orders'):
-                    raw = self._safe_api_call(self.api.get_open_sales_orders, customer_code=customer_code, limit=limit)
-                    if raw:
-                        logger.info(f"✅ Found {len(raw)} open sales orders from API")
-                        return self._transform_deliveries(raw, max_items=15)
-                    else:
-                        logger.info("No open sales orders found from API")
+            if clean_customer:
+                customers = self._safe_api_call(self.api.get_customers, search=clean_customer, limit=5)
+                if customers:
+                    best_match = customers[0]
+                    customer_code = best_match.get("CardCode")
+                    customer_name_display = best_match.get("CardName", clean_customer)
+                    logger.info(f"Resolved customer '{clean_customer}' to code: {customer_code}")
                 else:
-                    logger.info("get_open_sales_orders method not available in API")
-            except Exception as e:
-                logger.error(f"Error calling get_open_sales_orders: {e}")
+                    logger.warning(f"Customer '{clean_customer}' not found")
             
-            # Return friendly message while feature is being integrated
-            if customer:
-                return [{
-                    "customer": customer,
-                    "customer_code": customer_code,
-                    "message": f"📦 **Outstanding Deliveries for {customer}**\n\nThis feature is currently being integrated with our ERP system. For immediate assistance with delivery status, please contact:\n\n📞 Sales Support: 0709-123-456\n✉️ Email: sales@leysco.com\n\nWe'll notify you once real-time tracking is available.",
-                    "status": "coming_soon"
-                }]
-            else:
-                return [{
-                    "message": "📦 **Outstanding Deliveries**\n\nThis feature is coming soon! We're integrating real-time delivery tracking from SAP Business One.\n\nIn the meantime, you can:\n• Ask for 'outstanding deliveries for [customer name]'\n• Contact sales support for urgent delivery queries\n• Check back later for live updates",
-                    "status": "coming_soon"
-                }]
+            try:
+                # Get outstanding deliveries from API
+                raw = self._safe_api_call(
+                    self.api.get_outstanding_deliveries,
+                    customer_code=customer_code,
+                    limit=limit
+                )
+                
+                if raw:
+                    logger.info(f"Found {len(raw)} outstanding deliveries")
+                    return self._transform_deliveries(raw, max_items=15)
+                else:
+                    logger.info("No outstanding deliveries found")
+                    if clean_customer:
+                        return [{
+                            "customer_name": customer_name_display,
+                            "customer_code": customer_code,
+                            "message": f"No outstanding deliveries found for {customer_name_display}. All deliveries are complete.",
+                            "deliveries_count": 0,
+                            "deliveries": []
+                        }]
+                    else:
+                        return [{
+                            "message": "No outstanding deliveries found. All deliveries are complete.",
+                            "deliveries_count": 0,
+                            "deliveries": []
+                        }]
+                        
+            except Exception as e:
+                logger.error(f"Error getting outstanding deliveries: {e}")
+                return self._get_fallback_deliveries()
         
         # Default
-        logger.warning(f"⚠️ No optimized dispatch for intent: {intent}")
+        logger.warning(f"No optimized dispatch for intent: {intent}")
         return []
 
     # -----------------------------------------------------------------------
@@ -1410,10 +1612,10 @@ class DBQueryService:
         cache_key = f"price_lookup:{item_name}:{customer_name or 'default'}"
         cached = self.cache.get_simple(cache_key)
         if cached:
-            logger.info(f"📦 Price cache hit: {item_name}")
+            logger.info(f"Price cache hit: {item_name}")
             return cached
 
-        logger.info(f"💰 Price lookup for: '{item_name}'")
+        logger.info(f"Price lookup for: '{item_name}'")
         
         required_size = None
         exact_size_required = False
@@ -1498,14 +1700,14 @@ class DBQueryService:
                 if exact_size_required and required_size:
                     if item_size == required_size:
                         results.append(result_item)
-                        logger.info(f"   ✅ Found EXACT SIZE MATCH: {item_display} @ KES {price_result.get('price')}")
+                        logger.info(f"   Found EXACT SIZE MATCH: {item_display} @ KES {price_result.get('price')}")
                         break
                     else:
                         logger.debug(f"   Found priced item but size mismatch: {item_display} (size={item_size}) vs required={required_size}")
                         results.append(result_item)
                 else:
                     results.append(result_item)
-                    logger.info(f"   ✅ Found priced item: {item_display} @ KES {price_result.get('price')}")
+                    logger.info(f"   Found priced item: {item_display} @ KES {price_result.get('price')}")
                     if not exact_size_required:
                         break
 
@@ -1519,63 +1721,6 @@ class DBQueryService:
                 logger.info(f"   Filtered to {len(results)} exact size matches")
             elif results:
                 logger.warning(f"   No exact size match for {required_size}, using {len(results)} priced items with size mismatch")
-
-        if not results:
-            base_name = re.sub(r'\s+\d+(?:ml|kg|g|l)\b', '', item_name, flags=re.IGNORECASE).strip()
-            base_name = base_name.split()[0] if ' ' in base_name else base_name
-            
-            if base_name != item_name:
-                logger.info(f"   Trying broader search with '{base_name}'")
-                fallback_items = self._safe_api_call(self.api.get_items, search=base_name, limit=50)
-                
-                scored_fallback = []
-                for item in fallback_items:
-                    score = self._calculate_item_priority_score(
-                        item, base_name, required_size, exact_size_required
-                    )
-                    scored_fallback.append((score, item))
-                scored_fallback.sort(key=lambda x: x[0], reverse=True)
-                
-                for score, item in scored_fallback[:10]:
-                    item_code = item.get("ItemCode") or item.get("itemCode") or item.get("code")
-                    item_display = item.get("ItemName") or item.get("itemName") or item_code
-                    item_size = extract_size_from_item_name(item_display)
-                    
-                    if not item_code:
-                        continue
-                    
-                    if exact_size_required and item.get("SellItem") != "Y":
-                        continue
-                        
-                    price_result = self.api.get_item_price(
-                        item_code=item_code,
-                        customer_name=resolved_customer,
-                    )
-                    
-                    if price_result and price_result.get("found") and price_result.get("price", 0) > 0:
-                        result_item = {
-                            "ItemCode":      item_code,
-                            "ItemName":      item_display,
-                            "Price":         price_result.get("price"),
-                            "Currency":      price_result.get("currency", "KES"),
-                            "PriceListName": price_result.get("price_list_name", ""),
-                            "IsGrossPrice":  price_result.get("is_gross_price", False),
-                            "UomEntry":      price_result.get("uom_entry", ""),
-                            "Note":          price_result.get("note", ""),
-                            "Customer":      resolved_customer or "Standard pricing",
-                        }
-                        
-                        if exact_size_required and required_size:
-                            if item_size == required_size:
-                                results = [result_item]
-                                logger.info(f"   ✅ Found EXACT SIZE MATCH in fallback: {item_display}")
-                                break
-                            else:
-                                results.append(result_item)
-                        else:
-                            results = [result_item]
-                            logger.info(f"   ✅ Found priced item in fallback: {item_display}")
-                            break
 
         if not results and top_items:
             for item in top_items[:3]:
@@ -1610,6 +1755,16 @@ class DBQueryService:
 
     def get_item_by_name(self, name: str, limit: int = 10) -> list[dict]:
         raw = self._safe_api_call(self.api.get_items, search=name, limit=limit)
+        # Enhance with stock data
+        if raw:
+            inventory = self._safe_api_call(self.api.get_inventory_report, search=name, limit=limit)
+            inventory_dict = {inv.get("ItemCode"): inv for inv in inventory}
+            for r in raw:
+                item_code = r.get("ItemCode")
+                if item_code and item_code in inventory_dict:
+                    inv_data = inventory_dict[item_code]
+                    r["CurrentOnHand"] = inv_data.get("CurrentOnHand", 0)
+                    r["CurrentIsCommited"] = inv_data.get("CurrentIsCommited", 0)
         return self._transform_items(raw, max_items=limit)
 
     def get_customer_by_name(self, name: str, limit: int = 5) -> list[dict]:
@@ -1650,5 +1805,18 @@ class DBQueryService:
         return errors.get(error_type, "Hitilafu imetokea. Tafadhali jaribu tena.")
 
 
-# Singleton instance
-db_query_service = DBQueryService()
+# =========================================================
+# Factory function to create DBQueryService with user token
+# =========================================================
+
+def create_db_query_service(user_token: str = None) -> DBQueryService:
+    """
+    Create a DBQueryService instance with the user's token.
+    
+    Args:
+        user_token: The authenticated user's Bearer token
+    
+    Returns:
+        Configured DBQueryService instance
+    """
+    return DBQueryService(user_token=user_token)

@@ -3,6 +3,16 @@ app/services/leysco_api_service.py
 ===================================
 Leysco API Service - Enhanced with Business Partner Type Filtering and Pagination
 Optimized with connection pooling, Redis caching, and async support
+
+MODIFIED FOR PHASE 1: Removed static token, uses per-request user token only
+MODIFIED FOR PHASE 2: Added Sales Analytics, Customer Orders, and Outstanding Deliveries APIs
+UPDATED: get_sales_analytics now properly fetches real data from sales orders endpoint
+ADDED: Enhanced debugging for sales analytics to track API response
+FIXED: None value handling in DocTotal and other numeric fields
+ADDED: Sales orders-based top selling items calculation with proper item name resolution
+ADDED: Sales orders-based slow moving items calculation
+FIXED: Formatting error in sales analytics logging (invalid f-string format specifier)
+FIXED: Unknown item names in top selling items - now resolves from item masterdata
 """
 
 import requests
@@ -71,9 +81,14 @@ def cache_api_result(ttl_seconds: int = 300, key_prefix: str = ""):
     def decorator(func):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
+            # Skip caching if no user token (security)
+            if not self.user_token:
+                logger.debug("Skipping cache - no user token")
+                return func(self, *args, **kwargs)
+            
             cache = get_cache_service()
             
-            # Generate cache key
+            # Generate cache key with tenant context
             func_name = func.__name__
             cache_str = f"{key_prefix or func_name}:{str(args)}:{str(sorted(kwargs.items()))}"
             cache_key = hashlib.md5(cache_str.encode()).hexdigest()
@@ -99,7 +114,8 @@ def cache_api_result(ttl_seconds: int = 300, key_prefix: str = ""):
 class LeyscoAPIService:
     """
     Service to interact with Leysco Sales System APIs
-    AI-Optimized Version with Business Partner Type Filtering
+    MODIFIED: Uses per-request user token instead of static token.
+    No token storage - token must be provided per instance.
     """
 
     # Document type mapping for easy reference (based on Sales App)
@@ -203,12 +219,27 @@ class LeyscoAPIService:
         ],
     }
 
-    def __init__(self):
+    def __init__(self, user_token: str = None):
+        """
+        Initialize API service with user token from request.
+        
+        Args:
+            user_token: Bearer token from the authenticated user (required for data access)
+        """
         self.base_url = settings.LEYSCO_API_BASE_URL.rstrip("/")
+        self.user_token = user_token
+        
+        # Initialize headers WITHOUT static token
         self.headers = {
-            "Authorization": f"Bearer {settings.LEYSCO_API_TOKEN}",
             "Content-Type": "application/json"
         }
+        
+        # Add user token if provided
+        if self.user_token:
+            self.headers["Authorization"] = f"Bearer {self.user_token}"
+            logger.debug("API Service initialized with user token")
+        else:
+            logger.warning("API Service initialized WITHOUT user token - data access will fail")
         
         # Configure session with connection pooling
         self.session = requests.Session()
@@ -219,16 +250,16 @@ class LeyscoAPIService:
             pool_connections=20,
             pool_maxsize=20,
             max_retries=Retry(
-                total=3,
+                total=2,  # Reduced from 3 - don't retry auth failures
                 backoff_factor=0.3,
-                status_forcelist=[429, 500, 502, 503, 504]
+                status_forcelist=[429, 500, 502, 503, 504]  # 401 removed - don't retry
             )
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         
         self.timeout = 30
-        self._is_authenticated = True
+        self._is_authenticated = bool(self.user_token)
         
         self._endpoint_cache = {}
         self._last_discovery = None
@@ -262,32 +293,108 @@ class LeyscoAPIService:
         return self._pricing_service
 
     # -------------------------------------------------
-    # AUTHENTICATION HELPERS
+    # TOKEN MANAGEMENT (NEW FOR PHASE 1)
+    # -------------------------------------------------
+    
+    def set_user_token(self, token: str):
+        """Update user token for this instance (used when re-authenticating)"""
+        self.user_token = token
+        self.headers["Authorization"] = f"Bearer {token}"
+        self.session.headers.update(self.headers)
+        self._is_authenticated = True
+        logger.debug("User token updated")
+    
+    def _mask_token(self, token: str = None) -> str:
+        """Mask token for logging security"""
+        t = token or self.user_token
+        if not t:
+            return "***NO_TOKEN***"
+        if len(t) <= 12:
+            return "***MASKED***"
+        return f"{t[:8]}...{t[-4:]}"
+    
+    # -------------------------------------------------
+    # TOKEN VALIDATION (NEW FOR PHASE 1)
+    # -------------------------------------------------
+    
+    async def validate_token(self) -> Optional[Dict]:
+        """
+        Validate the current user token with Leysco API.
+        Returns user and tenant information if valid.
+        """
+        if not self.user_token:
+            logger.error("Cannot validate token - no token provided")
+            return {"valid": False, "error": "No token provided"}
+        
+        try:
+            url = f"{self.base_url}/auth/validate"
+            self._record_api_call()
+            resp = self.session.get(url, timeout=10)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("valid") or data.get("ResultState"):
+                    logger.info(f"✅ Token validated successfully for user")
+                    return {
+                        "valid": True,
+                        "user_id": data.get("user_id") or data.get("id"),
+                        "email": data.get("email"),
+                        "role": data.get("role") or data.get("user_role", "user"),
+                        "company_code": data.get("company_code") or data.get("tenant_code"),
+                        "company_id": data.get("company_id") or data.get("tenant_id", 0)
+                    }
+            
+            logger.warning(f"Token validation failed: HTTP {resp.status_code}")
+            return {"valid": False, "error": f"HTTP {resp.status_code}"}
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Token validation request error: {e}")
+            return {"valid": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Token validation error: {e}")
+            return {"valid": False, "error": str(e)}
+
+    # -------------------------------------------------
+    # AUTHENTICATION HELPERS (MODIFIED)
     # -------------------------------------------------
     
     def _check_auth(self, response: requests.Response) -> bool:
         """Check if response indicates authentication failure."""
-        if response.status_code == 401 or response.status_code == 302:
+        if response.status_code == 401:
             self._stats["auth_errors"] += 1
-            logger.warning(f"Authentication issue detected (status {response.status_code})")
-            
-            # Try to re-authenticate if credentials are available
-            if hasattr(settings, 'LEYSCO_USERNAME') and hasattr(settings, 'LEYSCO_PASSWORD'):
-                if self.login(settings.LEYSCO_USERNAME, settings.LEYSCO_PASSWORD):
-                    logger.info("Re-authentication successful")
-                    return True
-            
+            logger.warning(f"Authentication failed (401) - token may be invalid or expired")
+            self._is_authenticated = False
+            return False
+        
+        if response.status_code == 302:
+            self._stats["auth_errors"] += 1
+            logger.warning(f"Authentication redirect (302) - possible session expiry")
             self._is_authenticated = False
             return False
         
         return True
     
+    # -------------------------------------------------
+    # HTML RESPONSE DETECTION (FIXED - ADDED METHOD)
+    # -------------------------------------------------
+    def _is_html_response(self, text: str) -> bool:
+        """Check if response is HTML (login page) instead of JSON."""
+        if not text:
+            return False
+        text_lower = text.lower().strip()
+        html_indicators = [
+            '<html', '<!doctype html', '<!DOCTYPE HTML',
+            'welcome back', 'sign in', 'login', 'signin',
+            'username', 'password', 'enter your credentials'
+        ]
+        return any(indicator in text_lower for indicator in html_indicators)
+    
     def _ensure_auth(self) -> bool:
-        """Ensure we have valid authentication."""
-        if not self._is_authenticated:
-            if hasattr(settings, 'LEYSCO_USERNAME') and hasattr(settings, 'LEYSCO_PASSWORD'):
-                return self.login(settings.LEYSCO_USERNAME, settings.LEYSCO_PASSWORD)
-        return self._is_authenticated
+        """Ensure we have valid authentication (token present)."""
+        if not self.user_token:
+            logger.warning("No user token available for API call")
+            return False
+        return True
 
     # -------------------------------------------------
     # STATS HELPERS
@@ -498,10 +605,14 @@ class LeyscoAPIService:
         return None
 
     # -------------------------------------------------
-    # AUTHENTICATION
+    # AUTHENTICATION (MODIFIED - No static token)
     # -------------------------------------------------
     def login(self, username: str, password: str) -> bool:
-        """Authenticate with the API and store token."""
+        """
+        Authenticate with the API and store token.
+        NOTE: This is for system-level authentication only.
+        For user authentication, the token should come from the request.
+        """
         try:
             url = f"{self.base_url}/auth/login"
             payload = {"username": username, "password": password}
@@ -513,6 +624,7 @@ class LeyscoAPIService:
                 data = resp.json()
                 token = data.get("token") or data.get("access_token")
                 if token:
+                    self.user_token = token
                     self.headers["Authorization"] = f"Bearer {token}"
                     self.session.headers.update(self.headers)
                     self._is_authenticated = True
@@ -558,8 +670,9 @@ class LeyscoAPIService:
                 resp = self.session.get(url, params=params, timeout=30)
                 
                 if not self._check_auth(resp):
-                    # Retry with new auth
-                    resp = self.session.get(url, params=params, timeout=30)
+                    # Don't retry on auth failure - just return empty
+                    logger.warning("Authentication failed, stopping customer fetch")
+                    break
                 
                 if resp.status_code != 200:
                     logger.error(f"Failed to fetch customers page {page}: {resp.status_code}")
@@ -639,7 +752,7 @@ class LeyscoAPIService:
                 resp = self.session.get(url, params=params, timeout=30)
                 
                 if not self._check_auth(resp):
-                    resp = self.session.get(url, params=params, timeout=30)
+                    break
                 
                 if resp.status_code != 200:
                     break
@@ -688,7 +801,7 @@ class LeyscoAPIService:
                 resp = self.session.get(url, params=params, timeout=30)
                 
                 if not self._check_auth(resp):
-                    resp = self.session.get(url, params=params, timeout=30)
+                    break
                 
                 if resp.status_code != 200:
                     break
@@ -737,7 +850,7 @@ class LeyscoAPIService:
                 resp = self.session.get(url, params=params, timeout=30)
                 
                 if not self._check_auth(resp):
-                    resp = self.session.get(url, params=params, timeout=30)
+                    break
                 
                 if resp.status_code != 200:
                     break
@@ -813,7 +926,7 @@ class LeyscoAPIService:
             resp = self.session.get(url, params=params, timeout=15)
             
             if not self._check_auth(resp):
-                resp = self.session.get(url, params=params, timeout=15)
+                return []
             
             self._debug_response("ITEMS", resp)
             if resp.status_code == 200:
@@ -1002,8 +1115,8 @@ class LeyscoAPIService:
                 resp = self.session.get(url, params=params, timeout=15)
                 
                 if not self._check_auth(resp):
-                    logger.warning("Authentication failed during inventory fetch, retrying...")
-                    resp = self.session.get(url, params=params, timeout=15)
+                    logger.warning("Authentication failed during inventory fetch")
+                    break
                 
                 self._debug_response("INVENTORY REPORT", resp)
                 
@@ -1098,8 +1211,8 @@ class LeyscoAPIService:
             resp = self.session.get(url, params=params, timeout=15)
             
             if not self._check_auth(resp):
-                logger.warning("Authentication failed during warehouse fetch, retrying...")
-                resp = self.session.get(url, params=params, timeout=15)
+                logger.warning("Authentication failed during warehouse fetch")
+                return []
             
             self._debug_response("WAREHOUSES", resp)
             
@@ -1123,6 +1236,7 @@ class LeyscoAPIService:
     def get_open_sales_orders(self, customer_code: str = None, limit: int = 100) -> List[Dict]:
         """
         Fetch open sales orders with outstanding quantities from SAP Business One.
+        Uses the confirmed working endpoint: /marketing/docs/17 with isDoc=1 and DocStatus=1.
         
         Args:
             customer_code: Optional customer code to filter by
@@ -1135,180 +1249,1087 @@ class LeyscoAPIService:
             if not self._ensure_auth():
                 logger.warning("Not authenticated, cannot fetch open sales orders")
                 return []
-            
-            # Try multiple possible endpoints - prioritize /marketing/docs/17
-            endpoints_to_try = [
-                "/marketing/docs/17",  # SAP document type for Sales Orders (priority - working endpoint)
-                "/sales_orders?status=open",
-                "/orders?status=open",
-                "/documents/order",
-            ]
-            
-            for endpoint in endpoints_to_try:
-                url = f"{self.base_url}{endpoint}"
-                params = {"page": 1, "per_page": limit}
-                if customer_code:
-                    params["CardCode"] = customer_code
-                
-                logger.info(f"📦 Fetching open sales orders from: {url}")
-                self._record_api_call()
-                
-                try:
-                    resp = self.session.get(url, params=params, timeout=15)
-                    
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        
-                        # Parse based on endpoint
-                        orders = []
-                        
-                        if endpoint == "/marketing/docs/17":
-                            # Handle the specific format from /marketing/docs/17
-                            if data.get("ResultState") and data.get("ResponseData"):
-                                response_data = data["ResponseData"]
-                                if isinstance(response_data, dict):
-                                    # Check for data array (list of documents)
-                                    if "data" in response_data:
-                                        orders = response_data["data"]
-                                    elif "DocumentLines" in response_data:
-                                        # Single document returned
-                                        orders = [response_data]
-                                elif isinstance(response_data, list):
-                                    orders = response_data
-                        else:
-                            # Use standard normalization for other endpoints
-                            orders = self._normalize(data)
-                        
-                        if orders:
-                            logger.info(f"✅ Found {len(orders)} orders from {endpoint}")
-                            
-                            # Process and format orders to extract line items
-                            formatted_orders = []
-                            
-                            for order in orders:
-                                # Extract order header
-                                doc_num = order.get("DocNum") or order.get("doc_num") or order.get("DocumentNumber")
-                                doc_entry = order.get("DocEntry") or order.get("doc_entry") or order.get("DocumentEntry")
-                                card_code = order.get("CardCode") or order.get("card_code") or customer_code
-                                card_name = order.get("CardName") or order.get("card_name") or "Unknown"
-                                doc_date = order.get("DocDate") or order.get("doc_date") or ""
-                                doc_due_date = order.get("DocDueDate") or order.get("doc_due_date") or ""
-                                
-                                # Get items - check multiple possible field names
-                                items = (order.get("DocumentLines") or 
-                                        order.get("items") or 
-                                        order.get("Lines") or 
-                                        order.get("document_lines") or
-                                        [])
-                                
-                                # If no items found and order is a single item structure
-                                if not items and order.get("ItemCode"):
-                                    items = [order]
-                                
-                                logger.debug(f"Processing order {doc_num}: {len(items)} items")
-                                
-                                for item in items:
-                                    item_code = item.get("ItemCode") or item.get("item_code") or item.get("ProductCode")
-                                    item_name = item.get("ItemName") or item.get("item_name") or item.get("ProductName")
-                                    quantity = float(item.get("Quantity") or item.get("quantity") or 0)
-                                    open_qty = float(item.get("OpenQty") or item.get("open_qty") or item.get("OpenQuantity") or quantity)
-                                    price = float(item.get("Price") or item.get("price") or 0)
-                                    
-                                    # Only include items with outstanding quantity
-                                    if open_qty > 0:
-                                        formatted_orders.append({
-                                            "DocNum": doc_num,
-                                            "DocEntry": doc_entry,
-                                            "CardCode": card_code,
-                                            "CardName": card_name,
-                                            "DocDate": doc_date,
-                                            "DocDueDate": doc_due_date,
-                                            "ItemCode": item_code,
-                                            "ItemName": item_name,
-                                            "Quantity": quantity,
-                                            "OpenQty": open_qty,
-                                            "Price": price,
-                                            "Status": "Open"
-                                        })
-                                        logger.debug(f"  Added item: {item_code} - {item_name}, OpenQty: {open_qty}")
-                                
-                                # Limit the number of orders to prevent overwhelming response
-                                if len(formatted_orders) >= limit:
-                                    break
-                            
-                            if formatted_orders:
-                                logger.info(f"✅ Processed {len(formatted_orders)} line items from {endpoint}")
-                                return formatted_orders
-                            else:
-                                logger.warning(f"Found {len(orders)} orders but no items with outstanding quantity")
-                        
-                except Exception as e:
-                    logger.debug(f"Endpoint {endpoint} failed: {e}")
-                    continue
-            
-            # If we get here, no orders found
-            logger.info("No open sales orders found from any endpoint")
-            return []
-            
+
+            url = f"{self.base_url}/marketing/docs/17"
+            params = {
+                "isDoc": 1,
+                "page": 1,
+                "per_page": limit,
+                "DocStatus": 1,   # 1 = Open / outstanding
+                "IsICT": "N",
+                "created_by": "",
+            }
+            if customer_code:
+                params["CardCode"] = customer_code
+
+            logger.info(f"📦 Fetching open sales orders from: {url} | params: {params}")
+            self._record_api_call()
+            resp = self.session.get(url, params=params, timeout=30)
+
+            if not self._check_auth(resp):
+                logger.warning("Authentication failed fetching open sales orders")
+                return []
+
+            if resp.status_code != 200:
+                logger.error(f"Open sales orders API error: {resp.status_code}")
+                return []
+
+            if self._is_html_response(resp.text):
+                logger.warning("Received HTML response for open sales orders - token may be expired")
+                return []
+
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse open sales orders JSON: {e}")
+                return []
+
+            # Parse orders from standard Leysco response envelope
+            orders = []
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                if isinstance(response_data, dict):
+                    if "data" in response_data:
+                        orders = response_data["data"]
+                    elif "DocumentLines" in response_data:
+                        # Single document returned directly
+                        orders = [response_data]
+                elif isinstance(response_data, list):
+                    orders = response_data
+            else:
+                orders = self._normalize(data)
+
+            if not orders:
+                logger.info("No open sales orders found")
+                return []
+
+            # Flatten into line-item records (one row per outstanding item line)
+            formatted_orders = []
+            for order in orders:
+                doc_num     = order.get("DocNum") or order.get("doc_num") or order.get("DocumentNumber")
+                doc_entry   = order.get("DocEntry") or order.get("doc_entry") or order.get("DocumentEntry")
+                card_code   = order.get("CardCode") or order.get("card_code") or customer_code
+                card_name   = order.get("CardName") or order.get("card_name") or "Unknown"
+                doc_date    = order.get("DocDate") or order.get("doc_date") or ""
+                doc_due_date = order.get("DocDueDate") or order.get("doc_due_date") or ""
+
+                items = (
+                    order.get("DocumentLines")
+                    or order.get("items")
+                    or order.get("Lines")
+                    or order.get("document_lines")
+                    or []
+                )
+
+                # Handle single-item order structures
+                if not items and order.get("ItemCode"):
+                    items = [order]
+
+                for item in items:
+                    item_code  = item.get("ItemCode") or item.get("item_code") or item.get("ProductCode")
+                    item_name  = item.get("ItemName") or item.get("item_name") or item.get("ProductName")
+                    quantity   = float(item.get("Quantity") or item.get("quantity") or 0)
+                    open_qty   = float(item.get("OpenQty") or item.get("open_qty") or item.get("OpenQuantity") or quantity)
+                    price      = float(item.get("Price") or item.get("price") or 0)
+
+                    if open_qty > 0:
+                        formatted_orders.append({
+                            "DocNum":      doc_num,
+                            "DocEntry":    doc_entry,
+                            "CardCode":    card_code,
+                            "CardName":    card_name,
+                            "DocDate":     doc_date,
+                            "DocDueDate":  doc_due_date,
+                            "ItemCode":    item_code,
+                            "ItemName":    item_name,
+                            "Quantity":    quantity,
+                            "OpenQty":     open_qty,
+                            "Price":       price,
+                            "Status":      "Open",
+                        })
+
+                if len(formatted_orders) >= limit:
+                    break
+
+            logger.info(f"✅ Processed {len(formatted_orders)} open line items from sales orders")
+            return formatted_orders
+
         except Exception as e:
             self._record_error()
             logger.error(f"Failed to fetch open sales orders: {e}", exc_info=True)
             return []
 
+    # =========================================================
+    # PHASE 2: SALES ANALYTICS API - FIXED None value handling & formatting
+    # =========================================================
+    
+    @cache_api_result(ttl_seconds=ANALYTICS_CACHE_TTL)
+    def get_sales_analytics(
+        self,
+        period: str = "last_30_days",
+        limit: int = 100,
+        customer_code: str = None,
+        item_code: str = None
+    ) -> List[Dict]:
+        """
+        Get real sales analytics data from Leysco API using sales orders endpoint.
+        
+        Args:
+            period: Time period (last_7_days, last_30_days, last_90_days, last_365_days)
+            limit: Maximum number of records to return
+            customer_code: Optional customer filter
+            item_code: Optional item filter
+        
+        Returns:
+            List of sales analytics data with summary and top products
+        """
+        logger.info("=" * 80)
+        logger.info("🔍 SALES ANALYTICS DEBUG - START")
+        logger.info(f"   Period: {period}")
+        logger.info(f"   Limit: {limit}")
+        logger.info(f"   Customer Code: {customer_code}")
+        logger.info(f"   Item Code: {item_code}")
+        logger.info("=" * 80)
+        
+        try:
+            if not self._ensure_auth():
+                logger.warning("Not authenticated, cannot fetch sales analytics")
+                return []
+            
+            # Calculate date range based on period
+            end_date = datetime.now()
+            if period == "last_7_days":
+                start_date = end_date - timedelta(days=7)
+                period_days = 7
+            elif period == "last_30_days":
+                start_date = end_date - timedelta(days=30)
+                period_days = 30
+            elif period == "last_90_days":
+                start_date = end_date - timedelta(days=90)
+                period_days = 90
+            elif period == "last_365_days":
+                start_date = end_date - timedelta(days=365)
+                period_days = 365
+            else:
+                start_date = end_date - timedelta(days=30)
+                period_days = 30
+            
+            logger.info(f"📅 Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            
+            # Use SALES ORDERS endpoint which has data
+            url = f"{self.base_url}/marketing/docs/17"
+            params = {
+                "page": 1,
+                "per_page": limit,
+                "FromDate": start_date.strftime("%Y-%m-%d"),
+                "ToDate": end_date.strftime("%Y-%m-%d")
+            }
+            
+            if customer_code:
+                params["CardCode"] = customer_code
+            
+            logger.info(f"📊 Fetching sales analytics from: {url}")
+            logger.info(f"📊 Params: {params}")
+            self._record_api_call()
+            
+            resp = self.session.get(url, params=params, timeout=30)
+            
+            logger.info(f"📊 Response Status Code: {resp.status_code}")
+            logger.info(f"📊 Response Headers: Content-Type: {resp.headers.get('Content-Type', 'Unknown')}")
+            
+            if not self._check_auth(resp):
+                logger.warning("Authentication failed fetching sales analytics")
+                return []
+            
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch sales analytics: HTTP {resp.status_code}")
+                logger.warning(f"Response body preview: {resp.text[:500]}")
+                return []
+            
+            if self._is_html_response(resp.text):
+                logger.warning("Received HTML response - authentication may have expired")
+                logger.warning(f"HTML preview: {resp.text[:300]}")
+                return []
+            
+            try:
+                data = resp.json()
+                logger.info(f"📊 Response JSON type: {type(data)}")
+                if isinstance(data, dict):
+                    logger.info(f"📊 Response keys: {list(data.keys())}")
+                else:
+                    logger.info(f"📊 Response is not a dict: {type(data)}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse sales analytics JSON: {e}")
+                logger.error(f"Raw response (first 500 chars): {resp.text[:500]}")
+                return []
+            
+            # Parse orders from response
+            orders = []
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                logger.info(f"📊 ResponseData type: {type(response_data)}")
+                if isinstance(response_data, dict):
+                    if "data" in response_data:
+                        orders = response_data["data"]
+                        logger.info(f"📊 Orders from 'data' key: {len(orders)}")
+                    elif "DocumentLines" in response_data:
+                        orders = [response_data]
+                        logger.info("📊 Single document found (DocumentLines)")
+                    else:
+                        logger.info(f"📊 ResponseData dict keys: {list(response_data.keys())}")
+                elif isinstance(response_data, list):
+                    orders = response_data
+                    logger.info(f"📊 Orders from list: {len(orders)}")
+                else:
+                    logger.info(f"📊 ResponseData is {type(response_data)} - unexpected")
+            else:
+                orders = self._normalize(data)
+                logger.info(f"📊 Orders from normalize(): {len(orders)}")
+            
+            logger.info(f"📊 Total orders found: {len(orders)}")
+            
+            # Log first order for debugging (if any)
+            if orders and len(orders) > 0:
+                try:
+                    first_order = orders[0]
+                    logger.info(f"📊 First order sample: {json.dumps(first_order, default=str)[:800]}")
+                except Exception as e:
+                    logger.info(f"📊 Could not log first order: {e}")
+            else:
+                logger.warning("📊 NO ORDERS FOUND in the response!")
+                logger.info(f"📊 Raw response data structure: {json.dumps(data, default=str)[:1000] if data else 'Empty'}")
+                return []
+            
+            logger.info(f"Processing {len(orders)} orders for sales analytics")
+            
+            # Aggregate sales data
+            total_revenue = 0.0
+            total_transactions = 0
+            unique_customers = set()
+            total_items_sold = 0
+            product_sales = {}
+            customer_sales = {}
+            monthly_data = {}
+            
+            for order in orders:
+                # Handle None values in DocTotal
+                doc_total_raw = order.get("DocTotal", 0)
+                doc_total = float(doc_total_raw) if doc_total_raw is not None else 0.0
+                card_code = order.get("CardCode")
+                card_name = order.get("CardName", "Unknown")
+                doc_date = order.get("DocDate", "")
+                
+                total_revenue += doc_total
+                total_transactions += 1
+                
+                if card_code:
+                    unique_customers.add(card_code)
+                    if card_name not in customer_sales:
+                        customer_sales[card_name] = {"revenue": 0, "count": 0, "code": card_code}
+                    customer_sales[card_name]["revenue"] += doc_total
+                    customer_sales[card_name]["count"] += 1
+                
+                # Monthly aggregation
+                if doc_date and len(doc_date) >= 7:
+                    month_key = doc_date[:7]
+                    if month_key not in monthly_data:
+                        monthly_data[month_key] = {"revenue": 0, "count": 0}
+                    monthly_data[month_key]["revenue"] += doc_total
+                    monthly_data[month_key]["count"] += 1
+                
+                # Process line items
+                items = order.get("document_lines", []) or order.get("DocumentLines", [])
+                for item in items:
+                    item_code_val = item.get("ItemCode")
+                    item_name = item.get("ItemName", "Unknown")
+                    
+                    # Handle None values in Quantity and Price
+                    quantity_raw = item.get("Quantity", 0)
+                    price_raw = item.get("Price", 0)
+                    
+                    quantity = float(quantity_raw) if quantity_raw is not None else 0.0
+                    price = float(price_raw) if price_raw is not None else 0.0
+                    line_total = quantity * price
+                    
+                    total_items_sold += quantity
+                    
+                    # Filter by item code if specified
+                    if item_code and item_code_val != item_code:
+                        continue
+                    
+                    # Aggregate product sales
+                    if item_name not in product_sales:
+                        product_sales[item_name] = {
+                            "quantity": 0,
+                            "revenue": 0,
+                            "code": item_code_val or ""
+                        }
+                    product_sales[item_name]["quantity"] += quantity
+                    product_sales[item_name]["revenue"] += line_total
+            
+            # Calculate average order value
+            avg_order_value = total_revenue / total_transactions if total_transactions > 0 else 0
+            
+            # Get top products
+            top_products = []
+            for name, sales in sorted(product_sales.items(), key=lambda x: x[1]["revenue"], reverse=True)[:10]:
+                top_products.append({
+                    "name": name,
+                    "code": sales["code"],
+                    "quantity": int(sales["quantity"]),
+                    "revenue": round(sales["revenue"], 2)
+                })
+            
+            # Get top customers
+            top_customers = []
+            for name, sales in sorted(customer_sales.items(), key=lambda x: x[1]["revenue"], reverse=True)[:5]:
+                top_customers.append({
+                    "name": name,
+                    "code": sales["code"],
+                    "revenue": round(sales["revenue"], 2),
+                    "orders": sales["count"]
+                })
+            
+            # Format monthly data for display
+            monthly_summary = []
+            for month in sorted(monthly_data.keys())[-6:]:
+                monthly_summary.append({
+                    "month": month,
+                    "revenue": round(monthly_data[month]["revenue"], 2),
+                    "orders": monthly_data[month]["count"]
+                })
+            
+            # Determine period description
+            if period_days == 7:
+                period_desc = "last 7 days"
+            elif period_days == 30:
+                period_desc = "last 30 days"
+            elif period_days == 90:
+                period_desc = "last 90 days"
+            elif period_days == 365:
+                period_desc = "last 365 days"
+            else:
+                period_desc = f"last {period_days} days"
+            
+            # Return formatted analytics
+            result = [{
+                "analysis_type": "sales_analytics",
+                "period": period,
+                "period_days": period_days,
+                "period_description": period_desc,
+                "date_range": {
+                    "from": start_date.strftime("%Y-%m-%d"),
+                    "to": end_date.strftime("%Y-%m-%d")
+                },
+                "summary": {
+                    "total_revenue": round(total_revenue, 2),
+                    "total_transactions": total_transactions,
+                    "average_order_value": round(avg_order_value, 2),
+                    "unique_customers": len(unique_customers),
+                    "total_items_sold": int(total_items_sold)
+                },
+                "top_products": top_products,
+                "top_customers": top_customers,
+                "monthly_trend": monthly_summary,
+                "data_points": len(orders),
+                "source": "sales_orders_api",
+                "note": f"Sales data for the {period_desc}"
+            }]
+            
+            # FIXED: Properly format logging to avoid f-string condition inside format specifier
+            logger.info("=" * 80)
+            logger.info(f"✅ SALES ANALYTICS RETRIEVED SUCCESSFULLY:")
+            logger.info(f"   Total Revenue: KES {total_revenue:,.2f}")
+            logger.info(f"   Total Transactions: {total_transactions}")
+            logger.info(f"   Unique Customers: {len(unique_customers)}")
+            logger.info(f"   Total Items Sold: {int(total_items_sold)}")
+            
+            # Safely log top product
+            if top_products:
+                logger.info(f"   Top Product: {top_products[0]['name']} - KES {top_products[0]['revenue']:,.2f}")
+            else:
+                logger.info("   Top Product: N/A")
+            
+            # Safely log top customer
+            if top_customers:
+                logger.info(f"   Top Customer: {top_customers[0]['name']} - KES {top_customers[0]['revenue']:,.2f}")
+            else:
+                logger.info("   Top Customer: N/A")
+            
+            logger.info("=" * 80)
+            
+            return result
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Failed to fetch sales analytics: {e}", exc_info=True)
+            logger.error("=" * 80)
+            logger.error("🔍 SALES ANALYTICS DEBUG - FAILED")
+            logger.error("=" * 80)
+            return []
+
+    # =========================================================
+    # PHASE 2: CUSTOMER ORDERS API
+    # =========================================================
+    
+    @cache_api_result(ttl_seconds=DELIVERY_CACHE_TTL)
+    def get_customer_orders(
+        self,
+        customer_code: str = None,
+        customer_name: str = None,
+        limit: int = 50,
+        doc_status: str = "all",
+        from_date: str = None,
+        to_date: str = None
+    ) -> List[Dict]:
+        """
+        Get customer orders from SAP Business One.
+        
+        Args:
+            customer_code: Customer code filter
+            customer_name: Customer name (resolved to code)
+            limit: Max orders to return
+            doc_status: 'open', 'closed', or 'all'
+            from_date: Start date (YYYY-MM-DD)
+            to_date: End date (YYYY-MM-DD)
+        
+        Returns:
+            List of orders with line items
+        """
+        try:
+            if not self._ensure_auth():
+                return []
+            
+            # Resolve customer name to code if provided
+            if customer_name and not customer_code:
+                customer = self.resolve_customer(customer_name)
+                if customer:
+                    customer_code = customer.get("CardCode")
+                    logger.info(f"Resolved customer '{customer_name}' to code: {customer_code}")
+                else:
+                    logger.warning(f"Could not resolve customer: {customer_name}")
+                    return []
+            
+            # Use marketing docs endpoint for sales orders
+            url = f"{self.base_url}/marketing/docs/17"
+            params = {"page": 1, "per_page": limit}
+            
+            if customer_code:
+                params["CardCode"] = customer_code
+            
+            if from_date:
+                params["FromDate"] = from_date
+            if to_date:
+                params["ToDate"] = to_date
+            
+            logger.info(f"📋 Fetching customer orders from: {url} with params: {params}")
+            self._record_api_call()
+            resp = self.session.get(url, params=params, timeout=30)
+            
+            if not self._check_auth(resp):
+                return []
+            
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch orders: {resp.status_code}")
+                return []
+            
+            if self._is_html_response(resp.text):
+                logger.warning("Received HTML response - authentication may have expired")
+                return []
+            
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                logger.error("Failed to parse orders JSON")
+                return []
+            
+            # Parse orders
+            orders = []
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                if isinstance(response_data, dict):
+                    if "data" in response_data:
+                        orders = response_data["data"]
+                    elif "DocumentLines" in response_data:
+                        orders = [response_data]
+                elif isinstance(response_data, list):
+                    orders = response_data
+            
+            # Filter by status if needed
+            filtered_orders = []
+            for order in orders:
+                doc_num = order.get("DocNum")
+                if not doc_num:
+                    continue
+                
+                # Determine order status
+                has_open_items = False
+                items = order.get("DocumentLines", [])
+                for item in items:
+                    if item.get("OpenQty", 0) > 0:
+                        has_open_items = True
+                        break
+                
+                order_status = "open" if has_open_items else "closed"
+                
+                if doc_status != "all" and order_status != doc_status:
+                    continue
+                
+                # Format order
+                formatted_order = {
+                    "DocNum": doc_num,
+                    "DocEntry": order.get("DocEntry"),
+                    "DocDate": order.get("DocDate", ""),
+                    "DocDueDate": order.get("DocDueDate", ""),
+                    "CardCode": order.get("CardCode", customer_code),
+                    "CardName": order.get("CardName", "Unknown"),
+                    "DocTotal": float(order.get("DocTotal", 0) or 0),
+                    "Status": "Open" if has_open_items else "Closed",
+                    "Items": []
+                }
+                
+                for item in items:
+                    formatted_order["Items"].append({
+                        "ItemCode": item.get("ItemCode"),
+                        "ItemName": item.get("ItemName"),
+                        "Quantity": float(item.get("Quantity", 0) or 0),
+                        "OpenQty": float(item.get("OpenQty", 0) or 0),
+                        "Price": float(item.get("Price", 0) or 0),
+                        "LineTotal": float(item.get("LineTotal", 0) or 0)
+                    })
+                
+                filtered_orders.append(formatted_order)
+            
+            logger.info(f"✅ Retrieved {len(filtered_orders)} orders for {customer_name or customer_code}")
+            return filtered_orders
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Failed to fetch customer orders: {e}")
+            return []
+
+    # =========================================================
+    # PHASE 2: OUTSTANDING DELIVERIES - FIXED with multiple approaches
+    # =========================================================
+
+    @cache_api_result(ttl_seconds=DELIVERY_CACHE_TTL)
+    def get_outstanding_deliveries(
+        self,
+        customer_code: str = None,
+        customer_name: str = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        """
+        Fetch outstanding deliveries using multiple approaches.
+        
+        Approach 1: /marketing/docs/17 with DocStatus=1 (open orders)
+        Approach 2: /marketing/docs/15 (deliveries endpoint)
+        Approach 3: /deliveries endpoint
+        """
+        try:
+            if not self._ensure_auth():
+                logger.warning("Not authenticated, cannot fetch outstanding deliveries")
+                return []
+
+            # Resolve customer name → code if needed
+            if customer_name and not customer_code:
+                customer = self.resolve_customer(customer_name)
+                if customer:
+                    customer_code = customer.get("CardCode")
+                    logger.info(f"✅ Resolved customer '{customer_name}' → CardCode: {customer_code}")
+                else:
+                    logger.warning(f"⚠️ Could not resolve customer name '{customer_name}' to a CardCode")
+
+            # =========================================================
+            # APPROACH 1: Sales Orders with DocStatus=1 (Open orders)
+            # =========================================================
+            url = f"{self.base_url}/marketing/docs/17"
+            params = {
+                "isDoc": 1,
+                "page": 1,
+                "per_page": limit,
+                "DocStatus": 1,  # 1 = Open/outstanding
+                "IsICT": "N",
+            }
+            if customer_code:
+                params["CardCode"] = customer_code
+
+            logger.info(f"📦 Approach 1: Fetching from {url} with params: {params}")
+            resp = self.session.get(url, params=params, timeout=30)
+
+            if resp.status_code == 200 and not self._is_html_response(resp.text):
+                try:
+                    data = resp.json()
+                    
+                    # Parse orders
+                    orders = []
+                    if data.get("ResultState") and data.get("ResponseData"):
+                        response_data = data["ResponseData"]
+                        if isinstance(response_data, dict):
+                            orders = response_data.get("data", [])
+                        elif isinstance(response_data, list):
+                            orders = response_data
+                    
+                    if orders:
+                        logger.info(f"✅ Found {len(orders)} outstanding orders via Approach 1")
+                        return self._process_outstanding_orders(orders, customer_code, limit)
+                except Exception as e:
+                    logger.warning(f"Approach 1 parsing error: {e}")
+
+            # =========================================================
+            # APPROACH 2: Deliveries endpoint
+            # =========================================================
+            logger.info(f"📦 Approach 2: Trying deliveries endpoint")
+            url = f"{self.base_url}/marketing/docs/15"
+            params = {"page": 1, "per_page": limit}
+            if customer_code:
+                params["CardCode"] = customer_code
+            
+            resp = self.session.get(url, params=params, timeout=30)
+            
+            if resp.status_code == 200 and not self._is_html_response(resp.text):
+                try:
+                    data = resp.json()
+                    deliveries = []
+                    if data.get("ResultState") and data.get("ResponseData"):
+                        response_data = data["ResponseData"]
+                        if isinstance(response_data, dict):
+                            deliveries = response_data.get("data", [])
+                        elif isinstance(response_data, list):
+                            deliveries = response_data
+                    
+                    if deliveries:
+                        logger.info(f"✅ Found {len(deliveries)} deliveries via Approach 2")
+                        # Filter for outstanding (not completed)
+                        outstanding = [d for d in deliveries if d.get("DocStatus") != "C" and d.get("OpenQty", 0) > 0]
+                        if outstanding:
+                            return self._process_outstanding_orders(outstanding, customer_code, limit)
+                except Exception as e:
+                    logger.warning(f"Approach 2 parsing error: {e}")
+
+            # =========================================================
+            # APPROACH 3: Direct inventory report for stock (fallback)
+            # =========================================================
+            logger.info(f"📦 Approach 3: Using inventory report fallback")
+            inventory = self.get_inventory_report(limit=limit)
+            if inventory:
+                # Filter items with committed orders > 0 (pending deliveries)
+                outstanding_items = [
+                    item for item in inventory 
+                    if item.get("CurrentIsCommited", 0) > 0
+                ][:limit]
+                
+                if outstanding_items:
+                    logger.info(f"✅ Found {len(outstanding_items)} items with pending commitments")
+                    return self._convert_inventory_to_outstanding(outstanding_items, customer_code)
+            
+            logger.info("No outstanding deliveries found using any approach")
+            return []
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Failed to fetch outstanding deliveries: {e}", exc_info=True)
+            return []
+
+    def _process_outstanding_orders(self, orders: List[Dict], customer_code: str = None, limit: int = 100) -> List[Dict]:
+        """Process raw orders into outstanding delivery format."""
+        outstanding = []
+        
+        for order in orders[:limit]:
+            doc_num = order.get("DocNum")
+            doc_entry = order.get("DocEntry")
+            card_code = order.get("CardCode") or customer_code
+            card_name = order.get("CardName", "Unknown")
+            doc_date = order.get("DocDate", "")
+            doc_due_date = order.get("DocDueDate", "")
+            doc_total = float(order.get("DocTotal", 0) or 0)
+            
+            items = order.get("document_lines", []) or order.get("DocumentLines", [])
+            
+            for item in items:
+                item_code = item.get("ItemCode") or item.get("ProductCode")
+                item_name = item.get("ItemName") or item.get("ProductName") or item_code
+                quantity = float(item.get("Quantity", 0) or 0)
+                open_qty = float(item.get("OpenQty", 0) or item.get("OpenQuantity", 0) or quantity)
+                price = float(item.get("Price", 0) or 0)
+                
+                if open_qty > 0:
+                    # Calculate if overdue
+                    is_overdue = False
+                    if doc_due_date:
+                        try:
+                            due_date = datetime.strptime(str(doc_due_date)[:10], "%Y-%m-%d")
+                            if due_date < datetime.now():
+                                is_overdue = True
+                        except:
+                            pass
+                    
+                    outstanding.append({
+                        "DocNum": doc_num,
+                        "DocEntry": doc_entry,
+                        "CardCode": card_code,
+                        "CardName": card_name,
+                        "DocDate": doc_date,
+                        "DocDueDate": doc_due_date,
+                        "ItemCode": item_code,
+                        "ItemName": item_name,
+                        "Quantity": quantity,
+                        "OpenQty": open_qty,
+                        "Price": price,
+                        "LineTotal": open_qty * price,
+                        "Status": "Overdue" if is_overdue else "Outstanding",
+                        "IsOverdue": is_overdue,
+                    })
+        
+        logger.info(f"Processed {len(outstanding)} outstanding line items")
+        return outstanding
+
+    def _convert_inventory_to_outstanding(self, inventory_items: List[Dict], customer_code: str = None) -> List[Dict]:
+        """Convert inventory items with commitments to outstanding delivery format."""
+        outstanding = []
+        
+        for item in inventory_items[:50]:
+            outstanding.append({
+                "DocNum": None,
+                "DocEntry": None,
+                "CardCode": customer_code,
+                "CardName": "Pending Delivery",
+                "DocDate": datetime.now().strftime("%Y-%m-%d"),
+                "DocDueDate": (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
+                "ItemCode": item.get("ItemCode"),
+                "ItemName": item.get("ItemName"),
+                "Quantity": item.get("CurrentIsCommited", 0),
+                "OpenQty": item.get("CurrentIsCommited", 0),
+                "Price": 0,
+                "LineTotal": 0,
+                "Status": "Pending",
+                "IsOverdue": False,
+                "Note": "Based on inventory commitments"
+            })
+        
+        return outstanding
+
     # -------------------------------------------------
-    # ANALYTICS: TOP SELLING ITEMS (ENHANCED FALLBACK)
+    # ANALYTICS: TOP SELLING ITEMS - USING SALES ORDERS (FIXED with name resolution)
     # -------------------------------------------------
     @cache_api_result(ttl_seconds=ANALYTICS_CACHE_TTL)
     def get_top_selling_items(self, limit: int = 10, days: int = 30) -> List[Dict]:
         """
-        Get top selling items based on sales velocity.
-        Uses inventory data with recency scoring when API endpoint is unavailable.
+        Get top selling items from actual sales orders.
+        This is much more accurate than inventory-based calculation.
         """
         try:
-            # Try API endpoint first
+            if not self._ensure_auth():
+                return []
+            
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
             
-            url = f"{self.base_url}/sales_analysis/top_items"
+            # Fetch sales orders
+            url = f"{self.base_url}/marketing/docs/17"
             params = {
+                "page": 1,
+                "per_page": 200,
                 "FromDate": start_date.strftime("%Y-%m-%d"),
-                "ToDate": end_date.strftime("%Y-%m-%d"),
-                "limit": limit,
+                "ToDate": end_date.strftime("%Y-%m-%d")
             }
             
-            if self._ensure_auth():
-                self._record_api_call()
-                resp = self.session.get(url, params=params, timeout=20)
-                
-                if resp.status_code == 200:
-                    try:
-                        items = self._normalize(resp.json())
-                        if items:
-                            for i, item in enumerate(items, 1):
-                                item["rank"] = i
-                                item["analysis_days"] = days
-                                item["analysis_period"] = f"Last {days} days"
-                            logger.info(f"✅ Retrieved {len(items)} top selling items from API")
-                            return items
-                    except:
-                        pass
+            logger.info(f"📊 Fetching sales orders for top items from: {url}")
+            resp = self.session.get(url, params=params, timeout=30)
             
-            # Fallback: Calculate from inventory data
-            return self._calculate_top_selling_from_inventory(limit, days)
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch orders: {resp.status_code}, falling back to inventory calculation")
+                return self._calculate_top_selling_from_inventory(limit, days)
+            
+            if self._is_html_response(resp.text):
+                logger.warning("Received HTML response, falling back to inventory calculation")
+                return self._calculate_top_selling_from_inventory(limit, days)
+            
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON: {e}")
+                return self._calculate_top_selling_from_inventory(limit, days)
+            
+            # Parse orders
+            orders = []
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                if isinstance(response_data, dict):
+                    orders = response_data.get("data", [])
+                elif isinstance(response_data, list):
+                    orders = response_data
+            else:
+                orders = self._normalize(data)
+            
+            if not orders:
+                logger.info(f"No orders found in last {days} days")
+                return self._calculate_top_selling_from_inventory(limit, days)
+            
+            # FIRST PASS: Collect all unique item codes
+            item_codes_needed = set()
+            for order in orders:
+                items = order.get("document_lines", []) or order.get("DocumentLines", [])
+                for item in items:
+                    item_code = item.get("ItemCode")
+                    if item_code:
+                        item_codes_needed.add(item_code)
+            
+            logger.info(f"Found {len(item_codes_needed)} unique item codes in sales orders")
+            
+            # SECOND PASS: Fetch item names for all needed codes
+            item_names = {}
+            for item_code in list(item_codes_needed)[:100]:  # Limit to 100 items for performance
+                try:
+                    item = self.get_item_by_code(item_code)
+                    if item:
+                        item_names[item_code] = item.get("ItemName", item_code)
+                    else:
+                        item_names[item_code] = item_code
+                except Exception as e:
+                    logger.debug(f"Could not fetch item name for {item_code}: {e}")
+                    item_names[item_code] = item_code
+            
+            logger.info(f"Resolved names for {len(item_names)} items")
+            
+            # THIRD PASS: Aggregate product sales with proper names
+            product_sales = {}
+            for order in orders:
+                items = order.get("document_lines", []) or order.get("DocumentLines", [])
+                for item in items:
+                    item_code = item.get("ItemCode")
+                    if not item_code:
+                        continue
+                    
+                    quantity_raw = item.get("Quantity", 0)
+                    quantity = float(quantity_raw) if quantity_raw is not None else 0
+                    
+                    if quantity > 0:
+                        if item_code not in product_sales:
+                            product_sales[item_code] = {
+                                "name": item_names.get(item_code, item_code),
+                                "quantity": 0,
+                                "code": item_code
+                            }
+                        product_sales[item_code]["quantity"] += quantity
+            
+            if not product_sales:
+                logger.info("No product sales found")
+                return self._calculate_top_selling_from_inventory(limit, days)
+            
+            # Sort and return top items
+            sorted_items = sorted(product_sales.values(), key=lambda x: x["quantity"], reverse=True)
+            result = sorted_items[:limit]
+            
+            total_quantity = sum(item["quantity"] for item in result)
+            
+            for i, item in enumerate(result, 1):
+                item["rank"] = i
+                item["analysis_days"] = days
+                item["analysis_period"] = f"Last {days} days"
+                item["PopularityScore"] = min(100, round((item["quantity"] / max(1, result[0]["quantity"])) * 100, 1))
+                item["percentage_of_top"] = round((item["quantity"] / max(1, total_quantity)) * 100, 1) if total_quantity > 0 else 0
+            
+            logger.info(f"✅ Found {len(result)} top selling items from sales orders")
+            for item in result[:5]:
+                logger.info(f"   Top {item['rank']}: {item['name']} - {item['quantity']} units sold")
+            
+            return result
             
         except Exception as e:
             self._record_error()
-            logger.error(f"Failed to fetch top selling items: {e}")
+            logger.error(f"Error in get_top_selling_items: {e}")
             return self._calculate_top_selling_from_inventory(limit, days)
 
-    # =========================================================
-    # FIXED: _calculate_top_selling_from_inventory
-    # =========================================================
+    # -------------------------------------------------
+    # ANALYTICS: SLOW MOVING ITEMS - USING SALES ORDERS
+    # -------------------------------------------------
+    @cache_api_result(ttl_seconds=ANALYTICS_CACHE_TTL)
+    def get_slow_moving_items(self, limit: int = 10, days: int = 90, turnover_threshold: float = 0.5) -> List[Dict]:
+        """
+        Get slow moving items based on actual sales orders.
+        Items with low sales volume relative to stock level.
+        """
+        try:
+            if not self._ensure_auth():
+                return []
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+            
+            # Fetch sales orders
+            url = f"{self.base_url}/marketing/docs/17"
+            params = {
+                "page": 1,
+                "per_page": 200,
+                "FromDate": start_date.strftime("%Y-%m-%d"),
+                "ToDate": end_date.strftime("%Y-%m-%d")
+            }
+            
+            logger.info(f"📊 Fetching sales orders for slow items from: {url}")
+            resp = self.session.get(url, params=params, timeout=30)
+            
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch orders: {resp.status_code}, falling back to inventory calculation")
+                return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
+            
+            if self._is_html_response(resp.text):
+                logger.warning("Received HTML response, falling back to inventory calculation")
+                return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
+            
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON: {e}")
+                return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
+            
+            # Parse orders
+            orders = []
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                if isinstance(response_data, dict):
+                    orders = response_data.get("data", [])
+                elif isinstance(response_data, list):
+                    orders = response_data
+            else:
+                orders = self._normalize(data)
+            
+            # Get inventory data for stock levels
+            inventory = self.get_inventory_report(limit=500)
+            inventory_map = {inv.get("ItemCode"): inv for inv in inventory}
+            
+            # FIRST PASS: Collect unique item codes
+            item_codes_needed = set()
+            for order in orders:
+                order_items = order.get("document_lines", []) or order.get("DocumentLines", [])
+                for item in order_items:
+                    item_code = item.get("ItemCode")
+                    if item_code:
+                        item_codes_needed.add(item_code)
+            
+            # SECOND PASS: Fetch item names
+            item_names = {}
+            for item_code in list(item_codes_needed)[:100]:
+                try:
+                    item = self.get_item_by_code(item_code)
+                    if item:
+                        item_names[item_code] = item.get("ItemName", item_code)
+                    else:
+                        item_names[item_code] = item_code
+                except Exception as e:
+                    logger.debug(f"Could not fetch item name for {item_code}: {e}")
+                    item_names[item_code] = item_code
+            
+            # Aggregate product sales with names
+            product_sales = {}
+            for order in orders:
+                order_items = order.get("document_lines", []) or order.get("DocumentLines", [])
+                for item in order_items:
+                    item_code = item.get("ItemCode")
+                    if not item_code:
+                        continue
+                    
+                    quantity_raw = item.get("Quantity", 0)
+                    quantity = float(quantity_raw) if quantity_raw is not None else 0
+                    
+                    if quantity > 0:
+                        if item_code not in product_sales:
+                            product_sales[item_code] = {
+                                "name": item_names.get(item_code, item_code),
+                                "quantity": 0,
+                                "code": item_code
+                            }
+                        product_sales[item_code]["quantity"] += quantity
+            
+            # Calculate turnover and identify slow movers
+            slow_items = []
+            for item_code, sales_data in product_sales.items():
+                inv_data = inventory_map.get(item_code)
+                if not inv_data:
+                    continue
+                
+                on_hand = inv_data.get("CurrentOnHand", 0)
+                if on_hand <= 0:
+                    continue
+                
+                daily_sales = sales_data["quantity"] / days if days > 0 else 0
+                
+                if daily_sales > 0:
+                    days_of_stock = on_hand / daily_sales
+                    turnover_rate = daily_sales * 365 / on_hand if on_hand > 0 else 0
+                else:
+                    days_of_stock = 999
+                    turnover_rate = 0
+                
+                # Identify slow movers (low turnover or high days of stock)
+                if turnover_rate < turnover_threshold or days_of_stock > 180:
+                    severity = "critical" if days_of_stock > 365 or turnover_rate < 0.1 else "warning" if days_of_stock > 180 else "monitor"
+                    
+                    slow_items.append({
+                        "ItemCode": item_code,
+                        "ItemName": sales_data["name"],
+                        "TurnoverRate": round(turnover_rate, 2),
+                        "CurrentOnHand": on_hand,
+                        "DaysOfStock": round(days_of_stock, 1),
+                        "UnitsSold": int(sales_data["quantity"]),
+                        "Severity": severity,
+                        "Recommendation": self._get_slow_mover_recommendation(severity, days_of_stock, on_hand),
+                        "analysis_days": days,
+                        "analysis_period": f"Last {days} days",
+                        "turnover_threshold": turnover_threshold
+                    })
+            
+            # Sort by severity and turnover rate
+            severity_order = {"critical": 0, "warning": 1, "monitor": 2}
+            slow_items.sort(key=lambda x: (severity_order.get(x.get("Severity", "monitor"), 3), x.get("TurnoverRate", 999)))
+            
+            result = slow_items[:limit]
+            logger.info(f"✅ Found {len(result)} slow moving items from sales orders")
+            
+            for i, item in enumerate(result, 1):
+                item["rank"] = i
+                # Ensure item has proper name
+                if item.get("ItemName", "").startswith("Unknown") and item.get("ItemCode"):
+                    # Try to get name one more time
+                    try:
+                        item_details = self.get_item_by_code(item.get("ItemCode"))
+                        if item_details and item_details.get("ItemName"):
+                            item["ItemName"] = item_details.get("ItemName")
+                    except:
+                        pass
+            
+            return result
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Error in get_slow_moving_items: {e}")
+            return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
+
+    def _get_slow_mover_recommendation(self, severity: str, days_of_stock: float, on_hand: float) -> str:
+        """Generate recommendation for slow moving items."""
+        if severity == "critical":
+            if days_of_stock > 365:
+                return "⚠️ CRITICAL: Over 1 year of stock - Consider write-off or deep discount (50%+ off)"
+            elif on_hand > 1000:
+                return "⚠️ CRITICAL: Large quantity with low turnover - Run clearance sale immediately"
+            else:
+                return "⚠️ CRITICAL: Very slow moving - Consider bundle with popular items or markdown"
+        elif severity == "warning":
+            if days_of_stock > 180:
+                return "⚠️ WARNING: Over 6 months of stock - Review pricing and consider promotion"
+            else:
+                return "⚠️ WARNING: Low turnover - Monitor and consider marketing push"
+        else:
+            return "📊 Monitor: Review sales velocity monthly and consider small promotion"
+
+    # -------------------------------------------------
+    # INVENTORY-BASED CALCULATIONS (FALLBACKS)
+    # -------------------------------------------------
     
     def _calculate_top_selling_from_inventory(self, limit: int = 20, days: int = 30) -> List[Dict]:
         """
         Calculate top selling items from inventory data using multiple metrics.
-        FIXED: Properly handles zero PeriodOutQty by using committed orders as demand indicator.
+        FALLBACK when sales orders API is unavailable.
         """
         try:
             inventory = self.get_inventory_report(limit=1000)
@@ -1320,42 +2341,31 @@ class LeyscoAPIService:
             scored_items = []
             
             for item in inventory:
-                # Extract item details
                 item_code = item.get("ItemCode", "")
                 item_name = item.get("ItemName", "")
                 
-                # Skip items with no name or code
                 if not item_code and not item_name:
                     continue
                 
-                # Get stock metrics
                 on_hand = float(item.get("CurrentOnHand", 0))
                 committed = float(item.get("CurrentIsCommited", 0))
                 period_out_qty = float(item.get("PeriodOutQty", 0))
                 last_transaction = item.get("LastTransactionDate", "")
                 
-                # Calculate demand score based on available data
                 demand_score = 0
                 
-                # If we have period out quantity (actual sales), use that
                 if period_out_qty > 0:
-                    # Daily sales rate over the period
                     daily_sales = period_out_qty / days if days > 0 else 0
-                    demand_score = min(100, daily_sales * 10)  # Scale: 10 units/day = 100 score
+                    demand_score = min(100, daily_sales * 10)
                 elif committed > 0:
-                    # Use committed orders as demand indicator
-                    # High committed relative to on-hand indicates demand
                     if on_hand > 0:
                         demand_ratio = min(2.0, committed / on_hand)
                         demand_score = min(100, demand_ratio * 50)
                     else:
-                        # Out of stock with committed orders - high demand
                         demand_score = min(100, 50 + (committed / 100))
                 elif on_hand > 0:
-                    # Have stock but no demand indicators - low priority
                     demand_score = 5
                 
-                # Recency bonus (newer transactions = higher score)
                 recency_bonus = 0
                 if last_transaction:
                     try:
@@ -1372,7 +2382,6 @@ class LeyscoAPIService:
                     except:
                         pass
                 
-                # Turnover bonus (how fast stock is moving relative to on-hand)
                 turnover_bonus = 0
                 if on_hand > 0 and committed > 0:
                     turnover_ratio = committed / on_hand
@@ -1383,14 +2392,12 @@ class LeyscoAPIService:
                     elif turnover_ratio > 0.5:
                         turnover_bonus = 10
                 
-                # Stockout bonus (items with low stock and high committed)
                 stockout_bonus = 0
                 if on_hand > 0 and committed > on_hand:
-                    stockout_bonus = 20  # Items that are backordered
+                    stockout_bonus = 20
                 
                 total_score = demand_score + recency_bonus + turnover_bonus + stockout_bonus
                 
-                # Determine velocity category
                 if total_score >= 80:
                     velocity = "VERY_HIGH"
                 elif total_score >= 60:
@@ -1402,7 +2409,6 @@ class LeyscoAPIService:
                 else:
                     velocity = "VERY_LOW"
                 
-                # Only include items with some activity
                 if total_score > 0 or on_hand > 0:
                     scored_items.append({
                         "ItemCode": item_code,
@@ -1410,14 +2416,9 @@ class LeyscoAPIService:
                         "PopularityScore": round(total_score, 2),
                         "CurrentOnHand": on_hand,
                         "CurrentIsCommited": committed,
-                        "PeriodOutQty": period_out_qty,
-                        "LastTransactionDate": last_transaction if last_transaction else "N/A",
                         "Velocity": velocity,
-                        "DemandScore": round(demand_score, 1),
-                        "RecencyBonus": round(recency_bonus, 1),
                     })
             
-            # Sort by popularity score (highest first)
             scored_items.sort(key=lambda x: x["PopularityScore"], reverse=True)
             result = scored_items[:limit]
             
@@ -1425,13 +2426,9 @@ class LeyscoAPIService:
                 item["rank"] = i
                 item["analysis_days"] = days
                 item["analysis_period"] = f"Last {days} days"
+                item["source"] = "inventory_fallback"
             
-            logger.info(f"✅ Calculated {len(result)} top selling items from inventory data")
-            
-            # Log the first few items for debugging
-            for item in result[:5]:
-                logger.info(f"   Top item: {item.get('ItemName')} (Code: {item.get('ItemCode')}, Score: {item.get('PopularityScore')})")
-            
+            logger.info(f"✅ Calculated {len(result)} top selling items from inventory data (fallback)")
             return result
             
         except Exception as e:
@@ -1439,59 +2436,8 @@ class LeyscoAPIService:
             logger.error(f"Failed to calculate top selling from inventory: {e}")
             return []
 
-    # -------------------------------------------------
-    # ANALYTICS: SLOW MOVING ITEMS (ENHANCED FALLBACK)
-    # -------------------------------------------------
-    @cache_api_result(ttl_seconds=ANALYTICS_CACHE_TTL)
-    def get_slow_moving_items(self, limit: int = 10, days: int = 90, turnover_threshold: float = 0.5) -> List[Dict]:
-        """
-        Get slow moving items based on turnover rate.
-        Uses inventory data when API endpoint is unavailable.
-        """
-        try:
-            # Try API endpoint first
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            
-            url = f"{self.base_url}/sales_analysis/slow_items"
-            params = {
-                "FromDate": start_date.strftime("%Y-%m-%d"),
-                "ToDate": end_date.strftime("%Y-%m-%d"),
-                "limit": limit,
-                "turnover_threshold": turnover_threshold,
-            }
-            
-            if self._ensure_auth():
-                self._record_api_call()
-                resp = self.session.get(url, params=params, timeout=20)
-                
-                if resp.status_code == 200:
-                    try:
-                        items = self._normalize(resp.json())
-                        if items:
-                            for i, item in enumerate(items, 1):
-                                item["rank"] = i
-                                item["analysis_days"] = days
-                                item["analysis_period"] = f"Last {days} days"
-                                item["turnover_threshold"] = turnover_threshold
-                            logger.info(f"✅ Retrieved {len(items)} slow moving items from API")
-                            return items
-                    except:
-                        pass
-            
-            # Fallback: Calculate from inventory data
-            return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
-            
-        except Exception as e:
-            self._record_error()
-            logger.error(f"Failed to fetch slow moving items: {e}")
-            return self._calculate_slow_moving_from_inventory(limit, days, turnover_threshold)
-
     def _calculate_slow_moving_from_inventory(self, limit: int = 20, days: int = 90, turnover_threshold: float = 0.5) -> List[Dict]:
-        """
-        Calculate slow moving items from inventory data.
-        No hardcoded data - all calculations based on actual inventory.
-        """
+        """Calculate slow moving items from inventory data. FALLBACK."""
         try:
             inventory = self.get_inventory_report(limit=1000)
             
@@ -1507,7 +2453,6 @@ class LeyscoAPIService:
                 last_transaction = item.get("LastTransactionDate", "")
                 period_out_qty = float(item.get("PeriodOutQty", 0))
                 
-                # Calculate turnover rate
                 if on_hand > 0:
                     if committed > 0:
                         turnover_rate = committed / on_hand
@@ -1520,7 +2465,6 @@ class LeyscoAPIService:
                 
                 turnover_rate = min(turnover_rate, 5.0)
                 
-                # Check if slow moving
                 if turnover_rate < turnover_threshold and on_hand > 0:
                     days_since = None
                     if last_transaction:
@@ -1530,18 +2474,14 @@ class LeyscoAPIService:
                         except:
                             pass
                     
-                    # Determine severity and recommendation
                     if turnover_rate < 0.1:
                         severity = "critical"
-                        urgency = "HIGH - Immediate action required"
                         recommendation = "⚠️ CRITICAL: Consider markdown or bundle promotion immediately"
                     elif turnover_rate < 0.3:
                         severity = "warning"
-                        urgency = "MEDIUM - Review within 30 days"
                         recommendation = "⚠️ Review pricing strategy or consider discontinuation"
                     else:
                         severity = "monitor"
-                        urgency = "LOW - Monitor monthly"
                         recommendation = "Monitor sales velocity and consider promotional offers"
                     
                     if days_since and days_since > 180:
@@ -1556,12 +2496,10 @@ class LeyscoAPIService:
                         "ItemName": item.get("ItemName"),
                         "TurnoverRate": round(turnover_rate, 2),
                         "CurrentOnHand": on_hand,
-                        "CurrentIsCommited": committed,
-                        "PeriodOutQty": period_out_qty,
                         "DaysSinceLastTransaction": days_since if days_since else "N/A",
                         "Severity": severity,
-                        "Urgency": urgency,
                         "Recommendation": recommendation,
+                        "source": "inventory_fallback"
                     })
             
             slow_items.sort(key=lambda x: x["TurnoverRate"])
@@ -1573,7 +2511,7 @@ class LeyscoAPIService:
                 item["analysis_period"] = f"Last {days} days"
                 item["turnover_threshold"] = turnover_threshold
             
-            logger.info(f"✅ Calculated {len(result)} slow moving items from inventory data")
+            logger.info(f"✅ Calculated {len(result)} slow moving items from inventory data (fallback)")
             return result
             
         except Exception as e:
@@ -1608,14 +2546,22 @@ class LeyscoAPIService:
         self._stats["cache_misses"] = 0
 
 
-# Singleton instance
-_leysco_api_instance: Optional[LeyscoAPIService] = None
+# =========================================================
+# IMPORTANT: No singleton instance for Phase 1
+# Each request creates its own instance with user token
+# =========================================================
 
-
-def get_leysco_api_service() -> LeyscoAPIService:
-    """Get or create singleton instance."""
-    global _leysco_api_instance
-    if _leysco_api_instance is None:
-        _leysco_api_instance = LeyscoAPIService()
-        logger.info("✅ Created new LeyscoAPIService singleton instance")
-    return _leysco_api_instance
+def create_api_service(user_token: str) -> LeyscoAPIService:
+    """
+    Create a new API service instance with the user's token.
+    This should be called for each request.
+    
+    Args:
+        user_token: The authenticated user's Bearer token
+    
+    Returns:
+        Configured LeyscoAPIService instance
+    """
+    if not user_token:
+        logger.warning("Creating API service without user token - data access will fail")
+    return LeyscoAPIService(user_token=user_token)

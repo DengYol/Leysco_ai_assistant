@@ -3,6 +3,10 @@ app/services/customer_orders_service.py
 ========================================
 Customer Orders Service - Handles customer order operations
 Optimized with caching and async support
+
+FIXED: Properly uses API's get_customer_orders method
+FIXED: Enhanced customer resolution with logging
+FIXED: Better error handling and empty result returns
 """
 
 import logging
@@ -38,7 +42,7 @@ def cache_orders(ttl_seconds: int = ORDERS_CACHE_TTL, key_prefix: str = ""):
             # Check cache
             cached = cache.get(cache_key, {}, "")
             if cached is not None:
-                logger.info(f"📦 Orders cache hit: {func.__name__}")
+                logger.debug(f"📦 Orders cache hit: {func.__name__}")
                 return cached.get("data")
             
             # Execute function
@@ -93,7 +97,7 @@ class CustomerOrdersService:
         self._stats["errors"] += 1
 
     # =========================================================
-    # CORE ORDER METHODS (Optimized)
+    # CORE ORDER METHODS (FIXED)
     # =========================================================
 
     @cache_orders(ttl_seconds=ORDERS_CACHE_TTL)
@@ -101,8 +105,8 @@ class CustomerOrdersService:
         self,
         customer_name: str,
         limit: int = 10,
-        doc_status: str = "open",
-        include_details: bool = True
+        doc_status: str = "all",
+        include_details: bool = False
     ) -> List[Dict]:
         """
         Get orders for a specific customer.
@@ -112,7 +116,7 @@ class CustomerOrdersService:
             customer_name: Name of the customer
             limit: Maximum number of orders to return
             doc_status: Order status ('open', 'closed', 'all')
-            include_details: Whether to include line items
+            include_details: Whether to include line items (default False for performance)
         
         Returns:
             List of orders with details
@@ -121,40 +125,71 @@ class CustomerOrdersService:
             self._record_api_call()
             logger.info(f"📋 Fetching orders for customer: {customer_name}")
             
-            # Resolve customer
+            if not customer_name:
+                logger.warning("No customer name provided")
+                return []
+            
+            # First resolve customer to get CardCode
             customer = self.api.resolve_customer(customer_name)
             if not customer:
-                logger.warning(f"⚠️ Customer '{customer_name}' not found")
-                return []
+                logger.warning(f"⚠️ Customer '{customer_name}' not found - checking partial match")
+                # Try partial match search
+                customers = self.api.get_customers(search=customer_name, limit=5)
+                if customers:
+                    customer = customers[0]
+                    logger.info(f"✅ Found customer via partial match: {customer.get('CardName')}")
+                else:
+                    logger.warning(f"⚠️ No customer found for '{customer_name}'")
+                    return []
+            
+            customer_code = customer.get("CardCode")
+            customer_name_display = customer.get("CardName", customer_name)
+            logger.info(f"✅ Resolved customer: {customer_name_display} (Code: {customer_code})")
             
             # Get orders from API
             orders = self.api.get_customer_orders(
-                customer_name=customer.get("CardName"),
+                customer_code=customer_code,
                 limit=limit,
                 doc_status=doc_status,
-                include_details=include_details
+                from_date=None,
+                to_date=None
             )
             
-            # Enhance orders with additional info
+            if not orders:
+                logger.info(f"No orders found for {customer_name_display}")
+                
+                # Return helpful message as empty list with note
+                return []  # The UI will handle empty result
+            
+            # Enhance orders with additional info (without line items for performance)
             enhanced_orders = []
             for order in orders:
                 enhanced_order = self._enhance_order(order, customer)
+                
+                # Remove line items if not requested (for performance)
+                if not include_details and "Items" in enhanced_order:
+                    del enhanced_order["Items"]
+                elif "Items" in enhanced_order:
+                    # Limit line items to first 5 for performance
+                    enhanced_order["Items"] = enhanced_order["Items"][:5]
+                    enhanced_order["ItemsCount"] = len(order.get("Items", []))
+                
                 enhanced_orders.append(enhanced_order)
             
-            logger.info(f"✅ Found {len(enhanced_orders)} orders for {customer.get('CardName')}")
+            logger.info(f"✅ Found {len(enhanced_orders)} orders for {customer_name_display}")
             return enhanced_orders
             
         except Exception as e:
             self._record_error()
-            logger.error(f"❌ Error fetching customer orders: {e}")
+            logger.error(f"❌ Error fetching customer orders: {e}", exc_info=True)
             return []
 
     async def get_customer_orders_async(
         self,
         customer_name: str,
         limit: int = 10,
-        doc_status: str = "open",
-        include_details: bool = True
+        doc_status: str = "all",
+        include_details: bool = False
     ) -> List[Dict]:
         """Async version of get_customer_orders."""
         return await asyncio.to_thread(
@@ -177,21 +212,34 @@ class CustomerOrdersService:
             self._record_api_call()
             logger.info(f"🔍 Fetching order #{order_number}")
             
-            # Get order by document ID
-            order = self.api.get_document_by_id(order_number, doc_type=17)
+            # First try to find in customer orders
+            order = None
+            
+            # Look for order in recent orders
+            recent_orders = self.get_recent_orders(days=90, limit=200)
+            for o in recent_orders:
+                if str(o.get("DocNum")) == str(order_number):
+                    order = o
+                    break
             
             if order:
-                # Enhance with additional info
-                order = self._enhance_order(order, {})
-                
-                # Format line items
-                if order.get("DocumentLines"):
-                    for line in order["DocumentLines"]:
-                        line["LineTotalFormatted"] = f"KES {float(line.get('LineTotal', 0)):,.2f}"
-                        line["UnitPriceFormatted"] = f"KES {float(line.get('UnitPrice', 0)):,.2f}"
-                
-                logger.info(f"✅ Found order #{order_number}")
-                return order
+                logger.info(f"✅ Found order #{order_number} in recent orders")
+                return self._enhance_order(order, {})
+            
+            # Try to get by document number via API
+            try:
+                # Search for document by number
+                documents = self.api.search_documents(
+                    doc_type=17,  # Sales Orders
+                    doc_num=order_number,
+                    per_page=1
+                )
+                if documents:
+                    order = documents[0]
+                    logger.info(f"✅ Found order #{order_number} via API search")
+                    return self._enhance_order(order, {})
+            except Exception as e:
+                logger.debug(f"Could not search documents by number: {e}")
             
             logger.warning(f"⚠️ Order #{order_number} not found")
             return None
@@ -225,24 +273,40 @@ class CustomerOrdersService:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
             
-            # Search for documents (type 17 = Sales Orders)
-            orders = self.api.search_documents(
-                doc_type=17,
-                date_from=start_date.strftime("%Y-%m-%d"),
-                date_to=end_date.strftime("%Y-%m-%d"),
-                per_page=limit
-            )
+            # Use get_customer_orders with all customers approach
+            # Get customers first to fetch their recent orders
+            customers = self.api.get_customers(limit=50)
+            
+            all_orders = []
+            for customer in customers[:30]:  # Limit to 30 customers for performance
+                try:
+                    customer_code = customer.get("CardCode")
+                    orders = self.api.get_customer_orders(
+                        customer_code=customer_code,
+                        limit=10,
+                        doc_status="all"
+                    )
+                    
+                    for order in orders:
+                        doc_date_str = order.get("DocDate")
+                        if doc_date_str:
+                            try:
+                                doc_date = datetime.strptime(doc_date_str[:10], "%Y-%m-%d")
+                                if doc_date >= start_date:
+                                    all_orders.append(order)
+                            except:
+                                pass
+                except Exception as e:
+                    logger.debug(f"Error fetching orders for customer {customer.get('CardName')}: {e}")
+                    continue
+            
+            # Sort by date (newest first) and limit
+            all_orders.sort(key=lambda x: x.get("DocDate", ""), reverse=True)
+            recent_orders = all_orders[:limit]
             
             # Enhance each order
             enhanced_orders = []
-            for order in orders:
-                # Get customer info
-                customer_code = order.get("CardCode")
-                if customer_code:
-                    customer = self.api.get_customer_by_code(customer_code)
-                    if customer:
-                        order["CustomerName"] = customer.get("CardName")
-                
+            for order in recent_orders:
                 enhanced_orders.append(self._enhance_order(order, {}))
             
             logger.info(f"✅ Found {len(enhanced_orders)} recent orders")
@@ -275,11 +339,12 @@ class CustomerOrdersService:
         """
         try:
             self._record_api_call()
-            orders = self.get_customer_orders(customer_name, limit=100, doc_status="all")
+            orders = self.get_customer_orders(customer_name, limit=100, doc_status="all", include_details=False)
             
             if not orders:
                 return {
                     "customer": customer_name,
+                    "found": False,
                     "total_orders": 0,
                     "total_value": 0,
                     "average_order_value": 0,
@@ -297,9 +362,10 @@ class CustomerOrdersService:
             
             return {
                 "customer": customer_name,
+                "found": True,
                 "total_orders": len(orders),
-                "total_value": total_value,
-                "average_order_value": total_value / len(orders) if orders else 0,
+                "total_value": round(total_value, 2),
+                "average_order_value": round(total_value / len(orders) if orders else 0, 2),
                 "open_orders": open_orders,
                 "closed_orders": closed_orders,
                 "recent_orders": [
@@ -316,7 +382,7 @@ class CustomerOrdersService:
         except Exception as e:
             self._record_error()
             logger.error(f"❌ Error calculating order summary: {e}")
-            return {"error": str(e), "customer": customer_name}
+            return {"error": str(e), "customer": customer_name, "found": False}
 
     async def get_order_summary_async(self, customer_name: str) -> Dict[str, Any]:
         """Async version of get_order_summary."""
@@ -338,22 +404,12 @@ class CustomerOrdersService:
             self._record_api_call()
             order = self.get_order_details(order_number)
             if order:
-                items = order.get("DocumentLines", [])
+                items = order.get("Items", [])
                 
-                # Enhance items with price info (batch pricing for efficiency)
-                if items:
-                    # Batch fetch prices for all items
-                    item_codes = [item.get("ItemCode") for item in items if item.get("ItemCode")]
-                    if item_codes:
-                        # Use pricing service to get prices in batch
-                        price_map = self._batch_get_prices(item_codes)
-                        
-                        for item in items:
-                            item_code = item.get("ItemCode")
-                            if item_code:
-                                price_data = price_map.get(item_code, {})
-                                item["CurrentPrice"] = price_data.get("price")
-                                item["PriceDifference"] = item.get("UnitPrice", 0) - price_data.get("price", 0) if price_data.get("price") else None
+                # Enhance items with formatted values
+                for item in items:
+                    item["LineTotalFormatted"] = f"KES {float(item.get('LineTotal', 0)):,.2f}"
+                    item["PriceFormatted"] = f"KES {float(item.get('Price', 0)):,.2f}"
                 
                 return items
             
@@ -369,7 +425,7 @@ class CustomerOrdersService:
         return await asyncio.to_thread(self.get_order_items, order_number)
 
     # =========================================================
-    # BATCH OPERATIONS (NEW)
+    # BATCH OPERATIONS
     # =========================================================
 
     def get_multiple_order_details(self, order_numbers: List[str]) -> Dict[str, Dict]:
@@ -440,42 +496,63 @@ class CustomerOrdersService:
     
     def _enhance_order(self, order: Dict, customer: Dict) -> Dict:
         """Enhance order with additional calculated fields."""
-        enhanced = order.copy()
+        enhanced = {
+            "DocNum": order.get("DocNum"),
+            "DocEntry": order.get("DocEntry"),
+            "DocDate": order.get("DocDate"),
+            "DocDueDate": order.get("DocDueDate"),
+            "DocTotal": float(order.get("DocTotal", 0)),
+            "CardCode": order.get("CardCode"),
+            "CardName": order.get("CardName", "Unknown"),
+        }
         
-        # Add customer info
+        # Add customer info from provided customer
         if customer:
-            enhanced["CustomerName"] = customer.get("CardName")
-            enhanced["CustomerCode"] = customer.get("CardCode")
-        
-        # Calculate order totals if not present
-        if "DocTotal" not in enhanced and enhanced.get("DocumentLines"):
-            total = sum(
-                float(line.get("LineTotal", 0))
-                for line in enhanced.get("DocumentLines", [])
-            )
-            enhanced["DocTotal"] = total
+            enhanced["CustomerName"] = customer.get("CardName", enhanced["CardName"])
+            enhanced["CustomerCode"] = customer.get("CardCode", enhanced["CardCode"])
         
         # Add status text
-        doc_status = enhanced.get("DocStatus")
-        if doc_status in [1, "1", "bost_Open"]:
+        doc_status = order.get("DocStatus") or order.get("Status")
+        if doc_status in [1, "1", "bost_Open", "Open", "open", "O", "O"]:
             enhanced["StatusText"] = "Open"
-        elif doc_status in [2, "2", "bost_Close"]:
+        elif doc_status in [2, "2", "bost_Close", "Closed", "closed", "C", "c"]:
             enhanced["StatusText"] = "Closed"
-        elif doc_status in [3, "3"]:
+        elif doc_status in [3, "3", "Cancelled", "cancelled"]:
             enhanced["StatusText"] = "Cancelled"
         else:
-            enhanced["StatusText"] = str(doc_status) if doc_status else "Unknown"
+            # Check for status from API
+            api_status = order.get("Status")
+            if api_status:
+                enhanced["StatusText"] = api_status
+            else:
+                enhanced["StatusText"] = str(doc_status) if doc_status else "Unknown"
         
-        # Add formatted date
-        doc_date = enhanced.get("DocDate")
+        # Add formatted dates
+        doc_date = enhanced["DocDate"]
         if doc_date:
             try:
-                # Format date for display
                 if isinstance(doc_date, str):
                     dt = datetime.strptime(doc_date[:10], "%Y-%m-%d")
                     enhanced["DocDateFormatted"] = dt.strftime("%b %d, %Y")
+                else:
+                    enhanced["DocDateFormatted"] = str(doc_date)[:10]
             except (ValueError, TypeError):
-                enhanced["DocDateFormatted"] = doc_date
+                enhanced["DocDateFormatted"] = str(doc_date)
+        
+        # Add items if present
+        items = order.get("Items") or order.get("DocumentLines") or []
+        if items:
+            enhanced["Items"] = []
+            enhanced["ItemCount"] = len(items)
+            for item in items:
+                enhanced["Items"].append({
+                    "ItemCode": item.get("ItemCode"),
+                    "ItemName": item.get("ItemName") or item.get("ItemDescription", "Unknown"),
+                    "Quantity": float(item.get("Quantity", 0)),
+                    "OpenQty": float(item.get("OpenQty", 0)),
+                    "Price": float(item.get("Price", 0)),
+                    "LineTotal": float(item.get("LineTotal", 0)),
+                })
         
         return enhanced
     
@@ -485,10 +562,6 @@ class CustomerOrdersService:
     
     def clear_cache(self):
         """Clear all caches."""
-        # Clear LRU caches
-        # Note: We don't have @lru_cache on methods in this class,
-        # but we could add them if needed
-        
         # Clear Redis cache
         cache = get_cache_service()
         logger.info("Customer orders service cache cleared")

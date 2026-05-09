@@ -5,14 +5,16 @@ Combined Pricing Intelligence Service
 
 Provides competitor price comparison for items, returning ALL variants
 with Leysco prices vs competitor prices in a format similar to item price.
+
+MODIFIED FOR PHASE 1: Accepts user token and passes to all services
 """
 
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from app.services.competitor_api_service import CompetitorAPIService
-from app.services.leysco_api_service import LeyscoAPIService
-from app.services.pricing_service import PricingService
+from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.pricing_service import PricingService, create_pricing_service
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +23,37 @@ class PricingIntelligenceService:
     """
     Combines Leysco pricing with competitor intelligence.
     Returns all item variants with their Leysco prices and competitor comparisons.
+    
+    MODIFIED: Now accepts user_token to properly authenticate API calls.
     """
 
-    def __init__(self):
-        self.leysco_api = LeyscoAPIService()
+    def __init__(self, user_token: str = None):
+        """
+        Initialize PricingIntelligenceService with user token.
+        
+        Args:
+            user_token: Bearer token from authenticated user
+        """
+        self.user_token = user_token
+        
+        # Create API services with the user token
+        if user_token:
+            self.leysco_api = create_api_service(user_token)
+            self.pricing_service = create_pricing_service(user_token)
+            logger.debug("PricingIntelligenceService initialized with user token")
+        else:
+            logger.warning("PricingIntelligenceService initialized WITHOUT user token - API calls will fail")
+            self.leysco_api = LeyscoAPIService()
+            self.pricing_service = PricingService()
+        
         self.competitor_api = CompetitorAPIService()
-        self.pricing_service = PricingService()
+    
+    def set_user_token(self, token: str):
+        """Update user token for this instance."""
+        self.user_token = token
+        self.leysco_api.set_user_token(token)
+        self.pricing_service.set_user_token(token)
+        logger.debug("PricingIntelligenceService user token updated")
     
     def get_complete_pricing_picture(self, item_name: str, item_code: str = None) -> Dict:
         """
@@ -332,3 +359,25 @@ class PricingIntelligenceService:
             return "meat"
         
         return "default"
+
+
+# =========================================================
+# Factory function to create PricingIntelligenceService with user token
+# =========================================================
+
+def create_pricing_intelligence_service(user_token: str = None) -> PricingIntelligenceService:
+    """
+    Create a PricingIntelligenceService instance with the user's token.
+    
+    Args:
+        user_token: The authenticated user's Bearer token
+    
+    Returns:
+        Configured PricingIntelligenceService instance
+    """
+    if not user_token:
+        logger.warning("⚠️ create_pricing_intelligence_service called WITHOUT user token - data access will fail")
+    else:
+        logger.info("✅ create_pricing_intelligence_service called WITH user token")
+    
+    return PricingIntelligenceService(user_token=user_token)

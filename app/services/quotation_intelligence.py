@@ -3,6 +3,9 @@ app/services/quotation_intelligence.py
 ========================================
 Quotation Follow-up Intelligence Service - Optimized with caching and async support
 
+FIXED: Removed singleton pattern, now accepts user_token per instance
+FIXED: Properly passes token to LeyscoAPIService and PricingService
+
 Surfaces three types of actionable business intelligence:
 
 1. Stale quotations  — open quotes with no activity for N+ days
@@ -30,9 +33,9 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache, wraps
 
-from app.services.leysco_api_service import LeyscoAPIService
+from app.services.leysco_api_service import LeyscoAPIService, create_api_service
 from app.services.cache_service import get_cache_service
-from app.services.pricing_service import get_pricing_service
+from app.services.pricing_service import get_pricing_service, create_pricing_service, PricingService
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +61,16 @@ def cache_quotation(ttl_seconds: int = QUOTATION_CACHE_TTL):
         def wrapper(self, *args, **kwargs):
             cache = get_cache_service()
             
-            # Generate cache key
+            # Generate cache key (include user_token for isolation)
             func_name = func.__name__
-            cache_str = f"quotation:{func_name}:{str(args)}:{str(sorted(kwargs.items()))}"
+            user_suffix = self.user_token[:8] if self.user_token else "no_token"
+            cache_str = f"quotation:{user_suffix}:{func_name}:{str(args)}:{str(sorted(kwargs.items()))}"
             cache_key = hashlib.md5(cache_str.encode()).hexdigest()
             
             # Check cache
             cached = cache.get_simple(cache_key)
             if cached is not None:
-                logger.info(f"⚡ Quotation cache hit: {func_name}")
+                logger.debug(f"⚡ Quotation cache hit: {func_name}")
                 return cached
             
             # Execute function
@@ -85,11 +89,28 @@ class QuotationIntelligence:
     """
     Read-only quotation analytics for the Leysco AI assistant.
     Optimized with caching and async support.
+    
+    FIXED: Now accepts user_token to properly authenticate API calls.
     """
 
-    def __init__(self) -> None:
-        self.api = LeyscoAPIService()
-        self.pricing = get_pricing_service()
+    def __init__(self, user_token: str = None) -> None:
+        """
+        Initialize QuotationIntelligence with user token.
+        
+        Args:
+            user_token: The authenticated user's Bearer token from the request
+        """
+        self.user_token = user_token
+        
+        # Create API services with the user token
+        if user_token:
+            self.api = LeyscoAPIService(user_token=user_token)
+            self.pricing = create_pricing_service(user_token=user_token)
+            logger.info("✅ QuotationIntelligence initialized WITH user token")
+        else:
+            self.api = LeyscoAPIService()  # Will fail but at least initialized
+            self.pricing = get_pricing_service()  # Will fail but at least initialized
+            logger.warning("⚠️ QuotationIntelligence initialized WITHOUT user token - data access will fail")
         
         # Stats tracking
         self._stats = {
@@ -102,6 +123,17 @@ class QuotationIntelligence:
         # Cache for customer resolution
         self._customer_cache = {}
         self._customer_cache_ttl = 300  # 5 minutes
+
+    def set_user_token(self, token: str):
+        """
+        Update user token for this instance.
+        Useful when reusing the instance across requests.
+        """
+        self.user_token = token
+        self.api.set_user_token(token)
+        if hasattr(self.pricing, 'set_user_token'):
+            self.pricing.set_user_token(token)
+        logger.debug("QuotationIntelligence token updated")
 
     # ------------------------------------------------------------------
     # STATS HELPERS
@@ -748,15 +780,61 @@ def _safe_float(val: Any) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Singleton
+# FIXED: Removed singleton pattern - now creates fresh instance per request
+# ---------------------------------------------------------------------------
+
+def create_quotation_intelligence(user_token: str = None) -> QuotationIntelligence:
+    """
+    Create a new QuotationIntelligence instance with the user's token.
+    Called per request to ensure proper authentication isolation.
+    
+    Args:
+        user_token: The authenticated user's Bearer token from the request
+    
+    Returns:
+        Configured QuotationIntelligence instance
+    
+    Example:
+        qi = create_quotation_intelligence(user_token=request_token)
+        report = qi.get_follow_up_report()
+    """
+    if not user_token:
+        logger.warning("Creating QuotationIntelligence without user token - data access will fail")
+    return QuotationIntelligence(user_token=user_token)
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED: Old singleton accessor - kept for backward compatibility
+# but will log a warning. Use create_quotation_intelligence() instead.
 # ---------------------------------------------------------------------------
 
 _qi_instance: QuotationIntelligence | None = None
 
 
-def get_quotation_intelligence() -> QuotationIntelligence:
-    """Get or create singleton instance."""
+def get_quotation_intelligence(user_token: str = None) -> QuotationIntelligence:
+    """
+    DEPRECATED: Old singleton accessor. Use create_quotation_intelligence() instead.
+    
+    This function is kept for backward compatibility but will log a warning.
+    For new code, use create_quotation_intelligence(user_token=token) to create
+    a fresh instance per request.
+    
+    If user_token is provided, it will update the singleton's token (but this
+    is not recommended for multi-tenant applications).
+    """
+    import warnings
+    warnings.warn(
+        "get_quotation_intelligence() is deprecated. Use create_quotation_intelligence(user_token=token) instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     global _qi_instance
     if _qi_instance is None:
-        _qi_instance = QuotationIntelligence()
+        _qi_instance = QuotationIntelligence(user_token=user_token)
+        logger.warning("Using deprecated singleton pattern - create fresh instances per request for better isolation")
+    elif user_token and _qi_instance.user_token != user_token:
+        _qi_instance.set_user_token(user_token)
+        logger.debug("Updated deprecated singleton with new token")
+    
     return _qi_instance

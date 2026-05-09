@@ -23,6 +23,8 @@ Optimizations:
 - Async support for concurrent scoring
 - Batch processing for portfolio views
 - LRU cache for frequent lookups
+
+MODIFIED FOR PHASE 1: Accepts user token and passes to LeyscoAPIService
 """
 
 import logging
@@ -32,7 +34,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache, wraps
 
-from app.services.leysco_api_service import LeyscoAPIService
+from app.services.leysco_api_service import LeyscoAPIService, create_api_service
 from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
@@ -67,12 +69,13 @@ def cache_health_score(ttl_seconds: int = HEALTH_SCORE_TTL):
         def wrapper(self, customer_code=None, customer_name=None):
             cache = get_cache_service()
             
-            # Generate cache key
+            # Generate cache key (include user token for isolation)
+            user_suffix = self.user_token[:8] if self.user_token else "no_token"
             key = customer_code or customer_name
             if not key:
                 return func(self, customer_code, customer_name)
             
-            cache_key = f"health_score:{key}"
+            cache_key = f"health_score:{user_suffix}:{key}"
             
             # Check cache
             cached = cache.get_simple(cache_key)
@@ -93,10 +96,27 @@ def cache_health_score(ttl_seconds: int = HEALTH_SCORE_TTL):
 
 
 class CustomerHealthService:
-    """Compute customer health scores from SAP B1 data via LeyscoAPIService."""
+    """Compute customer health scores from SAP B1 data via LeyscoAPIService.
+    
+    MODIFIED: Now accepts user_token to properly authenticate API calls.
+    """
 
-    def __init__(self) -> None:
-        self.api = LeyscoAPIService()
+    def __init__(self, user_token: str = None) -> None:
+        """
+        Initialize CustomerHealthService with user token.
+        
+        Args:
+            user_token: Bearer token from authenticated user
+        """
+        self.user_token = user_token
+        
+        # Create API service with user token
+        if user_token:
+            self.api = create_api_service(user_token)
+            logger.debug("CustomerHealthService initialized with user token")
+        else:
+            logger.warning("CustomerHealthService initialized WITHOUT user token - API calls will fail")
+            self.api = LeyscoAPIService()
         
         # Cache for batch results
         self._batch_cache = {}
@@ -110,6 +130,12 @@ class CustomerHealthService:
             "api_calls": 0,
             "errors": 0
         }
+
+    def set_user_token(self, token: str):
+        """Update user token for this instance."""
+        self.user_token = token
+        self.api.set_user_token(token)
+        logger.debug("CustomerHealthService user token updated")
 
     # ------------------------------------------------------------------
     # STATS HELPERS
@@ -224,7 +250,8 @@ class CustomerHealthService:
 
     def get_top_healthy(self, limit: int = 10) -> list[dict]:
         """Top N customers with score >= 70 (Good or Excellent)."""
-        cache_key = f"top_healthy_{limit}"
+        user_suffix = self.user_token[:8] if self.user_token else "no_token"
+        cache_key = f"top_healthy_{user_suffix}_{limit}"
         
         # Check cache
         if cache_key in self._batch_cache:
@@ -244,7 +271,8 @@ class CustomerHealthService:
 
     def get_at_risk(self, limit: int = 10) -> list[dict]:
         """Top N most at-risk customers with score < 50."""
-        cache_key = f"at_risk_{limit}"
+        user_suffix = self.user_token[:8] if self.user_token else "no_token"
+        cache_key = f"at_risk_{user_suffix}_{limit}"
         
         # Check cache
         if cache_key in self._batch_cache:
@@ -542,5 +570,56 @@ class CustomerHealthService:
         logger.info("Customer health service cache cleared")
 
 
-# Singleton instance
-customer_health_service = CustomerHealthService()
+# =========================================================
+# Factory function to create CustomerHealthService with user token
+# =========================================================
+
+def create_customer_health_service(user_token: str = None) -> CustomerHealthService:
+    """
+    Create a CustomerHealthService instance with the user's token.
+    
+    Args:
+        user_token: The authenticated user's Bearer token
+    
+    Returns:
+        Configured CustomerHealthService instance
+    """
+    if not user_token:
+        logger.warning("⚠️ create_customer_health_service called WITHOUT user token - data access will fail")
+    else:
+        logger.info("✅ create_customer_health_service called WITH user token")
+    
+    return CustomerHealthService(user_token=user_token)
+
+
+# =========================================================
+# DEPRECATED: Old singleton - kept for backward compatibility
+# =========================================================
+
+_deprecated_instance = None
+
+
+def get_customer_health_service(user_token: str = None) -> CustomerHealthService:
+    """
+    DEPRECATED: Old singleton accessor. Use create_customer_health_service() instead.
+    
+    This function is kept for backward compatibility but will log a warning.
+    For new code, use create_customer_health_service(user_token=token) to create
+    a fresh instance per request.
+    """
+    import warnings
+    warnings.warn(
+        "get_customer_health_service() is deprecated. Use create_customer_health_service(user_token=token) instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
+    global _deprecated_instance
+    if _deprecated_instance is None:
+        _deprecated_instance = CustomerHealthService(user_token=user_token)
+        logger.warning("Using deprecated singleton pattern - create fresh instances per request for better isolation")
+    elif user_token and _deprecated_instance.user_token != user_token:
+        _deprecated_instance.set_user_token(user_token)
+        logger.debug("Updated deprecated singleton with new token")
+    
+    return _deprecated_instance

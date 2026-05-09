@@ -28,13 +28,14 @@ except ImportError:
     GROQ_AVAILABLE = False
     logger.warning("Groq library not installed. Install with: pip install groq")
 
-# Try to import Gemini
+# Try to import new Gemini SDK (google-genai)
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-    logger.warning("Google Generative AI library not installed. Install with: pip install google-generativeai")
+    logger.warning("Google GenAI library not installed. Install with: pip install google-genai")
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +122,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• 'Got it! Here's what I found'\n\n"
         "FORMAT: Use bullet points for multiple variants.\n"
         "Include: item name, size, code, price, and price list.\n"
+        "Use **bold** for prices and important numbers.\n"
         "End with a helpful question like 'Need any other prices?'"
     ),
     "GET_STOCK_LEVELS": (
@@ -135,6 +137,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• On hand quantity\n"
         "• Committed quantity (if available)\n"
         "• Available quantity (on hand - committed)\n"
+        "• Use **bold** for the available quantity\n"
         "• Add a note if stock is low or negative\n\n"
         "If negative available (backorders), explain clearly.\n"
         "End with: 'Need to check another product?'"
@@ -144,12 +147,14 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "STYLE: Be personal and helpful.\n\n"
         "FORMAT: State customer name, item, price, and any notes.\n"
         "If multiple items, list them clearly.\n"
+        "Use **bold** for prices.\n"
         "End with: 'Would you like to create a quotation for them?'"
     ),
     "GET_CUSTOMER_DETAILS": (
         "You're sharing customer information with a sales rep.\n\n"
         "STYLE: Present info in a clean, scannable format.\n"
-        "Use emojis for visual cues: 👤 for customer, 📞 for phone, 📧 for email.\n\n"
+        "Use emojis for visual cues: 👤 for customer, 📞 for phone, 📧 for email.\n"
+        "Use **bold** for customer name and code.\n\n"
         "End with: 'Would you like to see their order history or create a quote?'"
     ),
     "GET_TOP_SELLING_ITEMS": (
@@ -160,6 +165,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• 'Customers are loving these products:'\n"
         "• 'Based on recent sales, these are the top performers:'\n\n"
         "For each item, include popularity score if available.\n"
+        "Use **bold** for item names.\n"
         "End with: 'Want to check stock on any of these?'"
     ),
     "GET_SLOW_MOVING_ITEMS": (
@@ -170,6 +176,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• 'These products might benefit from a promotion:'\n"
         "• 'Let me share what's moving a bit slower:'\n\n"
         "Include turnover rate, severity level (Critical/Warning/Monitor), and specific recommendations.\n"
+        "Use **bold** for severity levels and recommendations.\n"
         "For CRITICAL items: Urge immediate action like markdowns or bundling.\n"
         "For WARNING items: Suggest reviewing pricing or considering discontinuation.\n"
         "For MONITOR items: Recommend keeping an eye on sales velocity.\n"
@@ -183,6 +190,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• 'Let me pull up their purchase history:'\n"
         "• 'Here are their recent orders:'\n\n"
         "Include order numbers, dates, totals, and status.\n"
+        "Use **bold** for totals.\n"
         "End with: 'Need to create a new order or quotation for them?'"
     ),
     "FIND_CUSTOMERS_BY_ITEM": (
@@ -193,6 +201,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• 'I found these potential customers for [product]:'\n"
         "• 'Based on purchase history, these customers might be interested:'\n\n"
         "Include customer names, purchase quantities, and reasons.\n"
+        "Use **bold** for customer names.\n"
         "End with: 'Want me to create quotations for any of these customers?'"
     ),
     "GET_WAREHOUSES": (
@@ -201,7 +210,8 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "OPENERS:\n"
         "• 'Here are our warehouse locations:'\n"
         "• 'We have stock at these locations:'\n\n"
-        "Include warehouse names, codes, and stock counts when available."
+        "Include warehouse names, codes, and stock counts when available.\n"
+        "Use **bold** for warehouse names."
     ),
     "GET_LOW_STOCK_ALERTS": (
         "You're alerting about low stock levels.\n\n"
@@ -211,6 +221,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• 'Heads up! These items need reordering soon:'\n"
         "• 'Let me share what's getting low:'\n\n"
         "Include item names, current stock, and recommended actions.\n"
+        "Use **bold** for stock quantities.\n"
         "End with: 'Should I help you create reorder requests?'"
     ),
     "CREATE_QUOTATION": (
@@ -221,6 +232,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "• '✅ Quotation created successfully! Here's the summary:'\n"
         "• 'All set! Here's the quotation details:'\n\n"
         "Include customer name, items, quantities, prices, and total.\n"
+        "Use **bold** for customer name, total amount, and quotation number.\n"
         "End with: 'Need to email this to the customer?'"
     ),
     "GENERAL": (
@@ -229,6 +241,7 @@ INTENT_SYSTEM_PROMPTS: dict[str, str] = {
         "Be conversational - respond like a helpful colleague.\n"
         "Use occasional emojis for friendliness.\n"
         "Vary your responses - don't repeat the same phrases.\n"
+        "Use **bold** for important information.\n"
         "Always end by asking if you can help with anything else."
     ),
     "UNKNOWN": (
@@ -368,7 +381,7 @@ class LLMService:
         """
         self.provider = provider
         self._groq_client = None
-        self._gemini_model = None
+        self._gemini_client = None
         self._gemini_available = False
         
         # Conversation memory (simple in-memory)
@@ -422,9 +435,9 @@ class LLMService:
             self._groq_client = None
 
     def _init_gemini(self):
-        """Initialize Gemini client."""
+        """Initialize Gemini client with new google-genai SDK."""
         if not GEMINI_AVAILABLE:
-            logger.warning("Gemini not available - library not installed")
+            logger.warning("Gemini not available - google-genai library not installed")
             return
         
         api_key = settings.GEMINI_API_KEY
@@ -433,18 +446,14 @@ class LLMService:
             return
         
         try:
-            genai.configure(api_key=api_key)
-            self._gemini_model = genai.GenerativeModel(
-                "gemini-1.5-flash",
-                generation_config={
-                    "temperature": 0.7,  # Increased for more natural responses
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "max_output_tokens": 2048,
-                }
-            )
+            # Initialize the new Gemini client
+            self._gemini_client = genai.Client(api_key=api_key)
+            
+            # Store the default model name
+            self._gemini_model = "gemini-1.5-flash"  # or "gemini-2.0-flash-exp" for latest
+            
             self._gemini_available = True
-            logger.info("✅ Gemini client initialized (free tier)")
+            logger.info("✅ Gemini client initialized with google-genai SDK (free tier)")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini: {e}")
             self._gemini_available = False
@@ -457,6 +466,40 @@ class LLMService:
             logger.info(f"Rate limiting: sleeping for {sleep_time:.2f}s")
             time.sleep(sleep_time)
         self._last_request_time = time.time()
+
+    # -----------------------------------------------------------------------
+    # FIXED: Clean response method that preserves formatting for chat UI
+    # -----------------------------------------------------------------------
+    
+    def clean_response(self, text: str) -> str:
+        """
+        Clean response for display while preserving readable formatting.
+        Keeps **bold** text, bullet points, and emojis for beautiful chat output.
+        """
+        if not text:
+            return text
+        
+        # Remove code blocks but keep their content
+        text = re.sub(r'```[^`]*```', '', text, flags=re.DOTALL)
+        
+        # Convert markdown links [text](url) -> text (keep the text)
+        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+        
+        # Clean up excessive whitespace (but keep line breaks for readability)
+        text = re.sub(r' +', ' ', text)  # Multiple spaces to single
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 line breaks
+        
+        # Fix spacing after periods
+        text = re.sub(r'\.([A-Z])', r'. \1', text)
+        
+        # Ensure bullet points have proper spacing
+        text = re.sub(r'\n•', '\n•', text)
+        text = re.sub(r'^•', '•', text, flags=re.MULTILINE)
+        
+        # Preserve emojis and special characters
+        # Don't strip them out - they make the UI friendly
+        
+        return text.strip()
 
     # -----------------------------------------------------------------------
     # Conversation Memory
@@ -578,6 +621,7 @@ class LLMService:
             "Remember: Be conversational, friendly, and helpful. "
             "Use natural language like you're talking to a colleague. "
             "Avoid robotic phrases like 'based on the data provided'. "
+            "Use **bold** for important numbers and names. "
             "End by asking if they need anything else."
         )
         
@@ -884,7 +928,8 @@ class LLMService:
                 self._rate_limit()
                 response = self._generate_gemini(system_prompt, prompt, max_tokens)
                 if response:
-                    return response
+                    # Clean response before returning
+                    return self.clean_response(response)
             except Exception as e:
                 logger.warning(f"Gemini generation failed: {e}")
                 if self.provider == "gemini":
@@ -893,7 +938,9 @@ class LLMService:
         # Fallback to Groq
         if self._groq_client:
             try:
-                return self._generate_groq(system_prompt, prompt, max_tokens)
+                response = self._generate_groq(system_prompt, prompt, max_tokens)
+                # Clean response before returning
+                return self.clean_response(response)
             except Exception as e:
                 logger.error(f"Groq generation failed: {e}")
                 return self._handle_error(e, language)
@@ -902,20 +949,43 @@ class LLMService:
         return self._handle_error(Exception("No LLM provider available"), language)
 
     def _generate_gemini(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
-        """Generate with Gemini."""
-        combined_prompt = f"{system_prompt}\n\nUser: {user_prompt}"
-        response = self._gemini_model.generate_content(
-            combined_prompt,
-            generation_config={"max_output_tokens": max_tokens}
-        )
-
-        if response.prompt_feedback.block_reason:
-            logger.warning(f"Gemini blocked: {response.prompt_feedback.block_reason}")
-            return "I'm unable to respond to that request."
-
-        result = response.text.strip()
-        logger.info(f"✅ Gemini response: {len(result)} chars")
-        return result
+        """
+        Generate with new Gemini SDK (google-genai).
+        
+        Uses the updated API format with types.Content for messages.
+        """
+        try:
+            # Combine system and user prompts for Gemini (which doesn't have native system prompt)
+            combined_prompt = f"{system_prompt}\n\nUser: {user_prompt}"
+            
+            # Use the new API format
+            response = self._gemini_client.models.generate_content(
+                model=self._gemini_model,
+                contents=combined_prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=max_tokens,
+                    temperature=0.7,
+                    top_p=0.95,
+                )
+            )
+            
+            # Check for blocking
+            if response.prompt_feedback and response.prompt_feedback.block_reason:
+                logger.warning(f"Gemini blocked: {response.prompt_feedback.block_reason}")
+                return "I'm unable to respond to that request."
+            
+            # Extract text from response
+            if response.text:
+                result = response.text.strip()
+                logger.info(f"✅ Gemini response: {len(result)} chars")
+                return result
+            else:
+                logger.warning("Gemini returned empty response")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Gemini generation error: {e}")
+            raise
 
     def _generate_groq(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
         """Generate with Groq."""
@@ -970,7 +1040,7 @@ class LLMService:
         )
 
     # -----------------------------------------------------------------------
-    # Narrate Method
+    # Narrate Method (FIXED: preserves formatting)
     # -----------------------------------------------------------------------
 
     def narrate(
@@ -994,7 +1064,8 @@ class LLMService:
                 fallback = _NO_DATA_FALLBACKS_EN.get(intent_upper)
 
             if fallback:
-                return fallback
+                # Clean fallback response (preserves formatting)
+                return self.clean_response(fallback)
 
             # Generic fallback
             return self._generate_no_data_response(question, intent, lang)
@@ -1020,6 +1091,7 @@ Be friendly and helpful. Use the data above - don't make anything up.
 If there are multiple warehouses, show each warehouse separately.
 If stock is negative (backorder), explain clearly.
 Use bullet points or numbered lists for clarity.
+Use **bold** for important numbers (prices, quantities, totals).
 End by asking if they need anything else.
 """
         
@@ -1032,6 +1104,8 @@ End by asking if they need anything else.
             session_id=session_id,
             user_message=question,
         )
+        
+        # DON'T clean here - preserve formatting for the follow-up additions
         
         # Add helpful follow-up for certain intents
         if intent_upper == "GET_STOCK_LEVELS" and db_rows:
@@ -1076,7 +1150,8 @@ End by asking if they need anything else.
             else:
                 result += "\n\n💡 Want to check stock at a specific warehouse?"
         
-        return result
+        # Clean the final result once (preserves **bold** formatting)
+        return self.clean_response(result)
 
     def _generate_no_data_response(self, question: str, intent: str, language: str) -> str:
         """Generate natural response when no data is found."""
@@ -1093,10 +1168,12 @@ Provide a HELPFUL, POSITIVE response that:
 
 Use natural, conversational language. Be friendly and encouraging.
 NEVER use words like 'unfortunately', 'sorry', 'alas', 'regrettably'.
+Use **bold** for emphasis where appropriate.
 
 Write in {'Swahili' if language == 'sw' else 'English'}.
 """
-        return self.generate(prompt, max_tokens=200, intent=intent, language=language)
+        result = self.generate(prompt, max_tokens=200, intent=intent, language=language)
+        return self.clean_response(result)
 
     def _count_items(self, data: Any) -> int:
         """Count items in data."""

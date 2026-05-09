@@ -16,6 +16,8 @@ Optimizations:
 - Async methods for non-blocking operations
 - LRU cache for frequently accessed deliveries
 - Enhanced status determination with caching
+
+FIXED: Outstanding deliveries now uses the API's get_outstanding_deliveries method
 """
 
 import logging
@@ -51,7 +53,7 @@ def cache_delivery(ttl_seconds: int = DELIVERY_CACHE_TTL, key_prefix: str = ""):
             # Check cache
             cached = cache.get(cache_key, {}, "")
             if cached is not None:
-                logger.info(f"📦 Delivery cache hit: {func.__name__}")
+                logger.debug(f"📦 Delivery cache hit: {func.__name__}")
                 return cached.get("data")
             
             # Execute function
@@ -114,14 +116,16 @@ class DeliveryTrackingService:
         self._stats["errors"] += 1
 
     # =========================================================
-    # DELIVERY STATUS TRACKING (Optimized)
+    # DELIVERY STATUS TRACKING (FIXED - uses API's get_outstanding_deliveries)
     # =========================================================
     
-    @cache_delivery(ttl_seconds=OUTSTANDING_CACHE_TTL)
-    def get_outstanding_deliveries(self, customer_code: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_outstanding_deliveries(self, customer_code: str = None, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Get all outstanding (pending) deliveries for a customer.
         Optimized with caching.
+        
+        Uses the API's get_outstanding_deliveries method which implements
+        multiple approaches to fetch real delivery data.
         
         Returns deliveries that are:
         - Created but not yet dispatched
@@ -130,14 +134,22 @@ class DeliveryTrackingService:
         """
         try:
             self._record_api_call()
-            deliveries = self.api.get_deliveries(customer_code=customer_code, limit=limit)
+            logger.info(f"📦 Getting outstanding deliveries for customer: {customer_code or 'all'}")
+            
+            # Use the API's get_outstanding_deliveries method
+            deliveries = self.api.get_outstanding_deliveries(
+                customer_code=customer_code,
+                limit=limit
+            )
             
             if not deliveries:
+                logger.info("No outstanding deliveries found")
                 return []
             
             # Enrich delivery data with status and ETA
             enriched = []
             for delivery in deliveries:
+                # Extract fields based on the format from API
                 status = self._determine_delivery_status(delivery)
                 eta = self._calculate_eta(delivery)
                 
@@ -149,21 +161,26 @@ class DeliveryTrackingService:
                     "DocDate": delivery.get("DocDate"),
                     "DocDueDate": delivery.get("DocDueDate"),
                     "DocTotal": delivery.get("DocTotal"),
-                    "ItemCount": len(delivery.get("DocumentLines", [])),
+                    "OpenQty": delivery.get("OpenQty", 0),
+                    "ItemCode": delivery.get("ItemCode"),
+                    "ItemName": delivery.get("ItemName"),
+                    "Quantity": delivery.get("Quantity", 0),
+                    "Price": delivery.get("Price", 0),
+                    "LineTotal": delivery.get("LineTotal", 0),
                     "Status": status,
                     "ETA": eta,
-                    "Address": delivery.get("Address"),
-                    "Comments": delivery.get("Comments"),
+                    "IsOverdue": delivery.get("IsOverdue", False),
                 })
             
+            logger.info(f"✅ Found {len(enriched)} outstanding delivery line items")
             return enriched
             
         except Exception as e:
             self._record_error()
-            logger.error(f"Error getting outstanding deliveries for {customer_code}: {e}")
+            logger.error(f"Error getting outstanding deliveries: {e}")
             return []
     
-    async def get_outstanding_deliveries_async(self, customer_code: str, limit: int = 20) -> List[Dict[str, Any]]:
+    async def get_outstanding_deliveries_async(self, customer_code: str = None, limit: int = 20) -> List[Dict[str, Any]]:
         """Async version of get_outstanding_deliveries."""
         return await asyncio.to_thread(self.get_outstanding_deliveries, customer_code, limit)
     
@@ -182,13 +199,46 @@ class DeliveryTrackingService:
         """
         try:
             self._record_api_call()
+            logger.info(f"📦 Getting delivery details for: {doc_num}")
+            
+            # First try to find in outstanding deliveries
+            outstanding = self.get_outstanding_deliveries(limit=200)
+            for delivery in outstanding:
+                if str(delivery.get("DocNum")) == str(doc_num):
+                    return self._format_delivery_details(delivery)
+            
+            # If not found in outstanding, try to get via API
             delivery = self.api.get_delivery_by_docnum(doc_num)
             
             if not delivery:
+                logger.warning(f"Delivery {doc_num} not found")
                 return None
             
-            # Extract line items efficiently
-            line_items = []
+            return self._format_delivery_details(delivery)
+            
+        except Exception as e:
+            self._record_error()
+            logger.error(f"Error getting delivery details for {doc_num}: {e}")
+            return None
+    
+    def _format_delivery_details(self, delivery: Dict[str, Any]) -> Dict[str, Any]:
+        """Format delivery data into consistent structure."""
+        # Extract line items efficiently
+        line_items = []
+        
+        # Check if this is from outstanding deliveries (has ItemCode directly)
+        if delivery.get("ItemCode") and not delivery.get("DocumentLines"):
+            line_items.append({
+                "ItemCode": delivery.get("ItemCode"),
+                "ItemName": delivery.get("ItemName"),
+                "Quantity": delivery.get("Quantity", 0),
+                "DeliveredQty": 0,
+                "RemainingQty": delivery.get("OpenQty", 0),
+                "Price": delivery.get("Price", 0),
+                "LineTotal": delivery.get("LineTotal", 0),
+            })
+        else:
+            # Process DocumentLines
             for line in delivery.get("DocumentLines", []):
                 qty = float(line.get("Quantity", 0))
                 delivered_qty = float(line.get("DeliveredQty", 0))
@@ -201,34 +251,29 @@ class DeliveryTrackingService:
                     "Price": line.get("Price"),
                     "LineTotal": line.get("LineTotal"),
                 })
-            
-            status = self._determine_delivery_status(delivery)
-            eta = self._calculate_eta(delivery)
-            
-            return {
-                "DocNum": delivery.get("DocNum"),
-                "DocEntry": delivery.get("DocEntry"),
-                "DocDate": delivery.get("DocDate"),
-                "DocDueDate": delivery.get("DocDueDate"),
-                "Customer": {
-                    "CardCode": delivery.get("CardCode"),
-                    "CardName": delivery.get("CardName"),
-                    "Address": delivery.get("Address"),
-                    "Phone": delivery.get("Phone"),
-                },
-                "Status": status,
-                "ETA": eta,
-                "TotalValue": delivery.get("DocTotal"),
-                "Items": line_items,
-                "Comments": delivery.get("Comments"),
-                "CreatedBy": delivery.get("UserSign"),
-                "LastUpdated": delivery.get("UpdateDate"),
-            }
-            
-        except Exception as e:
-            self._record_error()
-            logger.error(f"Error getting delivery details for {doc_num}: {e}")
-            return None
+        
+        status = self._determine_delivery_status(delivery)
+        eta = self._calculate_eta(delivery)
+        
+        return {
+            "DocNum": delivery.get("DocNum"),
+            "DocEntry": delivery.get("DocEntry"),
+            "DocDate": delivery.get("DocDate"),
+            "DocDueDate": delivery.get("DocDueDate"),
+            "Customer": {
+                "CardCode": delivery.get("CardCode"),
+                "CardName": delivery.get("CardName"),
+                "Address": delivery.get("Address"),
+                "Phone": delivery.get("Phone"),
+            },
+            "Status": status,
+            "ETA": eta,
+            "TotalValue": delivery.get("DocTotal"),
+            "Items": line_items,
+            "Comments": delivery.get("Comments"),
+            "CreatedBy": delivery.get("UserSign"),
+            "LastUpdated": delivery.get("UpdateDate"),
+        }
     
     async def get_delivery_details_async(self, doc_num: str) -> Optional[Dict[str, Any]]:
         """Async version of get_delivery_details."""
@@ -244,12 +289,19 @@ class DeliveryTrackingService:
         """
         try:
             self._record_api_call()
-            all_deliveries = self.api.get_deliveries(customer_code=customer_code, limit=limit)
+            logger.info(f"📦 Getting delivery history for customer: {customer_code}")
+            
+            # Get outstanding deliveries first
+            all_deliveries = self.get_outstanding_deliveries(customer_code=customer_code, limit=limit)
             
             if not all_deliveries:
+                # Try to get from orders API for history
+                orders = self.api.get_customer_orders(customer_code=customer_code, limit=limit)
+                if orders:
+                    return self._convert_orders_to_history(orders, days)
                 return []
             
-            # Filter to completed/closed deliveries within date range
+            # Filter to completed/delivered deliveries within date range
             cutoff_date = datetime.now() - timedelta(days=days)
             history = []
             
@@ -262,18 +314,27 @@ class DeliveryTrackingService:
                     doc_date = datetime.strptime(doc_date_str[:10], "%Y-%m-%d")
                     status = self._determine_delivery_status(delivery)
                     
-                    # Only include completed deliveries
-                    if status == "Delivered" and doc_date >= cutoff_date:
+                    # Include delivered or completed items
+                    if status in ["Delivered", "Completed"] and doc_date >= cutoff_date:
                         history.append({
                             "DocNum": delivery.get("DocNum"),
                             "DocDate": doc_date_str,
-                            "ItemCount": len(delivery.get("DocumentLines", [])),
-                            "TotalValue": delivery.get("DocTotal"),
+                            "ItemCode": delivery.get("ItemCode"),
+                            "ItemName": delivery.get("ItemName"),
+                            "Quantity": delivery.get("Quantity", 0),
+                            "TotalValue": delivery.get("LineTotal", 0),
                             "Status": status,
                         })
                 except (ValueError, TypeError):
                     continue
             
+            # Also try to get from sales orders if no history found
+            if not history:
+                orders = self.api.get_customer_orders(customer_code=customer_code, limit=limit)
+                if orders:
+                    history = self._convert_orders_to_history(orders, days)
+            
+            logger.info(f"✅ Found {len(history)} delivery history items")
             return history
             
         except Exception as e:
@@ -281,11 +342,41 @@ class DeliveryTrackingService:
             logger.error(f"Error getting delivery history for {customer_code}: {e}")
             return []
     
+    def _convert_orders_to_history(self, orders: List[Dict], days: int) -> List[Dict]:
+        """Convert orders to delivery history format."""
+        cutoff_date = datetime.now() - timedelta(days=days)
+        history = []
+        
+        for order in orders:
+            doc_date_str = order.get("DocDate")
+            if not doc_date_str:
+                continue
+            
+            try:
+                doc_date = datetime.strptime(doc_date_str[:10], "%Y-%m-%d")
+                if doc_date >= cutoff_date:
+                    # Check if order is closed/completed
+                    status = order.get("Status", "")
+                    if "closed" in status.lower() or "completed" in status.lower():
+                        for item in order.get("Items", []):
+                            history.append({
+                                "DocNum": order.get("DocNum"),
+                                "DocDate": doc_date_str,
+                                "ItemCode": item.get("ItemCode"),
+                                "ItemName": item.get("ItemName"),
+                                "Quantity": item.get("Quantity", 0),
+                                "TotalValue": item.get("LineTotal", 0),
+                                "Status": "Delivered",
+                            })
+            except (ValueError, TypeError):
+                continue
+        
+        return history
+    
     async def get_delivery_history_async(self, customer_code: str, days: int = 30, limit: int = 50) -> List[Dict[str, Any]]:
         """Async version of get_delivery_history."""
         return await asyncio.to_thread(self.get_delivery_history, customer_code, days, limit)
     
-    @cache_delivery(ttl_seconds=DELIVERY_CACHE_TTL)
     def track_delivery(self, doc_num: str) -> Dict[str, Any]:
         """
         Track a specific delivery with real-time status.
@@ -295,29 +386,52 @@ class DeliveryTrackingService:
         For now: provides SAP status and estimated delivery.
         """
         try:
-            delivery = self.get_delivery_details(doc_num)
+            logger.info(f"🔍 Tracking delivery: {doc_num}")
+            
+            # First check outstanding deliveries
+            outstanding = self.get_outstanding_deliveries(limit=200)
+            for delivery in outstanding:
+                if str(delivery.get("DocNum")) == str(doc_num):
+                    return self._build_tracking_response(delivery)
+            
+            # Try to get via API
+            delivery = self.api.get_delivery_by_docnum(doc_num)
             
             if not delivery:
+                logger.warning(f"Delivery {doc_num} not found")
                 return {"error": f"Delivery {doc_num} not found"}
             
-            # Build tracking timeline
-            timeline = self._build_delivery_timeline(delivery)
-            
-            return {
-                "DocNum": doc_num,
-                "Status": delivery["Status"],
-                "ETA": delivery["ETA"],
-                "Customer": delivery["Customer"]["CardName"],
-                "Address": delivery["Customer"]["Address"],
-                "Timeline": timeline,
-                "Items": len(delivery["Items"]),
-                "TotalValue": delivery["TotalValue"],
-            }
+            return self._build_tracking_response(delivery)
             
         except Exception as e:
             self._record_error()
             logger.error(f"Error tracking delivery {doc_num}: {e}")
             return {"error": str(e)}
+    
+    def _build_tracking_response(self, delivery: Dict[str, Any]) -> Dict[str, Any]:
+        """Build consistent tracking response from delivery data."""
+        status = self._determine_delivery_status(delivery)
+        eta = self._calculate_eta(delivery)
+        timeline = self._build_delivery_timeline(delivery)
+        
+        # Extract item info
+        item_name = delivery.get("ItemName", "")
+        if not item_name and delivery.get("DocumentLines"):
+            lines = delivery.get("DocumentLines", [])
+            if lines:
+                item_name = lines[0].get("ItemName", "")
+        
+        return {
+            "DocNum": delivery.get("DocNum"),
+            "Status": status,
+            "ETA": eta,
+            "Customer": delivery.get("CardName", "Unknown"),
+            "Address": delivery.get("Address", "Not specified"),
+            "Timeline": timeline,
+            "ItemName": item_name,
+            "Quantity": delivery.get("Quantity", delivery.get("OpenQty", 0)),
+            "TotalValue": delivery.get("DocTotal", delivery.get("LineTotal", 0)),
+        }
     
     async def track_delivery_async(self, doc_num: str) -> Dict[str, Any]:
         """Async version of track_delivery."""
@@ -327,44 +441,52 @@ class DeliveryTrackingService:
     # DELIVERY ANALYTICS (Optimized)
     # =========================================================
     
-    def get_delivery_summary(self, customer_code: str) -> Dict[str, Any]:
+    def get_delivery_summary(self, customer_code: str = None) -> Dict[str, Any]:
         """
-        Get overall delivery summary for a customer.
+        Get overall delivery summary for a customer or all customers.
         
         Includes:
         - Outstanding deliveries count
         - Delayed deliveries count
-        - On-time delivery rate
-        - Average delivery time
+        - Total pending quantity
+        - Total value of outstanding deliveries
         """
         try:
-            outstanding = self.get_outstanding_deliveries(customer_code, limit=100)
-            history = self.get_delivery_history(customer_code, days=90, limit=100)
+            outstanding = self.get_outstanding_deliveries(customer_code=customer_code, limit=500)
             
-            # Count delayed deliveries
-            delayed = sum(1 for d in outstanding if d["Status"] == "Delayed")
-            in_transit = sum(1 for d in outstanding if d["Status"] == "In Transit")
+            if not outstanding:
+                return {
+                    "TotalOutstanding": 0,
+                    "Delayed": 0,
+                    "TotalPendingQty": 0,
+                    "TotalValue": 0,
+                    "CustomerCode": customer_code or "All Customers",
+                }
+            
+            # Calculate statistics
+            delayed = sum(1 for d in outstanding if d.get("IsOverdue", False) or d.get("Status") == "Overdue")
+            total_qty = sum(float(d.get("OpenQty", d.get("Quantity", 0)) or 0) for d in outstanding)
+            total_value = sum(float(d.get("LineTotal", d.get("DocTotal", 0)) or 0) for d in outstanding)
             
             return {
                 "TotalOutstanding": len(outstanding),
                 "Delayed": delayed,
-                "InTransit": in_transit,
-                "RecentDeliveries": len(history),
-                "OnTimeRate": self._calculate_ontime_rate(history),
-                "CustomerCode": customer_code,
+                "TotalPendingQty": round(total_qty, 2),
+                "TotalValue": round(total_value, 2),
+                "CustomerCode": customer_code or "All Customers",
             }
             
         except Exception as e:
             self._record_error()
-            logger.error(f"Error getting delivery summary for {customer_code}: {e}")
+            logger.error(f"Error getting delivery summary: {e}")
             return {}
     
-    async def get_delivery_summary_async(self, customer_code: str) -> Dict[str, Any]:
+    async def get_delivery_summary_async(self, customer_code: str = None) -> Dict[str, Any]:
         """Async version of get_delivery_summary."""
         return await asyncio.to_thread(self.get_delivery_summary, customer_code)
     
     # =========================================================
-    # BATCH OPERATIONS (NEW)
+    # BATCH OPERATIONS
     # =========================================================
     
     def get_multiple_delivery_details(self, doc_nums: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -397,16 +519,25 @@ class DeliveryTrackingService:
                 self._record_cache_miss()
                 uncached.append(doc_num)
         
-        # Fetch uncached deliveries
+        # Get all outstanding deliveries once
         if uncached:
-            # Use individual calls (batch API would be better if available)
+            outstanding = self.get_outstanding_deliveries(limit=500)
+            outstanding_map = {str(d.get("DocNum")): d for d in outstanding if d.get("DocNum")}
+            
             for doc_num in uncached:
-                try:
-                    details = self.get_delivery_details(doc_num)
-                    if details:
-                        results[doc_num] = details
-                except Exception as e:
-                    logger.error(f"Error fetching delivery {doc_num}: {e}")
+                if doc_num in outstanding_map:
+                    details = self._format_delivery_details(outstanding_map[doc_num])
+                    results[doc_num] = details
+                    # Cache it
+                    cache.set(f"delivery_details:{doc_num}", {}, "", {"data": details})
+                else:
+                    # Try individual fetch
+                    try:
+                        details = self.get_delivery_details(doc_num)
+                        if details:
+                            results[doc_num] = details
+                    except Exception as e:
+                        logger.error(f"Error fetching delivery {doc_num}: {e}")
         
         return results
     
@@ -423,11 +554,22 @@ class DeliveryTrackingService:
         Possible statuses:
         - Pending: Created, not yet dispatched
         - In Transit: Dispatched, on the way
-        - Delayed: Past due date
+        - Overdue: Past due date
         - Delivered: Completed
         - Cancelled: Cancelled order
+        - Outstanding: Still pending delivery
         """
-        doc_status = delivery.get("DocumentStatus", "O")  # O=Open, C=Closed
+        # Check if already has status field
+        if delivery.get("Status"):
+            status = delivery.get("Status")
+            if status in ["Delivered", "Completed", "Cancelled", "Overdue"]:
+                return status
+        
+        # Check for IsOverdue flag
+        if delivery.get("IsOverdue"):
+            return "Overdue"
+        
+        doc_status = delivery.get("DocStatus", "O")  # O=Open, C=Closed
         cancelled = delivery.get("Cancelled", "N")
         
         if cancelled == "Y":
@@ -440,11 +582,16 @@ class DeliveryTrackingService:
         due_date_str = delivery.get("DocDueDate")
         if due_date_str:
             try:
-                due_date = datetime.strptime(due_date_str[:10], "%Y-%m-%d")
+                due_date = datetime.strptime(str(due_date_str)[:10], "%Y-%m-%d")
                 if datetime.now() > due_date:
-                    return "Delayed"
+                    return "Overdue"
             except (ValueError, TypeError):
                 pass
+        
+        # Check if has open quantity
+        open_qty = delivery.get("OpenQty", 0)
+        if open_qty > 0:
+            return "Outstanding"
         
         # Check if dispatched (has shipping date or tracking number)
         if delivery.get("U_ShipDate") or delivery.get("U_TrackingNum"):
@@ -465,7 +612,7 @@ class DeliveryTrackingService:
         
         if due_date_str:
             try:
-                due_date = datetime.strptime(due_date_str[:10], "%Y-%m-%d")
+                due_date = datetime.strptime(str(due_date_str)[:10], "%Y-%m-%d")
                 
                 # If past due, return overdue message
                 if datetime.now() > due_date:
@@ -480,6 +627,23 @@ class DeliveryTrackingService:
                     return "Tomorrow"
                 else:
                     return f"In {days_until} days"
+            except (ValueError, TypeError):
+                pass
+        
+        # If no due date, estimate based on creation date
+        doc_date_str = delivery.get("DocDate")
+        if doc_date_str:
+            try:
+                doc_date = datetime.strptime(str(doc_date_str)[:10], "%Y-%m-%d")
+                # Assuming 3-5 days from creation
+                est_date = doc_date + timedelta(days=5)
+                days_until = (est_date - datetime.now()).days
+                if days_until < 0:
+                    return "Overdue - please follow up"
+                elif days_until == 0:
+                    return "Estimated today"
+                else:
+                    return f"Est. {est_date.strftime('%b %d')}"
             except (ValueError, TypeError):
                 pass
         
@@ -499,7 +663,7 @@ class DeliveryTrackingService:
         if doc_date:
             timeline.append({
                 "event": "Order Created",
-                "date": doc_date,
+                "date": str(doc_date)[:10],
                 "status": "completed"
             })
         
@@ -508,35 +672,30 @@ class DeliveryTrackingService:
         if ship_date:
             timeline.append({
                 "event": "Dispatched",
-                "date": ship_date,
+                "date": str(ship_date)[:10],
                 "status": "completed"
             })
         
         # Expected delivery
         due_date = delivery.get("DocDueDate")
-        status = delivery.get("Status")
+        status = self._determine_delivery_status(delivery)
         
         if due_date:
             timeline.append({
                 "event": "Expected Delivery",
-                "date": due_date,
-                "status": "completed" if status == "Delivered" else "pending"
+                "date": str(due_date)[:10],
+                "status": "completed" if status in ["Delivered", "Completed"] else "pending"
+            })
+        
+        # Add current status as last event if not completed
+        if status not in ["Delivered", "Completed"]:
+            timeline.append({
+                "event": f"Current Status: {status}",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "status": "current"
             })
         
         return timeline
-    
-    def _calculate_ontime_rate(self, history: List[Dict[str, Any]]) -> str:
-        """Calculate on-time delivery percentage."""
-        if not history:
-            return "N/A"
-        
-        # In production: compare actual vs promised delivery dates
-        # For now: use a reasonable estimate
-        if len(history) > 0:
-            # Assume 90% on-time rate as baseline
-            return "90%"
-        
-        return "N/A"
     
     # =========================================================
     # CACHE MANAGEMENT
@@ -548,8 +707,5 @@ class DeliveryTrackingService:
         # Clear LRU caches
         self._determine_delivery_status.cache_clear()
         self._calculate_eta.cache_clear()
-        # Clear Redis cache
-        cache = get_cache_service()
-        # This would need to clear all delivery-related keys
-        # For now, just log
+        # Clear Redis cache (would need pattern deletion)
         logger.info("Delivery tracking service cache cleared")
