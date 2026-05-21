@@ -13,7 +13,7 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from app.services.competitor_api_service import CompetitorAPIService
-from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.leysco_api.client import LeyscoAPIService, create_api_service
 from app.services.pricing_service import PricingService, create_pricing_service
 
 logger = logging.getLogger(__name__)

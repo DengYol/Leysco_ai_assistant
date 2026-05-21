@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache, wraps
 
-from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.leysco_api.client import LeyscoAPIService, create_api_service
 from app.services.cache_service import get_cache_service
 from app.services.pricing_service import get_pricing_service, create_pricing_service, PricingService
 
@@ -61,10 +61,11 @@ def cache_quotation(ttl_seconds: int = QUOTATION_CACHE_TTL):
         def wrapper(self, *args, **kwargs):
             cache = get_cache_service()
             
-            # Generate cache key (include user_token for isolation)
+            # Generate cache key (include user_token and company_code for isolation)
             func_name = func.__name__
             user_suffix = self.user_token[:8] if self.user_token else "no_token"
-            cache_str = f"quotation:{user_suffix}:{func_name}:{str(args)}:{str(sorted(kwargs.items()))}"
+            company_suffix = self.company_code if self.company_code else "no_company"
+            cache_str = f"quotation:{user_suffix}:{company_suffix}:{func_name}:{str(args)}:{str(sorted(kwargs.items()))}"
             cache_key = hashlib.md5(cache_str.encode()).hexdigest()
             
             # Check cache
@@ -90,23 +91,31 @@ class QuotationIntelligence:
     Read-only quotation analytics for the Leysco AI assistant.
     Optimized with caching and async support.
     
-    FIXED: Now accepts user_token to properly authenticate API calls.
+    FIXED: Now accepts user_token and company_code to properly authenticate API calls.
     """
 
-    def __init__(self, user_token: str = None) -> None:
+    def __init__(self, user_token: str = None, company_code: str = None) -> None:
         """
-        Initialize QuotationIntelligence with user token.
+        Initialize QuotationIntelligence with user token and company code.
         
         Args:
             user_token: The authenticated user's Bearer token from the request
+            company_code: Company code for multi-tenant URL resolution
         """
         self.user_token = user_token
+        self.company_code = company_code
         
-        # Create API services with the user token
+        # Create API services with the user token and company code
         if user_token:
-            self.api = LeyscoAPIService(user_token=user_token)
-            self.pricing = create_pricing_service(user_token=user_token)
-            logger.info("✅ QuotationIntelligence initialized WITH user token")
+            self.api = LeyscoAPIService(
+                user_token=user_token,
+                company_code=company_code
+            )
+            self.pricing = create_pricing_service(
+                user_token=user_token,
+                company_code=company_code
+            )
+            logger.info(f"✅ QuotationIntelligence initialized WITH user token and company_code={company_code}")
         else:
             self.api = LeyscoAPIService()  # Will fail but at least initialized
             self.pricing = get_pricing_service()  # Will fail but at least initialized
@@ -134,6 +143,16 @@ class QuotationIntelligence:
         if hasattr(self.pricing, 'set_user_token'):
             self.pricing.set_user_token(token)
         logger.debug("QuotationIntelligence token updated")
+    
+    def set_company_code(self, company_code: str):
+        """
+        Update company code for this instance.
+        """
+        self.company_code = company_code
+        self.api.set_company_code(company_code)
+        if hasattr(self.pricing, 'set_company_code'):
+            self.pricing.set_company_code(company_code)
+        logger.debug(f"QuotationIntelligence company code updated to: {company_code}")
 
     # ------------------------------------------------------------------
     # STATS HELPERS
@@ -783,24 +802,25 @@ def _safe_float(val: Any) -> float:
 # FIXED: Removed singleton pattern - now creates fresh instance per request
 # ---------------------------------------------------------------------------
 
-def create_quotation_intelligence(user_token: str = None) -> QuotationIntelligence:
+def create_quotation_intelligence(user_token: str = None, company_code: str = None) -> QuotationIntelligence:
     """
-    Create a new QuotationIntelligence instance with the user's token.
+    Create a new QuotationIntelligence instance with the user's token and company code.
     Called per request to ensure proper authentication isolation.
     
     Args:
         user_token: The authenticated user's Bearer token from the request
+        company_code: Company code for multi-tenant URL resolution
     
     Returns:
         Configured QuotationIntelligence instance
     
     Example:
-        qi = create_quotation_intelligence(user_token=request_token)
+        qi = create_quotation_intelligence(user_token=request_token, company_code="TEST001")
         report = qi.get_follow_up_report()
     """
     if not user_token:
         logger.warning("Creating QuotationIntelligence without user token - data access will fail")
-    return QuotationIntelligence(user_token=user_token)
+    return QuotationIntelligence(user_token=user_token, company_code=company_code)
 
 
 # ---------------------------------------------------------------------------
@@ -811,12 +831,12 @@ def create_quotation_intelligence(user_token: str = None) -> QuotationIntelligen
 _qi_instance: QuotationIntelligence | None = None
 
 
-def get_quotation_intelligence(user_token: str = None) -> QuotationIntelligence:
+def get_quotation_intelligence(user_token: str = None, company_code: str = None) -> QuotationIntelligence:
     """
     DEPRECATED: Old singleton accessor. Use create_quotation_intelligence() instead.
     
     This function is kept for backward compatibility but will log a warning.
-    For new code, use create_quotation_intelligence(user_token=token) to create
+    For new code, use create_quotation_intelligence(user_token=token, company_code=company_code) to create
     a fresh instance per request.
     
     If user_token is provided, it will update the singleton's token (but this
@@ -824,17 +844,20 @@ def get_quotation_intelligence(user_token: str = None) -> QuotationIntelligence:
     """
     import warnings
     warnings.warn(
-        "get_quotation_intelligence() is deprecated. Use create_quotation_intelligence(user_token=token) instead.",
+        "get_quotation_intelligence() is deprecated. Use create_quotation_intelligence(user_token=token, company_code=company_code) instead.",
         DeprecationWarning,
         stacklevel=2
     )
     
     global _qi_instance
     if _qi_instance is None:
-        _qi_instance = QuotationIntelligence(user_token=user_token)
+        _qi_instance = QuotationIntelligence(user_token=user_token, company_code=company_code)
         logger.warning("Using deprecated singleton pattern - create fresh instances per request for better isolation")
     elif user_token and _qi_instance.user_token != user_token:
         _qi_instance.set_user_token(user_token)
         logger.debug("Updated deprecated singleton with new token")
+    elif company_code and _qi_instance.company_code != company_code:
+        _qi_instance.set_company_code(company_code)
+        logger.debug("Updated deprecated singleton with new company code")
     
     return _qi_instance

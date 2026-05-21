@@ -38,7 +38,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from app.core.config import settings
+from app.core.config import settings, get_leysco_api_base_url
 from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
@@ -108,15 +108,25 @@ class PricingService:
     MODIFIED: Uses per-request user token instead of static token.
     """
 
-    def __init__(self, user_token: str = None):
+    def __init__(self, user_token: str = None, company_code: str = None):
         """
-        Initialize pricing service with user token.
+        Initialize pricing service with user token and company code.
         
         Args:
             user_token: Bearer token from authenticated user
+            company_code: Company code for multi-tenant URL resolution
         """
-        self.base_url = settings.LEYSCO_API_BASE_URL.rstrip("/")
+        self.company_code = company_code
         self.user_token = user_token
+        
+        # Resolve base URL dynamically using company code
+        if company_code:
+            self.base_url = get_leysco_api_base_url(company_code).rstrip("/")
+            logger.debug(f"PricingService resolved base URL for {company_code}: {self.base_url}")
+        else:
+            # Fallback to global setting (should not happen in multi-tenant)
+            self.base_url = settings.LEYSCO_API_BASE_URL.rstrip("/")
+            logger.warning(f"PricingService initialized without company_code, using global URL: {self.base_url}")
         
         # Configure session with connection pooling
         self.session = requests.Session()
@@ -174,6 +184,13 @@ class PricingService:
         self.user_token = token
         self._update_headers()
         logger.debug("PricingService user token updated")
+    
+    def set_company_code(self, company_code: str):
+        """Update company code and re-resolve base URL."""
+        self.company_code = company_code
+        if company_code:
+            self.base_url = get_leysco_api_base_url(company_code).rstrip("/")
+            logger.debug(f"PricingService base URL updated for {company_code}: {self.base_url}")
     
     def _ensure_auth(self) -> bool:
         """Check if we have a valid user token."""
@@ -584,10 +601,20 @@ class PricingService:
         
         try:
             self._record_api_call()
+            url = f"{self.base_url}/price_lists"
+            logger.debug(f"Fetching price lists from: {url}")
+            
             resp = self.session.get(
-                f"{self.base_url}/price_lists",
+                url,
                 timeout=15,
             )
+            
+            # Check for HTML response (auth failure or wrong URL)
+            response_text = resp.text[:50] if resp.text else ""
+            if "<!DOCTYPE" in response_text or "<html" in response_text.lower():
+                logger.error(f"Pricing endpoint returned HTML — likely auth failure or wrong URL: {url}")
+                logger.error(f"Response preview: {response_text}")
+                return
             
             # Check for auth failure
             if resp.status_code == 401:
@@ -754,32 +781,35 @@ class PricingService:
 
 # ---------------------------------------------------------------------------
 # IMPORTANT: No singleton instance for Phase 1
-# Each request creates its own instance with user token
+# Each request creates its own instance with user token and company code
 # ---------------------------------------------------------------------------
 
-def create_pricing_service(user_token: str = None) -> PricingService:
+def create_pricing_service(user_token: str = None, company_code: str = None) -> PricingService:
     """
-    Create a new pricing service instance with the user's token.
+    Create a new pricing service instance with the user's token and company code.
     This should be called for each request.
     
     Args:
         user_token: The authenticated user's Bearer token
+        company_code: Company code for multi-tenant URL resolution
     
     Returns:
         Configured PricingService instance
     """
     if not user_token:
         logger.warning("Creating pricing service without user token - lookups will fail")
-    return PricingService(user_token=user_token)
+    if not company_code:
+        logger.warning("Creating pricing service without company_code - will use global URL")
+    return PricingService(user_token=user_token, company_code=company_code)
 
 
 # Legacy function - will be deprecated
 def get_pricing_service() -> PricingService:
     """
-    LEGACY: Returns singleton instance WITHOUT user token.
+    LEGACY: Returns singleton instance WITHOUT user token or company code.
     This will cause authentication errors.
     
-    Use create_pricing_service(user_token) instead.
+    Use create_pricing_service(user_token, company_code) instead.
     """
-    logger.warning("Using legacy get_pricing_service() without user token - this will fail")
-    return PricingService()  # No token - will fail
+    logger.warning("Using legacy get_pricing_service() without user token/company - this will fail")
+    return PricingService()  # No token, no company - will fail

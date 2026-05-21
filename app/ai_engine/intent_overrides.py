@@ -36,7 +36,7 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
     
     # Get original query if available (from entity extractor)
     original_query = (entities.get("_original_query") or "").lower()
-
+    
     # =========================================================
     # 🚫 PROTECTED INTENTS - NEVER OVERRIDE THESE
     # =========================================================
@@ -54,12 +54,53 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
         "FIND_BEST_PRICE",          # Never override best price
         "MARKET_INTELLIGENCE",      # Never override market intelligence
         "PRICE_ALERT",              # Never override price alerts
+        "GET_WAREHOUSE_STOCK",      # PROTECT: Never override warehouse stock
+        "GET_WAREHOUSES",           # PROTECT: Never override warehouse listing
+        "GET_LOW_STOCK_ALERTS",     # PROTECT: Never override low stock alerts
     }
     
     if intent in PROTECTED_INTENTS:
         logger.debug(f"🛡️ Protected intent '{intent}' - no override applied")
         return intent
-
+    
+    # =========================================================
+    # 🔍 CHECK FOR WAREHOUSE QUERIES FIRST (high priority)
+    # =========================================================
+    # This must come BEFORE Rule 1 (item+customer) because warehouse queries
+    # often have both item_name and customer_name set incorrectly.
+    
+    # Check if this is a warehouse-related query
+    warehouse_keywords = ["warehouse", "stock in", "inventory at", "dispatch", "store", "branch"]
+    is_warehouse_query = any(kw in original_query for kw in warehouse_keywords)
+    
+    # If intent is already GET_WAREHOUSE_STOCK or GET_WAREHOUSES, preserve it
+    if intent in ["GET_WAREHOUSE_STOCK", "GET_WAREHOUSES", "GET_LOW_STOCK_ALERTS"]:
+        if warehouse_name or is_warehouse_query:
+            logger.debug(f"🏭 Preserving warehouse intent: {intent}")
+            return intent
+    
+    # Warehouse stock query detection (specific warehouse)
+    if is_warehouse_query and ("stock" in original_query or "inventory" in original_query):
+        logger.info(f"🏭 Warehouse stock query detected - forcing GET_WAREHOUSE_STOCK")
+        return "GET_WAREHOUSE_STOCK"
+    
+    # ✨ NEW: Check if item_name and customer_name are the SAME (indicates extraction error)
+    # This happens when "dispatch warehouse" gets set to both fields
+    if item_name and customer_name and item_name.lower() == customer_name.lower():
+        # This is likely an extraction error, not a real customer price query
+        logger.info(f"⚠️ Same value in item_name and customer_name: '{item_name}' - checking for warehouse")
+        
+        # Check if this value looks like a warehouse
+        warehouse_indicators = ["warehouse", "dispatch", "store", "depot", "branch"]
+        if any(indicator in item_name.lower() for indicator in warehouse_indicators):
+            # This is a warehouse query, not a price query
+            if "stock" in original_query or "inventory" in original_query:
+                logger.info(f"🏭 Overriding: same item/customer -> GET_WAREHOUSE_STOCK")
+                return "GET_WAREHOUSE_STOCK"
+            elif "warehouses" in original_query or "list" in original_query:
+                logger.info(f"🏭 Overriding: same item/customer -> GET_WAREHOUSES")
+                return "GET_WAREHOUSES"
+    
     # =========================================================
     # 🔍 CROSS-SELL DETECTION - Even if intent got misclassified
     # =========================================================
@@ -117,13 +158,16 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
 
     # ── RULE 1: item + customer → GET_CUSTOMER_PRICE ──────────────────
     # "price of vegimax for magomano" → both entities extracted
-    if item_name and customer_name:
-        logger.debug(f"RULE 1: item + customer -> GET_CUSTOMER_PRICE")
-        return "GET_CUSTOMER_PRICE"
+    # BUT skip if this is actually a warehouse query (detected above)
+    if item_name and customer_name and not is_warehouse_query:
+        # Make sure they're not the same value (extraction error)
+        if item_name.lower() != customer_name.lower():
+            logger.debug(f"RULE 1: item + customer -> GET_CUSTOMER_PRICE")
+            return "GET_CUSTOMER_PRICE"
 
     # ── RULE 2: customer only, no item, price context → try GET_CUSTOMER_PRICE ──
     # This handles "magomano price" where item_name failed to extract
-    if customer_name and not item_name:
+    if customer_name and not item_name and not is_warehouse_query:
         # Only override if original intent suggests pricing
         if intent in ("GET_ITEM_PRICE", "GET_ITEMS_ADVANCED"):
             logger.debug(f"RULE 2: customer only with price context -> GET_CUSTOMER_PRICE")
@@ -131,7 +175,7 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
 
     # ── RULE 3: item only, price keyword context → GET_ITEM_PRICE ─────
     # Protects against GET_ITEMS_ADVANCED when user clearly wants a price.
-    if item_name and not customer_name:
+    if item_name and not customer_name and not is_warehouse_query:
         if intent == "GET_ITEMS_ADVANCED" and not warehouse_name:
             logger.debug(f"RULE 3: item only, no warehouse -> GET_ITEM_PRICE")
             return "GET_ITEM_PRICE"
@@ -151,7 +195,6 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
     
     # 4b: No warehouse entity but warehouse keywords in item_name
     # This handles cases where warehouse wasn't extracted but is in the query
-    warehouse_keywords = ["warehouse", "store", "branch", "depot", "facility"]
     if not warehouse_name and item_name:
         item_lower = item_name.lower()
         for keyword in warehouse_keywords:
@@ -225,7 +268,7 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
             if any(p in customer_name.lower() for p in bogus_patterns):
                 logger.info(f"🧹 Cleared bogus customer_name='{customer_name}' from recommendation query")
                 entities["customer_name"] = None
-                customer_name = None  # Update local variable too
+                customer_name = None
 
     # =========================================================
     # 🚫 BLOCK CROSS-SELL OVERRIDE FOR QUOTATION

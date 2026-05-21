@@ -193,7 +193,7 @@ class AnomalyDetectionService:
         anomalies = []
         
         try:
-            from app.services.leysco_api_service import create_api_service
+            from app.services.leysco_api.client import create_api_service
             
             api_service = create_api_service(user_token=user_token)
             
@@ -273,7 +273,7 @@ class AnomalyDetectionService:
         anomalies = []
         
         try:
-            from app.services.leysco_api_service import create_api_service
+            from app.services.leysco_api.client import create_api_service
             from app.services.pricing_service import create_pricing_service
             
             api_service = create_api_service(user_token=user_token)

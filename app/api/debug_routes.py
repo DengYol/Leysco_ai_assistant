@@ -21,7 +21,7 @@ from typing import Optional
 from fastapi import APIRouter, Query, Request, Depends
 from fastapi.responses import JSONResponse
 
-from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.leysco_api.client import LeyscoAPIService, create_api_service
 from app.services.pricing_service import PricingService, create_pricing_service
 from app.api.dependencies import get_token_from_header
 

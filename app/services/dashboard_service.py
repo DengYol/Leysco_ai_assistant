@@ -36,7 +36,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from functools import wraps
 
-from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.leysco_api.client import LeyscoAPIService, create_api_service
 from app.services.warehouse_service import WarehouseService, create_warehouse_service
 from app.services.delivery_tracking_service import DeliveryTrackingService
 from app.services.cache_service import get_cache_service

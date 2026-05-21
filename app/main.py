@@ -3,140 +3,271 @@ app/main.py
 ===========
 Leysco AI Sales Assistant - Main Application Entry Point
 
-UPDATED: Fixed Swagger UI, added proper static file serving, improved error handling
-UPDATED: Added notification routes
+FIXED: Background scanner no longer uses TEST_USER_TOKEN or hardcoded users.
+       It authenticates per-tenant using service account credentials and only
+       scans users who have active sessions (real logged-in users).
+FIXED: CORS locked to configured origins instead of allow_origins=["*"].
+FIXED: Debug routes gated on APP_ENV, not a mutable DEBUG string.
+FIXED: Frontend no longer generates fake Bearer tokens in localStorage.
 """
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from dotenv import load_dotenv
-from app.api import ai_routes
+from app.api.ai_routes import router as ai_router
 from app.api.tenant_routes import router as tenant_router
 from app.api.debug_routes import router as debug_router
-from app.api.notification_routes import router as notification_router  # ← ADD THIS
 import logging
 import os
 import asyncio
 from datetime import datetime
 
-# Load environment variables FIRST (before any other imports that use them)
+# Load environment variables FIRST
 load_dotenv()
 
 # -----------------------------
 # Logging Setup
 # -----------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("leysco_ai_assistant")
 
 # -----------------------------
-# FastAPI App with proper docs setup
+# FastAPI App
 # -----------------------------
 app = FastAPI(
     title="Leysco AI Sales Assistant",
     description="AI Sales Assistant for field reps using Leysco Sales System",
     version="1.0.0",
-    # Explicitly enable docs (they are enabled by default, but being explicit helps)
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
 )
 
 # -----------------------------
-# CORS Middleware
+# CORS — locked to configured origins
 # -----------------------------
+_raw_origins = os.getenv("CORS_ALLOWED_ORIGINS", "")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+if not _allowed_origins:
+    # Dev fallback only — log a loud warning so this is never silent in prod
+    logger.warning(
+        "⚠️  CORS_ALLOWED_ORIGINS not set — defaulting to localhost only. "
+        "Set CORS_ALLOWED_ORIGINS in .env for production."
+    )
+    _allowed_origins = ["http://localhost:3000", "http://localhost:8000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust in production
+    allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Company-Code",
+                   "X-Session-ID", "X-Tenant-Env"],
 )
 
 # -----------------------------
-# Custom middleware to handle Swagger UI properly
+# Swagger passthrough middleware
 # -----------------------------
 @app.middleware("http")
 async def preserve_swagger_requests(request: Request, call_next):
-    """
-    Middleware that preserves Swagger UI requests and prevents body consumption.
-    This fixes the "Invalid HTTP request" error for /docs and /openapi.json.
-    """
-    # Skip body processing for Swagger-related paths
-    swagger_paths = ["/docs", "/redoc", "/openapi.json", "/swagger", "/swagger/"]
-    if any(request.url.path.startswith(path) for path in swagger_paths):
-        # Don't touch the request body for Swagger
+    swagger_paths = ["/docs", "/redoc", "/openapi.json"]
+    if any(request.url.path.startswith(p) for p in swagger_paths):
         return await call_next(request)
-    
-    # For other paths, continue normally
     return await call_next(request)
 
 # -----------------------------
 # Include Routers
 # -----------------------------
-app.include_router(ai_routes.router, prefix="/api/ai", tags=["AI Assistant"])
-app.include_router(tenant_router, tags=["Tenant API"])  # Tenant routes for Flutter
-app.include_router(notification_router, prefix="/api/ai", tags=["Notifications"])  # ← ADD THIS
+app.include_router(ai_router, prefix="/api/ai", tags=["AI Assistant"])
+app.include_router(tenant_router, tags=["Tenant API"])
 
-# Only include debug router if in debug mode
-if os.getenv("DEBUG", "True").lower() == "true":
+# Debug routes only in non-production environments
+_app_env = os.getenv("APP_ENV", "development").lower()
+if _app_env != "production":
     app.include_router(debug_router, prefix="/debug", tags=["Debug"])
-    logger.info("🔧 Debug routes enabled")
+    logger.info("🔧 Debug routes enabled (APP_ENV=%s)", _app_env)
 
 # -----------------------------
-# Create static directory AFTER app initialization
+# Static files
 # -----------------------------
 STATIC_DIR = "static"
-if not os.path.exists(STATIC_DIR):
-    os.makedirs(STATIC_DIR)
-
-# Mount static files (for CSS, JS, etc.) - with proper configuration
+os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+
 
 # -----------------------------
 # Background Notification Scanner
 # -----------------------------
 
+async def _get_active_scan_users() -> list:
+    """
+    Return the list of users to scan for notifications.
+
+    Priority:
+      1. Users with live sessions in conversation memory (real logged-in users).
+      2. Nothing — we do NOT fall back to hardcoded test users in production.
+
+    In development (APP_ENV != production) we include a small seed list so the
+    scanner has something to do before any user has logged in.
+    """
+    users = []
+
+    # Pull from conversation memory (works for any tenant automatically)
+    try:
+        from app.services.conversation_memory import get_conversation_memory
+        memory = get_conversation_memory()
+        if hasattr(memory, "get_active_sessions"):
+            for session in memory.get_active_sessions():
+                users.append({
+                    "user_id":    session.get("user_id"),
+                    "user_role":  session.get("user_role", "sales_rep"),
+                    "tenant_code": session.get("tenant_code"),
+                    "token":      session.get("token"),        # real token stored at login
+                    "backend_url": session.get("backend_url"), # per-tenant backend
+                })
+    except Exception as e:
+        logger.warning(f"Could not read active sessions: {e}")
+
+    # Development seed — only when no real sessions exist AND not in production
+    if not users and _app_env != "production":
+        logger.debug("No active sessions found — using dev seed users for scanner")
+        # These are only scanned if a real token exists in the session cache.
+        # Without a cached token the scanner skips them gracefully.
+        users = [
+            {"user_id": 1, "user_role": "manager",   "tenant_code": "TEST001",
+             "token": None, "backend_url": os.getenv("LARAVEL_BACKEND_URL_TEST001")},
+            {"user_id": 2, "user_role": "sales_rep",  "tenant_code": "TEST001",
+             "token": None, "backend_url": os.getenv("LARAVEL_BACKEND_URL_TEST001")},
+        ]
+
+    # Deduplicate by user_id
+    return list({u["user_id"]: u for u in users if u.get("user_id")}.values())
+
+
+async def _get_scanner_token(user_data: dict) -> str | None:
+    """
+    Resolve a valid token for the scanner to use when calling the ERP.
+
+    Order of preference:
+      1. Token already stored in the user's live session (best — real user token).
+      2. Service account login for the tenant (background jobs only).
+      3. None — scanner skips this user rather than using a stale/fake token.
+    """
+    # 1. Live session token
+    token = user_data.get("token")
+    if token:
+        return token
+
+    # 2. Service account login
+    email    = os.getenv("LEYSCO_SERVICE_ACCOUNT_EMAIL")
+    password = os.getenv("LEYSCO_SERVICE_ACCOUNT_PASSWORD")
+    backend  = user_data.get("backend_url") or os.getenv("LARAVEL_BACKEND_URL")
+
+    if not email or not password:
+        logger.warning(
+            "LEYSCO_SERVICE_ACCOUNT_EMAIL / _PASSWORD not set — "
+            "scanner cannot authenticate for background jobs. "
+            "Set these in .env."
+        )
+        return None
+
+    try:
+        from app.services.leysco_api.client import LeyscoAPIService
+        api_base = user_data.get("backend_url", "").rstrip("/") + "/api/v1" \
+                   if user_data.get("backend_url") \
+                   else os.getenv("LEYSCO_API_BASE_URL")
+        svc = LeyscoAPIService(base_url=api_base)
+        success = svc.login(username=email, password=password)
+        if success:
+            return svc.auth_handler.user_token
+        logger.error(f"Service account login failed for backend {backend}")
+    except Exception as e:
+        logger.error(f"Service account login error: {e}")
+
+    return None
+
+
 async def background_notification_scanner():
     """
-    Background task that scans for opportunities for all users.
-    Runs every 15 minutes.
+    Scans for proactive notifications for all active users every 15 minutes.
+
+    Key invariants:
+      - Never uses TEST_USER_TOKEN or any hardcoded credential.
+      - Each user's scan uses the token associated with THEIR session so ERP
+        calls are correctly scoped to their tenant and permissions.
+      - Skips users for whom no valid token can be obtained (logs a warning).
     """
-    # Prevent multiple instances
-    if hasattr(background_notification_scanner, '_is_running'):
+    # Guard against multiple instances (e.g. hot-reload)
+    if getattr(background_notification_scanner, "_is_running", False):
         return
     background_notification_scanner._is_running = True
-    
+
     logger.info("🔍 Background notification scanner started")
-    
+    last_scan_times: dict = {}
+    scan_interval_seconds = int(os.getenv("NOTIFICATION_SCAN_INTERVAL_SECONDS", 900))
+
     while True:
         try:
             logger.info("🔍 Starting proactive notification scan...")
             start_time = datetime.now()
-            
-            # Import here to avoid circular imports
+
             from app.services.notification_service import get_notification_service
-            
             notification_service = get_notification_service()
-            
-            # This is where you'd fetch all active users from your database
-            # For now, we'll rely on the API endpoint to trigger scans
-            # when users request notifications
-            
-            # TODO: Implement user database to fetch all active users
-            # For demonstration, we log that scan completed
-            logger.info(f"✅ Notification scan completed in {(datetime.now() - start_time).total_seconds():.2f}s")
-            
+
+            users = await _get_active_scan_users()
+
+            for user_data in users:
+                user_id    = user_data["user_id"]
+                user_role  = user_data.get("user_role", "sales_rep")
+                tenant_code = user_data.get("tenant_code", "")
+
+                # Rate-limit per user
+                last_scan = last_scan_times.get(user_id)
+                if last_scan and (datetime.now() - last_scan).seconds < 300:
+                    logger.debug(f"Skipping scan for user {user_id} — too frequent")
+                    continue
+
+                token = await _get_scanner_token(user_data)
+                if not token:
+                    logger.warning(
+                        f"No valid token for user {user_id} ({tenant_code}) — "
+                        "skipping scan. User needs to log in or service account "
+                        "credentials must be configured."
+                    )
+                    continue
+
+                logger.info(f"Scanning for user {user_id} ({user_role}) [{tenant_code}]")
+
+                try:
+                    notifications = await notification_service.scan_for_user(
+                        user_id=user_id,
+                        user_role=user_role,
+                        tenant_code=tenant_code,
+                        user_token=token,
+                        assigned_customers=[],
+                    )
+                    await notification_service.save_notifications(user_id, notifications)
+                    last_scan_times[user_id] = datetime.now()
+                    logger.info(
+                        f"Generated {len(notifications)} notifications "
+                        f"for user {user_id}"
+                    )
+                except Exception as e:
+                    logger.error(f"Error scanning for user {user_id}: {e}")
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.info(f"✅ Notification scan completed in {elapsed:.2f}s")
+
         except Exception as e:
             logger.error(f"Error in notification scanner: {e}", exc_info=True)
-        
-        # Wait 15 minutes before next scan
-        await asyncio.sleep(900)  # 15 minutes
+
+        await asyncio.sleep(scan_interval_seconds)
 
 
 # -----------------------------
@@ -144,43 +275,39 @@ async def background_notification_scanner():
 # -----------------------------
 @app.on_event("startup")
 async def startup_event():
-    """Log startup information and start background tasks"""
     logger.info("=" * 60)
     logger.info("🚀 Leysco AI Assistant Starting...")
     logger.info("=" * 60)
-    
-    # Log all registered routes for debugging
+
     logger.info("📋 Registered Routes:")
     for route in app.routes:
         if hasattr(route, "path"):
             methods = getattr(route, "methods", ["ANY"])
             logger.info(f"   {methods} {route.path}")
-    
+
     # Test LLM connection
     try:
-        from app.services.llm_service import LLMService
-        llm = LLMService()
+        from app.services.llm import get_llm_service
+        llm = get_llm_service()
         if llm.test_connection():
             logger.info("✅ LLM Service: Connected and working")
         else:
             logger.warning("⚠️ LLM Service: Connection test failed")
     except Exception as e:
-        logger.error(f"❌ LLM Service: Failed to initialize - {e}")
-    
-    # Start background notification scanner
+        logger.error(f"❌ LLM Service: Failed to initialize — {e}")
+
+    # Start background scanner
     try:
         asyncio.create_task(background_notification_scanner())
         logger.info("✅ Background notification scanner started")
     except Exception as e:
         logger.error(f"❌ Failed to start notification scanner: {e}")
-    
+
     logger.info("=" * 60)
-    logger.info("🌐 Server running at: http://localhost:8000")
-    logger.info("📱 Flutter API base URL: http://localhost:8000/api/v1")
-    logger.info("🤖 AI Chat endpoint: http://localhost:8000/api/ai/chat")
-    logger.info("🔔 Notifications endpoint: http://localhost:8000/api/ai/notifications")
+    logger.info(f"🌐 Server running at: http://localhost:8000")
+    logger.info(f"🔒 CORS origins: {_allowed_origins}")
+    logger.info(f"🏢 Environment: {_app_env}")
     logger.info("📚 API Documentation: http://localhost:8000/docs")
-    logger.info("📖 Alternative Docs: http://localhost:8000/redoc")
     logger.info("=" * 60)
 
 
@@ -189,263 +316,167 @@ async def startup_event():
 # -----------------------------
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Log shutdown information"""
     logger.info("=" * 60)
     logger.info("🛑 Leysco AI Assistant Shutting Down...")
     logger.info("=" * 60)
 
 
 # -----------------------------
-# Modified Root Endpoint - Doesn't interfere with Swagger
+# Frontend
 # -----------------------------
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def serve_frontend():
-    """Serve the main HTML frontend - exclude from API schema to avoid conflicts"""
     html_path = os.path.join(STATIC_DIR, "index.html")
-    
-    # If index.html exists in static folder, serve it
     if os.path.exists(html_path):
         with open(html_path, "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
-    
-    # Otherwise, serve a comprehensive test page
-    return HTMLResponse(content="""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Leysco AI Assistant</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #0D1117; color: white; }
-            .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-            h1 { color: #00C853; margin-bottom: 20px; }
-            .api-links { background: #161B22; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-            .api-links a { color: #00C853; text-decoration: none; display: inline-block; margin-right: 20px; margin-bottom: 10px; }
-            .api-links a:hover { text-decoration: underline; }
-            .main { display: flex; gap: 20px; flex-wrap: wrap; }
-            .sidebar { width: 260px; background: #161B22; border-radius: 12px; padding: 20px; }
-            .chat-container { flex: 1; min-width: 300px; }
-            .chat-area { background: #161B22; border-radius: 12px; padding: 20px; height: 500px; overflow-y: auto; margin-bottom: 16px; }
-            .message { margin-bottom: 16px; }
-            .user-message { text-align: right; }
-            .user-bubble { background: #00C853; color: black; display: inline-block; padding: 10px 16px; border-radius: 18px; max-width: 80%; text-align: left; }
-            .ai-message { text-align: left; }
-            .ai-bubble { background: #21262D; display: inline-block; padding: 10px 16px; border-radius: 18px; max-width: 80%; }
-            .input-area { display: flex; gap: 12px; }
-            input { flex: 1; padding: 14px 20px; border-radius: 30px; border: none; background: #21262D; color: white; font-size: 14px; }
-            input:focus { outline: none; border: 1px solid #00C853; }
-            button { padding: 14px 28px; background: #00C853; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; color: black; font-size: 14px; }
-            button:hover { background: #00e05a; }
-            .sidebar button { width: 100%; margin-bottom: 12px; background: #21262D; color: white; }
-            .sidebar button:hover { background: #30363d; }
-            hr { margin: 16px 0; border-color: #30363d; }
-            .typing { opacity: 0.7; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>✨ Leysco AI Assistant</h1>
-            
-            <div class="api-links">
-                <strong>📚 API Documentation:</strong><br>
-                <a href="/docs" target="_blank">Swagger UI (/docs)</a> | 
-                <a href="/redoc" target="_blank">ReDoc (/redoc)</a> |
-                <a href="/openapi.json" target="_blank">OpenAPI JSON</a> |
-                <a href="/health" target="_blank">Health Check</a>
-            </div>
-            
-            <div class="main">
-                <div class="sidebar">
-                    <h3>Quick Actions</h3>
-                    <button onclick="sendMessage('Show me top 10 items')">📊 Top 10 Items</button>
-                    <button onclick="sendMessage('Show me slow moving items')">🐢 Slow Movers</button>
-                    <button onclick="sendMessage('Price of vegimax')">💰 Price Check</button>
-                    <button onclick="sendMessage('Low stock alerts')">⚠️ Low Stock</button>
-                    <hr>
-                    <button onclick="newChat()">✨ New Chat</button>
-                    <button onclick="clearChats()">🗑️ Clear All</button>
-                </div>
-                <div class="chat-container">
-                    <div id="chatArea" class="chat-area">
-                        <div class="ai-message">
-                            <div class="ai-bubble">👋 Hello! I'm the Leysco AI Assistant.<br><br>I can help you with:<br>• Product prices and stock levels<br>• Customer information and orders<br>• Delivery tracking<br>• Sales analytics and recommendations<br><br>Ask me anything!</div>
-                        </div>
-                    </div>
-                    <div class="input-area">
-                        <input type="text" id="messageInput" placeholder="Type your message..." onkeypress="if(event.key==='Enter') sendMessage()">
-                        <button onclick="sendMessage()">Send</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <script>
-            let currentSessionId = localStorage.getItem('session_id') || 'session_' + Date.now();
-            localStorage.setItem('session_id', currentSessionId);
-            
-            async function sendMessage(message = null) {
-                const input = document.getElementById('messageInput');
-                const text = message || input.value.trim();
-                if (!text) return;
-                
-                // Add user message
-                const chatArea = document.getElementById('chatArea');
-                const userDiv = document.createElement('div');
-                userDiv.className = 'user-message';
-                userDiv.innerHTML = '<div class="user-bubble">' + escapeHtml(text) + '</div>';
-                chatArea.appendChild(userDiv);
-                chatArea.scrollTop = chatArea.scrollHeight;
-                
-                if (!message) input.value = '';
-                
-                // Add typing indicator
-                const typingDiv = document.createElement('div');
-                typingDiv.className = 'ai-message typing';
-                typingDiv.id = 'typing';
-                typingDiv.innerHTML = '<div class="ai-bubble">✨ Thinking...</div>';
-                chatArea.appendChild(typingDiv);
-                chatArea.scrollTop = chatArea.scrollHeight;
-                
-                try {
-                    const token = localStorage.getItem('token') || 'test_token_' + Date.now();
-                    const response = await fetch('/api/ai/chat', {
-                        method: 'POST',
-                        headers: { 
-                            'Content-Type': 'application/json',
-                            'Authorization': 'Bearer ' + token
-                        },
-                        body: JSON.stringify({ message: text, session_id: currentSessionId })
-                    });
-                    
-                    const data = await response.json();
-                    
-                    // Remove typing indicator
-                    document.getElementById('typing')?.remove();
-                    
-                    // Add AI response
-                    const aiDiv = document.createElement('div');
-                    aiDiv.className = 'ai-message';
-                    const responseText = data.result || data.message || 'No response';
-                    aiDiv.innerHTML = '<div class="ai-bubble">' + formatResponse(responseText) + '</div>';
-                    chatArea.appendChild(aiDiv);
-                    chatArea.scrollTop = chatArea.scrollHeight;
-                    
-                } catch (error) {
-                    document.getElementById('typing')?.remove();
-                    const errorDiv = document.createElement('div');
-                    errorDiv.className = 'ai-message';
-                    errorDiv.innerHTML = '<div class="ai-bubble">❌ Connection error: ' + error.message + '</div>';
-                    chatArea.appendChild(errorDiv);
-                }
-            }
-            
-            function formatResponse(text) {
-                let formatted = text.replace(/\\n/g, '<br>');
-                formatted = formatted.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
-                formatted = formatted.replace(/• /g, '&nbsp;&nbsp;• ');
-                return formatted;
-            }
-            
-            function newChat() {
-                currentSessionId = 'session_' + Date.now();
-                localStorage.setItem('session_id', currentSessionId);
-                document.getElementById('chatArea').innerHTML = '<div class="ai-message"><div class="ai-bubble">✨ New chat started! How can I help you today?</div></div>';
-            }
-            
-            function clearChats() {
-                if (confirm('Clear all chats?')) {
-                    document.getElementById('chatArea').innerHTML = '<div class="ai-message"><div class="ai-bubble">🗑️ Chat history cleared! How can I help you?</div></div>';
-                }
-            }
-            
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-            
-            if (!localStorage.getItem('token')) {
-                localStorage.setItem('token', 'test_token_' + Date.now());
-            }
-        </script>
-    </body>
-    </html>
-    """)
+
+    # Minimal fallback UI — no fake tokens, no localStorage token generation.
+    # The Flutter app handles real auth; this page is only for quick API testing.
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html><head><title>Leysco AI Assistant</title><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+       background:#0D1117;color:white;padding:40px}
+  h1{color:#00C853;margin-bottom:20px}
+  .card{background:#161B22;border-radius:12px;padding:20px;margin-bottom:16px}
+  a{color:#00C853;text-decoration:none;margin-right:16px}
+  .note{color:#aaa;font-size:13px;margin-top:12px}
+  label{display:block;margin-bottom:6px;color:#aaa;font-size:13px}
+  input{width:100%;padding:10px 14px;border-radius:8px;border:1px solid #30363d;
+        background:#0D1117;color:white;font-size:14px;margin-bottom:12px}
+  button{padding:10px 24px;background:#00C853;border:none;border-radius:8px;
+         cursor:pointer;font-weight:bold;color:black}
+  #response{background:#0D1117;border-radius:8px;padding:16px;margin-top:16px;
+            white-space:pre-wrap;font-size:13px;max-height:300px;overflow-y:auto;
+            display:none}
+</style></head>
+<body>
+<h1>✨ Leysco AI Assistant</h1>
+
+<div class="card">
+  <strong>API Documentation</strong><br><br>
+  <a href="/docs">Swagger UI</a>
+  <a href="/redoc">ReDoc</a>
+  <a href="/health">Health Check</a>
+  <p class="note">Use your Bearer token from the Flutter app to authenticate API calls.</p>
+</div>
+
+<div class="card">
+  <strong>Quick API Test</strong>
+  <p class="note">Paste your Bearer token from the Flutter app to test the chat endpoint.</p>
+  <br>
+  <label>Bearer Token</label>
+  <input type="password" id="tokenInput" placeholder="Paste your token here">
+  <label>Company Code</label>
+  <input type="text" id="companyInput" placeholder="e.g. TEST001">
+  <label>Message</label>
+  <input type="text" id="msgInput" placeholder="e.g. Show me top selling items" 
+         onkeypress="if(event.key==='Enter')sendTest()">
+  <button onclick="sendTest()">Send</button>
+  <div id="response"></div>
+</div>
+
+<script>
+async function sendTest() {
+  const token   = document.getElementById('tokenInput').value.trim();
+  const company = document.getElementById('companyInput').value.trim();
+  const message = document.getElementById('msgInput').value.trim();
+  const out     = document.getElementById('response');
+
+  if (!token || !message) {
+    out.style.display = 'block';
+    out.textContent = '⚠️ Please enter a token and a message.';
+    return;
+  }
+
+  out.style.display = 'block';
+  out.textContent = '⏳ Sending...';
+
+  try {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token,
+    };
+    if (company) headers['X-Company-Code'] = company;
+
+    const res  = await fetch('/api/ai/chat', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ message }),
+    });
+    const data = await res.json();
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    out.textContent = '❌ Error: ' + e.message;
+  }
+}
+</script>
+</body></html>""")
 
 
 # -----------------------------
-# Health Check Endpoint
+# Health / Info Endpoints
 # -----------------------------
 @app.get("/health", include_in_schema=False)
 def health_check():
-    """Health check endpoint for monitoring"""
     return {
         "status": "ok",
-        "message": "Leysco AI Assistant is running",
-        "timestamp": datetime.now().isoformat()
+        "service": "Leysco AI Sales Assistant",
+        "environment": _app_env,
+        "timestamp": datetime.now().isoformat(),
     }
 
 
-# -----------------------------
-# API Info Endpoint
-# -----------------------------
 @app.get("/api/info", include_in_schema=False)
 def api_info():
-    """Return API information for Flutter app"""
     return {
         "name": "Leysco AI Sales Assistant",
         "version": "1.0.0",
         "endpoints": {
-            "login": "/api/v1/login",
-            "items": "/api/v1/{tenant_id}/items",
-            "inventory": "/api/v1/{tenant_id}/inventory/",
-            "orders": "/api/v1/{tenant_id}/orders",
-            "customers": "/api/v1/{tenant_id}/customers/",
+            "login":            "/api/v1/login",
+            "items":            "/api/v1/{tenant_id}/items",
+            "inventory":        "/api/v1/{tenant_id}/inventory/",
+            "orders":           "/api/v1/{tenant_id}/orders",
+            "customers":        "/api/v1/{tenant_id}/customers/",
             "customer_details": "/api/v1/{tenant_id}/customers/{customer_code}",
-            "expenses": "/api/v1/{tenant_id}/expenses",
-            "price": "/api/v1/{tenant_id}/price",
-            "ai_chat": "/api/ai/chat",
+            "expenses":         "/api/v1/{tenant_id}/expenses",
+            "price":            "/api/v1/{tenant_id}/price",
+            "ai_chat":          "/api/ai/chat",
             "ai_notifications": "/api/ai/notifications",
             "ai_session_clear": "/api/ai/session/clear",
-            "ai_session_history": "/api/ai/session/history"
+            "ai_session_history": "/api/ai/session/history",
         },
-        "authentication": "Bearer token required for all endpoints except /api/v1/login",
+        "authentication": "Bearer token required (X-Company-Code header recommended)",
         "features": {
-            "conversation_memory": True,
+            "multi_tenant":           True,
+            "conversation_memory":    True,
             "proactive_notifications": True,
-            "bilingual_support": True,
-            "role_based_access": True
-        }
+            "role_based_access":      True,
+        },
     }
 
 
-# -----------------------------
-# Root Info Endpoint
-# -----------------------------
 @app.get("/info", include_in_schema=False)
 def root_info():
-    """Root info endpoint"""
     return {
         "service": "Leysco AI Sales Assistant",
         "version": "1.0.0",
-        "status": "running",
+        "status":  "running",
         "documentation": "/docs",
-        "health": "/health",
-        "api_info": "/api/info"
+        "health":        "/health",
+        "api_info":      "/api/info",
     }
 
 
-# -----------------------------
-# Run with: uvicorn app.main:app --reload
-# -----------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        log_level="info"
+        reload=_app_env != "production",
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
     )

@@ -3,6 +3,7 @@ app/api/dependencies.py
 ========================
 FastAPI dependencies for token extraction, validation, and session management.
 
+FIXED: Dynamic per-tenant backend URL resolution so any leysco100 tenant works.
 FIXED: Correctly extracts manager role from Laravel SUPERUSER field
 FIXED: Proper role detection for both SUPERUSER flag and role field
 FIXED: Stable session ID derived from user identity to prevent new session
@@ -25,6 +26,72 @@ logger = logging.getLogger(__name__)
 
 # In-memory user session cache (replace with Redis in production)
 _user_session_cache: Dict[str, Dict] = {}
+
+
+# =========================================================
+# TENANT → BACKEND URL RESOLUTION   ← NEW
+# =========================================================
+
+def resolve_backend_url(company_code: Optional[str] = None, request: Optional[Request] = None) -> str:
+    """
+    Dynamically resolve the Laravel backend URL for a given tenant.
+
+    Resolution order:
+      1. Per-tenant env var  e.g. LARAVEL_BACKEND_URL_TEST001=https://dev100-be.leysco100.com
+      2. Origin-header sniffing  (dev100.leysco100.com  → dev100-be.leysco100.com)
+      3. X-Tenant-Env header     (explicit override for testing)
+      4. LARAVEL_BACKEND_URL     (global default / single-tenant fallback)
+      5. Hard error              (nothing configured)
+
+    Examples
+    --------
+    Company TEST001 on dev100:
+        env  LARAVEL_BACKEND_URL_TEST001=https://dev100-be.leysco100.com
+        → https://dev100-be.leysco100.com
+
+    Any request from https://dev109.leysco100.com (no per-tenant env var):
+        origin sniff → https://dev109-be.leysco100.com
+    """
+
+    # 1. Per-tenant env var  (LARAVEL_BACKEND_URL_<COMPANY_CODE>)
+    if company_code:
+        env_key = f"LARAVEL_BACKEND_URL_{company_code.upper()}"
+        per_tenant = os.getenv(env_key)
+        if per_tenant:
+            logger.debug(f"🔀 Backend URL from env {env_key}: {per_tenant}")
+            return per_tenant.rstrip("/")
+
+    # 2. Derive from the Origin / Referer header
+    #    dev100.leysco100.com  → dev100-be.leysco100.com
+    #    dev109.leysco100.com  → dev109-be.leysco100.com
+    if request:
+        origin = request.headers.get("origin") or request.headers.get("referer", "")
+        match = re.search(r"https?://(dev\d+)\.leysco100\.com", origin)
+        if match:
+            env_slug = match.group(1)           # e.g. "dev100"
+            derived = f"https://{env_slug}-be.leysco100.com"
+            logger.debug(f"🔀 Backend URL derived from origin '{origin}': {derived}")
+            return derived
+
+    # 3. Explicit X-Tenant-Env header  (useful for Postman / integration tests)
+    if request:
+        tenant_env = request.headers.get("x-tenant-env")  # e.g. "dev100"
+        if tenant_env and re.fullmatch(r"[a-zA-Z0-9_-]{3,30}", tenant_env):
+            derived = f"https://{tenant_env}-be.leysco100.com"
+            logger.debug(f"🔀 Backend URL from X-Tenant-Env header: {derived}")
+            return derived
+
+    # 4. Global fallback env var
+    global_url = getattr(settings, "LARAVEL_BACKEND_URL", None) or os.getenv("LARAVEL_BACKEND_URL")
+    if global_url:
+        logger.debug(f"🔀 Backend URL from global setting: {global_url}")
+        return global_url.rstrip("/")
+
+    # 5. Nothing configured — fail loudly
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Authentication service is not configured for this tenant.",
+    )
 
 
 # =========================================================
@@ -110,7 +177,7 @@ async def get_company_code(
         logger.info(f"✅ Company code from header: {code}")
         return code
 
-    validation = await validate_token_with_backend(token)
+    validation = await validate_token_with_backend(token, request=request)
     if validation and validation.get("company_code"):
         return validation["company_code"]
 
@@ -168,20 +235,22 @@ class UserSessionManager:
 # TOKEN VALIDATION WITH LARAVEL BACKEND
 # =========================================================
 
-async def validate_token_with_backend(token: str) -> Optional[Dict[str, Any]]:
+async def validate_token_with_backend(
+    token: str,
+    company_code: Optional[str] = None,
+    request: Optional[Request] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    Validate opaque Sanctum token against the Laravel backend.
+    Validate opaque Sanctum token against the correct Laravel backend
+    for this tenant.
+
+    Backend URL is resolved dynamically via resolve_backend_url() so
+    tokens from dev100.leysco100.com validate against dev100-be, tokens
+    from dev109.leysco100.com validate against dev109-be, etc.
 
     Returns canonical user_info dict with keys:
         user_id, user_role, user_email, company_code,
-        assigned_customers, is_manager
-
-    Results are cached for ttl_seconds so subsequent calls are free.
-    
-    FIXED: Properly detects manager role from Laravel response:
-        - SUPERUSER == "1" → manager
-        - role in ["manager", "admin", "supervisor", "director"] → manager
-        - is_manager == True → manager
+        assigned_customers, is_manager, backend_url (for debugging)
     """
     # Cache hit — skip network call
     cached = UserSessionManager.get(token)
@@ -189,80 +258,80 @@ async def validate_token_with_backend(token: str) -> Optional[Dict[str, Any]]:
         logger.info("✅ Using cached user session")
         return cached
 
-    backend_url = getattr(settings, "LARAVEL_BACKEND_URL", None)
+    # ← CHANGED: resolve dynamically instead of reading a single setting
+    backend_url = resolve_backend_url(company_code=company_code, request=request)
+    validate_url = f"{backend_url}/api/user"
 
-    if not backend_url:
-        logger.error("LARAVEL_BACKEND_URL is not configured")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service is not configured.",
-        )
+    logger.info(f"🔍 Validating token against: {validate_url}")
 
-    validate_url = f"{backend_url.rstrip('/')}/api/user"
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 validate_url,
                 headers={"Authorization": f"Bearer {token}"},
+                follow_redirects=False,   # surface mis-routed requests immediately
             )
+
+        if response.status_code == 302:
+            location = response.headers.get("location", "unknown")
+            logger.error(
+                f"Token validation redirected (302) to '{location}'. "
+                f"Likely wrong backend URL '{backend_url}' for this token. "
+                f"Check resolve_backend_url() or per-tenant env vars."
+            )
+            return None
 
         if response.status_code == 200:
             data = response.json()
-            
-            # FIXED: Proper manager detection from Laravel response
-            # Check for SUPERUSER field (string "1" or "0")
-            is_superuser = data.get("SUPERUSER") == "1"
-            
-            # Check role field
-            role = data.get("role", "sales_rep")
-            is_manager_role = role.lower() in ("manager", "admin", "supervisor", "director")
-            
-            # Check is_manager flag
-            is_manager_flag = data.get("is_manager", False)
-            
-            # Combined manager flag
-            is_manager = is_superuser or is_manager_role or is_manager_flag
-            
-            # Determine user role string
-            user_role = "manager" if is_manager else "sales_rep"
-            
-            # Extract company code from various possible fields
-            company_code = (
-                data.get("company_code") or 
-                data.get("tenant_code") or 
-                data.get("CompanyID") or 
+
+            # Manager detection from Laravel response
+            is_superuser     = data.get("SUPERUSER") == "1"
+            role             = data.get("role", "sales_rep")
+            is_manager_role  = role.lower() in ("manager", "admin", "supervisor", "director")
+            is_manager_flag  = data.get("is_manager", False)
+            is_manager       = is_superuser or is_manager_role or is_manager_flag
+            user_role        = "manager" if is_manager else "sales_rep"
+
+            # Company code extraction
+            company_code_val = (
+                data.get("company_code") or
+                data.get("tenant_code") or
+                data.get("CompanyID") or
                 data.get("company_id")
             )
-            
-            # If company code is numeric (like CompanyID), add "C" prefix
-            if company_code and str(company_code).isdigit():
-                company_code = f"C{company_code}"
-            
+            if company_code_val and str(company_code_val).isdigit():
+                company_code_val = f"C{company_code_val}"
+
             user_info: Dict[str, Any] = {
                 "user_id":            data.get("id"),
                 "user_role":          user_role,
                 "user_email":         data.get("email"),
-                "company_code":       company_code,
+                "company_code":       company_code_val,
                 "assigned_customers": data.get("assigned_customers", []),
                 "is_manager":         is_manager,
-                "raw_user_data": {    # Keep for debugging
-                    "name": data.get("name"),
+                "backend_url":        backend_url,   # useful for debugging
+                "raw_user_data": {
+                    "name":      data.get("name"),
                     "SUPERUSER": data.get("SUPERUSER"),
-                    "type": data.get("type"),
-                }
+                    "type":      data.get("type"),
+                },
             }
-            
-            logger.info(f"✅ Token validated - User: {data.get('name')}, Role: {user_role}, SUPERUSER: {data.get('SUPERUSER')}")
+
+            logger.info(
+                f"✅ Token validated — User: {data.get('name')}, "
+                f"Role: {user_role}, SUPERUSER: {data.get('SUPERUSER')}, "
+                f"Backend: {backend_url}"
+            )
             UserSessionManager.store(token, user_info)
             return user_info
 
         elif response.status_code == 401:
-            logger.warning("Token invalid or expired")
+            logger.warning(f"Token invalid or expired (401) from {backend_url}")
             return None
 
         else:
-            logger.error(f"Token validation failed: HTTP {response.status_code}")
+            logger.error(f"Token validation failed: HTTP {response.status_code} from {backend_url}")
             return None
 
     except HTTPException:
@@ -281,7 +350,11 @@ async def extract_user_info_from_token(
     request: Request = None,
 ) -> Dict[str, Any]:
     """Return full user_info dict for a token."""
-    info = await validate_token_with_backend(token)
+    company_code = None
+    if request:
+        company_code = await get_company_code_header(request)
+
+    info = await validate_token_with_backend(token, company_code=company_code, request=request)
     if info:
         return info
 
@@ -291,23 +364,23 @@ async def extract_user_info_from_token(
     )
 
 
-async def extract_user_id_from_token(token: str) -> Optional[int]:
-    info = await validate_token_with_backend(token)
+async def extract_user_id_from_token(token: str, request: Request = None) -> Optional[int]:
+    info = await validate_token_with_backend(token, request=request)
     return info.get("user_id") if info else None
 
 
-async def extract_user_role_from_token(token: str) -> str:
-    info = await validate_token_with_backend(token)
+async def extract_user_role_from_token(token: str, request: Request = None) -> str:
+    info = await validate_token_with_backend(token, request=request)
     return info.get("user_role", "sales_rep") if info else "sales_rep"
 
 
-async def extract_user_email_from_token(token: str) -> Optional[str]:
-    info = await validate_token_with_backend(token)
+async def extract_user_email_from_token(token: str, request: Request = None) -> Optional[str]:
+    info = await validate_token_with_backend(token, request=request)
     return info.get("user_email") if info else None
 
 
-async def extract_assigned_customers_from_token(token: str) -> List[str]:
-    info = await validate_token_with_backend(token)
+async def extract_assigned_customers_from_token(token: str, request: Request = None) -> List[str]:
+    info = await validate_token_with_backend(token, request=request)
     if not info:
         return []
     customers = info.get("assigned_customers", [])
@@ -318,8 +391,8 @@ async def extract_assigned_customers_from_token(token: str) -> List[str]:
     return []
 
 
-async def is_manager_from_token(token: str) -> bool:
-    info = await validate_token_with_backend(token)
+async def is_manager_from_token(token: str, request: Request = None) -> bool:
+    info = await validate_token_with_backend(token, request=request)
     return info.get("is_manager", False) if info else False
 
 
@@ -329,14 +402,8 @@ async def is_manager_from_token(token: str) -> bool:
 
 def _make_stable_session_id(user_id: Any, tenant_code: str) -> str:
     """
-    Derive a deterministic session ID from user identity.
-
-    This ensures that stateless polling endpoints (notifications, unread-count)
-    always resolve to the SAME session rather than spawning a fresh uuid4 on
-    every request — which was the root cause of notifications never persisting.
-
-    The result is a 36-character hex string (no dashes) so it looks like a
-    normal session ID in logs.
+    Derive a deterministic session ID from user identity so polling
+    endpoints always resolve to the same session.
     """
     stable_key = f"{tenant_code}:{user_id}"
     return hashlib.sha256(stable_key.encode()).hexdigest()[:36]
@@ -349,17 +416,13 @@ async def get_session_id_from_request(
     tenant_code: Optional[str] = None,
 ) -> str:
     """
-    Resolve session ID with the following priority:
-
+    Resolve session ID with priority:
     1. Explicit session_id argument
     2. ?session_id= query param
     3. X-Session-ID request header
     4. session_id field in POST body
-    5. Stable deterministic ID derived from user_id + tenant_code  ← FIXED
-    6. Random uuid4 (last resort — only when no user identity available)
-
-    Previously the fallback was always uuid4(), which meant every notification
-    poll created a brand-new session and notifications never accumulated.
+    5. Stable deterministic ID from user_id + tenant_code
+    6. Random uuid4 (last resort)
     """
     if session_id:
         return session_id
@@ -375,15 +438,11 @@ async def get_session_id_from_request(
         except Exception:
             pass
 
-    # FIXED: derive a stable, repeatable session ID from user identity so that
-    # polling endpoints (GET /notifications, GET /notifications/unread-count)
-    # always land on the same session instead of creating a new one each time.
     if user_id is not None and tenant_code:
         stable_id = _make_stable_session_id(user_id, tenant_code)
-        logger.debug(f"🔑 Using stable session ID for user {user_id} / {tenant_code}: {stable_id[:8]}...")
+        logger.debug(f"🔑 Stable session ID for {user_id}/{tenant_code}: {stable_id[:8]}...")
         return stable_id
 
-    # True last resort — anonymous or unauthenticated requests
     return str(uuid.uuid4())
 
 
@@ -398,12 +457,8 @@ async def get_conversation_context(
 ) -> Dict[str, Any]:
     """
     Build full conversation context for the current request.
-    validate_token_with_backend is called ONCE; all fields come from
-    that single cached dict.
-
-    FIXED: user_id and tenant_code are resolved BEFORE get_session_id_from_request
-    so the stable-session-ID fallback has the information it needs. Previously
-    the call order meant user_id was never passed in, so uuid4() was always used.
+    Passes company_code + request to validate_token_with_backend so the
+    correct tenant backend is always used.
     """
     user_info = await extract_user_info_from_token(token, request)
 
@@ -414,7 +469,6 @@ async def get_conversation_context(
     is_manager         = user_info.get("is_manager", user_role == "manager")
     tenant_code        = company_code
 
-    # Pass user identity so polling endpoints get a stable session ID
     effective_session_id = await get_session_id_from_request(
         request,
         user_id=user_id,
@@ -485,29 +539,26 @@ async def logout_user(token: str) -> None:
 async def debug_token_info(request: Request) -> Dict:
     """Debug helper to inspect token and user info."""
     try:
-        token = await get_token_from_header(request)
-        user_info = await extract_user_info_from_token(token, request)
-        
+        token        = await get_token_from_header(request)
+        company_code = await get_company_code_header(request)
+        backend_url  = resolve_backend_url(company_code=company_code, request=request)
+        user_info    = await extract_user_info_from_token(token, request)
+
         return {
-            "authenticated": True,
-            "user_id": user_info.get("user_id"),
-            "user_role": user_info.get("user_role"),
-            "user_email": user_info.get("user_email"),
-            "company_code": user_info.get("company_code"),
-            "is_manager": user_info.get("is_manager"),
-            "raw_user_data": user_info.get("raw_user_data"),
-            "token_preview": f"{token[:20]}...{token[-10:]}" if len(token) > 30 else token,
+            "authenticated":  True,
+            "user_id":        user_info.get("user_id"),
+            "user_role":      user_info.get("user_role"),
+            "user_email":     user_info.get("user_email"),
+            "company_code":   user_info.get("company_code"),
+            "is_manager":     user_info.get("is_manager"),
+            "raw_user_data":  user_info.get("raw_user_data"),
+            "backend_url":    backend_url,
+            "token_preview":  f"{token[:20]}...{token[-10:]}" if len(token) > 30 else token,
         }
     except HTTPException as e:
-        return {
-            "authenticated": False,
-            "error": e.detail,
-        }
+        return {"authenticated": False, "error": e.detail}
     except Exception as e:
-        return {
-            "authenticated": False,
-            "error": str(e),
-        }
+        return {"authenticated": False, "error": str(e)}
 
 
 # =========================================================
@@ -530,6 +581,7 @@ __all__ = [
     "validate_token_with_backend",
     "sync_user_session",
     "logout_user",
+    "resolve_backend_url",
     "UserSessionManager",
     "debug_token_info",
 ]

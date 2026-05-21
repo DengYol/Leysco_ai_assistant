@@ -1,6 +1,7 @@
 """
 intent_classifier.py - Optimized with async support, caching, and fast-path
 Enhanced with natural language understanding for conversational queries
+Enhanced with Swahili language detection and multilingual support
 """
 
 import json
@@ -50,6 +51,23 @@ _FAREWELL_WORDS = {
     "good night", "take care", "ttyl", "cya",
 }
 
+# Swahili specific words for language detection
+_SWAHILI_GREETINGS = {
+    "mambo", "habari", "sasa", "vipi", "jambo", "hujambo", "sijambo", 
+    "shikamoo", "marahaba", "poa", "fresh", "nzuri", "salama", "njema", "noma"
+}
+
+_SWAHILI_WORDS = {
+    "naomba", "tafadhali", "asante", "samahani", "karibu", "kwaheri", 
+    "sawa", "ndio", "hapana", "unauza", "bei", "ghali", "nafuu", "huduma",
+    "hisa", "ghala", "maghala", "mteja", "wateja", "oda", "nukuu", "bidhaa",
+    "unauza", "nanunua", "kipimo", "kiasi", "sana", "kidogo", "ngapi"
+}
+
+_SWAHILI_QUESTION_PHRASES = {
+    "lipo?", "iko?", "wapi?", "ngapi?", "gani?", "lini?", "kwanini?"
+}
+
 _CROSS_SELL_PHRASES = {
     "customers who bought", "also bought", "frequently bought",
     "people also buy", "others bought", "similar customers bought",
@@ -69,7 +87,7 @@ _SELL_OUT_PHRASES = {
 }
 
 # =========================================================
-# CHURN RISK PHRASES (NEW)
+# CHURN RISK PHRASES
 # =========================================================
 _CHURN_RISK_PHRASES = {
     "churn risk", "churning", "at risk", "risk of leaving",
@@ -80,6 +98,7 @@ _CHURN_RISK_PHRASES = {
     "medium risk customers", "low risk customers", "health check",
     "customer health check", "health report", "customer wellbeing",
     "churn score", "attrition risk", "loyalty risk",
+    "wateja walio katika hatari", "hatari ya kuondoka", "afya ya mteja"
 }
 
 # Top selling phrases
@@ -91,7 +110,8 @@ TOP_SELLING_PHRASES = {
     "top performing", "best performers", "hot items", "trending products",
     "most purchased", "frequently bought", "high volume", "best movers",
     "what's popular", "what are people buying", "customers are buying",
-    "selling like hotcakes", "flying off the shelves"
+    "selling like hotcakes", "flying off the shelves",
+    "bidhaa zinazouzwa sana", "zinazouzwa zaidi", "maarufu"
 }
 
 # Slow moving phrases
@@ -101,7 +121,8 @@ SLOW_MOVING_PHRASES = {
     "not selling", "poorly selling", "slow items", "slow products",
     "dormant stock", "stagnant", "low turnover", "inactive items",
     "non moving", "non-moving", "excess stock", "surplus",
-    "gathering dust", "not moving", "sitting on shelves", "hard to sell"
+    "gathering dust", "not moving", "sitting on shelves", "hard to sell",
+    "zinazosonga polepole", "hazijauzwa", "haziuZiki", "zimelala"
 }
 
 # Sales analytics phrases
@@ -114,77 +135,28 @@ SALES_ANALYTICS_PHRASES = {
     "sales performance report", "monthly sales", "weekly sales", "daily sales",
     "yearly sales", "quarterly sales", "sales by category", "sales by product",
     "sales history", "sales record", "transaction report", "sales totals",
-    "total sales", "gross sales", "net sales", "sales volume"
+    "total sales", "gross sales", "net sales", "sales volume",
+    "uchambuzi wa mauzo", "ripoti ya mauzo", "mauzo kwa mwezi"
 }
 
-# Natural language variations for price queries
-PRICE_VARIATIONS = [
-    r"\bhow much\b", 
-    r"\bwhat'?s?\s*the\s*price\b", 
-    r"\bwhat is\s*the\s*price\b",
-    r"\bcost\b",
-    r"\bpricing\b", 
-    r"\bwhat'?s?\s*the\s*cost\b",
-    r"\bwhat does.*cost\b",
-    r"\bhow expensive\b", 
-    r"\bhow\s*much\s*shillings\b",
-    r"\bhow\s*much\s*money\b",
-    r"\bbiashara\b", 
-    r"\bthamani\b", 
-    r"\bugharama\b", 
-    r"\bpesa ngapi\b",
-    r"\bni bei gani\b", 
-    r"\bbei yake\b", 
-    r"\bgharama yake\b",
-    r"\bhow much is\b", 
-    r"\bwhat'?s?\s*the\s*cost of\b",
-    r"\bcan you tell me.*price\b", 
-    r"\bi'?d like\s*the\s*price\b",
-    r"\bi want\s*the\s*price\b"
-]
+# =========================================================
+# STOCK LEVELS GENERAL PHRASES
+# =========================================================
+_STOCK_LEVELS_GENERAL_PHRASES = {
+    "stock levels", "show stock levels", "show me stock levels",
+    "view stock levels", "display stock levels", "get stock levels",
+    "stock overview", "stock summary", "stock report", "stock status",
+    "current stock", "all stock", "inventory levels", "inventory overview",
+    "inventory summary", "inventory report", "inventory status",
+    "what's in stock", "what is in stock", "show stock", "view stock",
+    "display stock", "get stock", "check stock", "stock check",
+    "how much stock", "stock on hand", "available stock", "stock availability",
+    "hisa zote", "hisa za maghala yote", "hisa ya bidhaa"
+}
 
-# Natural language variations for stock queries
-STOCK_VARIATIONS = [
-    r"\b(?:stock|inventory|supply|availability|hisa)\b",
-    r"\bhow many\b.*\bin stock\b", 
-    r"\bdo you have\b",
-    r"\bis there\b", 
-    r"\bare there\b", 
-    r"\bwhat'?s?\s*available\b",
-    r"\bquantity on hand\b", 
-    r"\blevels?\b", 
-    r"\bupatikanaji\b",
-    r"\bhow many left\b", 
-    r"\bwhat'?s?\s*in stock\b"
-]
-
-# Natural language variations for customer queries
-CUSTOMER_VARIATIONS = [
-    r"\bcustomer\s*(?:details|info|information|profile)\b",
-    r"\bwho is\b", 
-    r"\btell me about\b.*\bcustomer\b",
-    r"\bwhat do we know about\b", 
-    r"\bmteja\b.*\bmaelezo\b",
-    r"\btaarifa za mteja\b", 
-    r"\bprofile ya mteja\b",
-    r"\bshow me.*customer\b", 
-    r"\bget.*customer\s*(?:details|info)\b"
-]
-
-# Natural language variations for order queries
-ORDER_VARIATIONS = [
-    r"\border(?:s)?\b", 
-    r"\bpurchase(?:s)?\b", 
-    r"\btransaction(?:s)?\b",
-    r"\bwhat did (?:they|the customer) buy\b", 
-    r"\bwhat has (?:been|been) ordered\b",
-    r"\boda\b", 
-    r"\bununuzi\b", 
-    r"\bhistoria ya ununuzi\b",
-    r"\bwhat (?:has|did).*buy\b", 
-    r"\b(?:show|list|view).*orders\b"
-]
-
+# =========================================================
+# COMMON PRODUCTS LIST
+# =========================================================
 _COMMON_PRODUCTS = [
     "cabbage", "tomato", "maize", "pepper", "cauliflower", "onion",
     "vegimax", "easeed", "tosheka", "kh500", "mh401", "snowball",
@@ -194,7 +166,29 @@ _COMMON_PRODUCTS = [
 # Enhanced Fast-path patterns for natural language understanding
 FAST_PATH_PATTERNS = [
     # =========================================================
-    # CRITICAL: CHURN RISK PATTERNS (HIGHEST PRIORITY)
+    # CRITICAL: ITEM BROWSING PATTERNS (HIGHEST PRIORITY)
+    # =========================================================
+    (r'^(?:show|list|display|view|get|browse|find|fetch|see|check|pull\s+up|look\s+up|search\s+for|explore)\s+me\s+(?:all\s+)?(?:items|products|inventory|stock)$', "GET_ITEMS"),
+    (r'^(?:show|list|display|view|get|browse|find|fetch|see|check|pull\s+up|look\s+up|search\s+for|explore)\s+(?:all\s+)?(?:items|products|inventory|stock|available\s+items|sellable\s+items)$', "GET_ITEMS"),
+    (r'^(?:items|products|inventory|stock|what\s+do\s+you\s+have|what\s+is\s+available)$', "GET_ITEMS"),
+    (r'^what\s+(?:items|products|stock)\s+(?:are|do\s+you\s+have|is\s+available|are\s+available)\?*$', "GET_ITEMS"),
+    (r'^tell\s+me\s+about\s+(?:your\s+)?(?:items|products|inventory)$', "GET_ITEMS"),
+    (r'^show\s+me\s+(?:the\s+)?(?:items|products|inventory)$', "GET_ITEMS"),
+    (r'^list\s+(?:all\s+)?(?:items|products|inventory)$', "GET_ITEMS"),
+    
+    # =========================================================
+    # CRITICAL: STOCK LEVELS GENERAL
+    # =========================================================
+    (r'^(?:show|view|display|get|check)\s+(?:me\s+)?(?:the\s+)?stock\s+levels?\s*$', "GET_STOCK_LEVELS"),
+    (r'^(?:stock|inventory)\s+(?:levels?|overview|summary|report|status|check)\s*$', "GET_STOCK_LEVELS"),
+    (r'^(?:what(?:\'s| is)\s+)?(?:the\s+)?(?:current\s+)?stock\s+(?:levels?|status|overview)\s*$', "GET_STOCK_LEVELS"),
+    (r'^(?:how\s+much\s+)?stock\s+(?:do\s+we\s+have|is\s+there|is\s+available)\s*$', "GET_STOCK_LEVELS"),
+    (r'^(?:all|overall|general)\s+stock\s+(?:levels?|overview)\s*$', "GET_STOCK_LEVELS"),
+    (r'^(?:onyesha|angalia|tazama)\s+(?:hisa|stock)\s+(?:zote|yote)?\s*$', "GET_STOCK_LEVELS"),
+    (r'^hisa\s+(?:za|ya|kwa)?\s*$', "GET_STOCK_LEVELS"),
+    
+    # =========================================================
+    # CRITICAL: CHURN RISK PATTERNS
     # =========================================================
     (r'(?:show|list|get|view|display)\s+(?:customers|wateja)\s+(?:at|with|having)\s+(?:churn|churn risk|risk|customer health)', "GET_CUSTOMER_HEALTH"),
     (r'(?:churn\s+risk|customer\s+health|health\s+score).*(?:customers|wateja)', "GET_CUSTOMER_HEALTH"),
@@ -202,9 +196,17 @@ FAST_PATH_PATTERNS = [
     (r'customers?\s+(?:at|with)\s+risk\s+(?:of\s+)?(?:churn|leaving)', "GET_CUSTOMER_HEALTH"),
     (r'who\s+is\s+(?:likely|about)\s+to\s+(?:leave|churn)', "GET_CUSTOMER_HEALTH"),
     (r'(?:high|medium|low)\s+risk\s+customers', "GET_CUSTOMER_HEALTH"),
+    (r'wateja\s+walio\s+katika\s+hatari', "GET_CUSTOMER_HEALTH"),
+    (r'afya\s+ya\s+mteja', "GET_CUSTOMER_HEALTH"),
     
     # =========================================================
-    # CRITICAL: Quotation creation patterns
+    # Swahili greeting patterns
+    # =========================================================
+    (r'^(?:mambo|habari|sasa|vipi|jambo|hujambo|shikamoo|poa)(?:\s|$)', "GREETING", "sw"),
+    (r'^(?:nzuri|salama|njema|sawa|fresh)(?:\s|$)', "GREETING", "sw"),
+    
+    # =========================================================
+    # Quotation creation patterns
     # =========================================================
     (r'^create\s+(?:a\s+)?quotation\s+(?:for\s+)?([A-Za-z0-9\s]+)(?:\s+with\s+|\s+containing\s+|\s+including\s+)(.+)', "CREATE_QUOTATION"),
     (r'^make\s+(?:a\s+)?quotation\s+(?:for\s+)?([A-Za-z0-9\s]+)(?:\s+with\s+|\s+containing\s+)(.+)', "CREATE_QUOTATION"),
@@ -213,9 +215,11 @@ FAST_PATH_PATTERNS = [
     (r'^(?:cash sale|cash sale -)\s+([A-Za-z0-9\s]+)(?:\s+with\s+)(.+)', "CREATE_QUOTATION"),
     (r'^create\s+quotation$', "CREATE_QUOTATION"),
     (r'^make\s+quotation$', "CREATE_QUOTATION"),
+    (r'^unda\s+(?:nukuu|quote)\s+(?:kwa|ya|kwa ajili ya)?\s*([A-Za-z0-9\s]+)', "CREATE_QUOTATION"),
+    (r'^nukuu\s+(?:mpya)?\s*(?:kwa)?\s*([A-Za-z0-9\s]+)', "CREATE_QUOTATION"),
     
     # =========================================================
-    # Company Info (HIGH PRIORITY - BEFORE customer patterns)
+    # Company Info
     # =========================================================
     (r'^(?:tell me about|what is|about)\s+leysco\s*$', "COMPANY_INFO"),
     (r'^(?:tell me about|what is|about)\s+the\s+company\s*$', "COMPANY_INFO"),
@@ -225,14 +229,14 @@ FAST_PATH_PATTERNS = [
     (r'^about\s+leysco\s*$', "COMPANY_INFO"),
     
     # =========================================================
-    # Top Selling & Analytics (HIGH PRIORITY)
+    # Top Selling & Analytics
     # =========================================================
     (r'^(?:show|get|list)\s+(?:top|best)\s+(?:selling|sellers)\s+(?:items|products)$', "GET_TOP_SELLING_ITEMS"),
     (r'^(?:top|best)\s+(\d+)\s+(?:selling|sellers)\s+(?:items|products)$', "GET_TOP_SELLING_ITEMS"),
     (r'^(?:show|get|list)\s+(?:slow|least)\s+(?:moving|selling)\s+(?:items|products)$', "GET_SLOW_MOVING_ITEMS"),
     
     # =========================================================
-    # Sales Analytics & Reporting (HIGH PRIORITY)
+    # Sales Analytics & Reporting
     # =========================================================
     (r'^(?:show|get|view|display)\s+(?:sales|revenue)\s+(?:analytics|analysis|report|data|overview|summary)$', "GET_SALES_ANALYTICS"),
     (r'^(?:sales|revenue)\s+(?:analytics|analysis|report|data|overview|summary)$', "GET_SALES_ANALYTICS"),
@@ -241,9 +245,9 @@ FAST_PATH_PATTERNS = [
     (r'^(?:monthly|weekly|daily|yearly|quarterly)\s+sales$', "GET_SALES_ANALYTICS"),
     (r'^(?:what|show me)\s+(?:are\s+)?(?:my\s+)?(?:total|gross|net)\s+sales$', "GET_SALES_ANALYTICS"),
     
-    # Original patterns
+    # Price patterns
     (r'^(price|bei)\s+(of|ya)?\s*([a-zA-Z0-9\-\(\)\s]+)$', "GET_ITEM_PRICE"),
-    (r'^(stock|hisa)\s+(level|kiwango)?\s*(for|ya)?\s*([a-zA-Z0-9\-\(\)\s]+)$', "GET_STOCK_LEVELS"),
+    (r'^(stock|hisa)\s+(level|kiwango)?\s*(for|of|ya)?\s*([a-zA-Z0-9\-\(\)\s]{3,})$', "GET_STOCK_LEVELS"),
     (r'^(show|list|onyesha|orodhesha)\s+(me)?\s*(customers|wateja)$', "GET_CUSTOMERS"),
     (r'^(show|list|onyesha|orodhesha)\s+(me)?\s*(items|bidhaa)$', "GET_ITEMS"),
     (r'^low\s+stock\s+(alert|arifa)$', "GET_LOW_STOCK_ALERTS"),
@@ -259,37 +263,27 @@ FAST_PATH_PATTERNS = [
     (r'^price\s+of\s+([a-zA-Z0-9\-\(\)\s]+)\??$', "GET_ITEM_PRICE"),
     (r'^bei\s+ya\s+([a-zA-Z0-9\-\(\)\s]+)\??$', "GET_ITEM_PRICE"),
     
-    # Natural language price queries
-    (r'(?:how much|what(?:\'s| is)? the (?:price|cost)|can you tell me (?:the )?price|i(?:\'d like| want) (?:the )?price|show me (?:the )?price|give me (?:the )?price).*(?:of|for|on)\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_ITEM_PRICE"),
-    (r'(?:what(?:\'s| is)?|how much is)\s+([a-zA-Z0-9\-\(\)\s]+?)\s*(?:price|cost|worth|selling for|going for)$', "GET_ITEM_PRICE"),
-    (r'([a-zA-Z0-9\-\(\)\s]+?)\s+(?:price|cost|bei|gharama)$', "GET_ITEM_PRICE"),
+    # Conversational greetings (English)
+    (r'^(?:hi|hello|hey|good morning|good afternoon|good evening|howdy|sup|yo)(?:\s|$)', "GREETING", "en"),
     
-    # Natural language stock queries
-    (r'(?:how many|what(?:\'s| is)? the (?:stock|quantity|inventory)|do you have|is there|are there).*(?:of|for|on)\s+([a-zA-Z0-9\-\(\)\s]+?)(?:\s+in stock|\s+available)?$', "GET_STOCK_LEVELS"),
-    (r'(?:stock|hisa|available).*(?:of|for|ya)\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_STOCK_LEVELS"),
+    # Conversational greetings (Swahili)
+    (r'^(?:jambo|habari|mambo|sasa|vipi|hujambo|shikamoo|poa|fresh)(?:\s|$)', "GREETING", "sw"),
     
-    # Natural language customer queries
-    (r'(?:show|get|view|tell me about).*(?:customer|client|mteja)\s+(?:details|info|information|maelezo).*(?:for|of|about|ya)\s+([A-Za-z][A-Za-z\s]+)$', "GET_CUSTOMER_DETAILS"),
-    (r'(?:who is|customer info for)\s+([A-Za-z][A-Za-z\s]+)$', "GET_CUSTOMER_DETAILS"),
-    
-    # Natural language order queries
-    (r'(?:show|list|view|what are).*(?:orders|purchases|oda).*(?:for|of|from|ya)\s+([A-Za-z][A-Za-z\s]+)$', "GET_CUSTOMER_ORDERS"),
-    (r'(?:what has|what did)\s+([A-Za-z][A-Za-z\s]+?)\s+(?:bought|ordered|purchased)$', "GET_CUSTOMER_ORDERS"),
-    
-    # Conversational greetings
-    (r'^(?:hi|hello|hey|good morning|good afternoon|good evening|howdy|sup|yo|jambo|habari|mambo|sasa)(?:\s|$)', "GREETING"),
     (r'^(?:thanks|thank you|appreciate it|nice one|good one|asante|shukran)(?:\s|$)', "THANKS"),
     
     # Help queries
-    (r'^(?:help|what can you do|how do i use this|capabilities|what do you do|msaada|unaweza kufanya nini)(?:\s|\?)?$', "FAQ"),
+    (r'^(?:help|what can you do|how do i use this|capabilities|what do you do)(?:\s|\?)?$', "FAQ"),
+    (r'^(?:msaada|unaweza kufanya nini|unafanya nini|uwezo wako)(?:\s|\?)?$', "FAQ"),
     
     # Warehouse queries
     (r'^(?:show|list|where are).*(?:warehouses?|maghala|storage|depots?)$', "GET_WAREHOUSES"),
     (r'^(?:what|which).*(?:warehouses?|maghala).*(?:have|has|stock|hisa).*(?:for|of|ya)\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_WAREHOUSE_STOCK"),
+    (r'^(?:onyesha|orodhesha|wapi)\s+(?:maghala|warehouses|ghala)\s*$', "GET_WAREHOUSES"),
     
     # Low stock alerts
     (r'^(?:what|which).*(?:low|critical|danger).*(?:stock|inventory|hisa|items|bidhaa).*(?:alert|alerts?|warning|arifa)$', "GET_LOW_STOCK_ALERTS"),
     (r'^(?:what\'?s|what is).*(?:low|running low|almost out)$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:arifa|onyo)\s+(?:za|la)\s+hisa\s+chini$', "GET_LOW_STOCK_ALERTS"),
 ]
 
 
@@ -315,776 +309,300 @@ class IntentClassifier:
         self.llm = LLMService()
         self.prompt_manager = PromptManager()
         self.swahili = SwahiliSupport()
-        self._fast_path_cache = {}  # Simple in-memory cache for fast-path results
+        self._fast_path_cache = {}
+
+    # -------------------------------------------------------------------------
+    # LANGUAGE DETECTION
+    # -------------------------------------------------------------------------
+    def _detect_language(self, message: str) -> str:
+        """Detect if the message is in Swahili or English."""
+        message_lower = message.lower().strip()
+        
+        swahili_score = 0
+        english_score = 0
+        
+        for greeting in _SWAHILI_GREETINGS:
+            if greeting in message_lower:
+                swahili_score += 3
+        
+        for word in _SWAHILI_WORDS:
+            if word in message_lower:
+                swahili_score += 1
+        
+        for phrase in _SWAHILI_QUESTION_PHRASES:
+            if phrase in message_lower:
+                swahili_score += 2
+        
+        english_indicators = ["the", "this", "that", "these", "those", "please", "help", "show", "list"]
+        for word in english_indicators:
+            if word in message_lower:
+                english_score += 1
+        
+        if len(message_lower.split()) <= 3:
+            for greeting in _SWAHILI_GREETINGS:
+                if greeting == message_lower or message_lower.startswith(greeting):
+                    return "sw"
+        
+        if swahili_score > english_score and swahili_score >= 2:
+            return "sw"
+        elif english_score > swahili_score:
+            return "en"
+        else:
+            return "en"
+
+    # -------------------------------------------------------------------------
+    # DIRECT INTENT CHECK FOR COMMON PHRASES
+    # -------------------------------------------------------------------------
+    def _check_direct_intents(self, message: str) -> Optional[Tuple[str, dict, str]]:
+        """Direct pattern matching for common phrases before LLM."""
+        message_lower = message.lower().strip()
+        language = self._detect_language(message)
+        
+        # Direct check for item browsing
+        browse_patterns = [
+            r'^(?:show|list|display|view|get|browse|find|fetch|see|check)\s+me\s+(?:all\s+)?(?:items|products|inventory|stock)',
+            r'^(?:show|list|display|view|get|browse|find|fetch|see|check)\s+(?:all\s+)?(?:items|products|inventory|stock|available\s+items)',
+            r'^what\s+items\s+do\s+you\s+have',
+            r'^what\s+products\s+are\s+available',
+            r'^tell\s+me\s+about\s+(?:your\s+)?(?:items|products)',
+            r'^items$',
+            r'^products$',
+            r'^show\s+me\s+(?:the\s+)?(?:items|products)',
+            r'^list\s+items$',
+        ]
+        
+        for pattern in browse_patterns:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                logger.info(f"Direct intent match: '{message}' → GET_ITEMS")
+                return ("GET_ITEMS", {}, language)
+        
+        # Check for greetings
+        if any(w in message_lower for w in _SWAHILI_GREETINGS):
+            return ("GREETING", {}, "sw")
+        
+        if any(w in message_lower for w in ["hi", "hello", "hey", "good morning", "good afternoon"]):
+            return ("GREETING", {}, "en")
+        
+        return None
 
     # -------------------------------------------------------------------------
     # FAST-PATH DETECTION (No LLM)
     # -------------------------------------------------------------------------
-    def _try_fast_path(self, message: str) -> Optional[Tuple[str, dict]]:
+    def _try_fast_path(self, message: str) -> Optional[Tuple[str, dict, str]]:
         """Try to classify using fast-path patterns (no LLM call)."""
         message_lower = message.lower().strip()
         
-        # Check cache first
         cache_key = f"fast_path:{message_lower}"
         if cache_key in self._fast_path_cache:
-            logger.debug(f"Fast-path cache hit: {message_lower}")  # Changed to DEBUG
             return self._fast_path_cache[cache_key]
         
-        # Check patterns
-        for pattern, intent in FAST_PATH_PATTERNS:
+        detected_language = self._detect_language(message)
+        
+        for phrase in _STOCK_LEVELS_GENERAL_PHRASES:
+            if phrase in message_lower:
+                result = ("GET_STOCK_LEVELS", {}, detected_language)
+                self._fast_path_cache[cache_key] = result
+                return result
+        
+        for pattern_tuple in FAST_PATH_PATTERNS:
+            if len(pattern_tuple) == 2:
+                pattern, intent = pattern_tuple
+                pattern_lang = None
+            else:
+                pattern, intent, pattern_lang = pattern_tuple
+            
+            if pattern_lang and pattern_lang != detected_language and detected_language != "en":
+                continue
+                
             match = re.match(pattern, message_lower, re.IGNORECASE)
             if match:
-                # Extract entities if present
                 entities = {}
                 groups = match.groups()
                 
-                # For quotation creation, extract customer name and items
                 if intent == "CREATE_QUOTATION" and len(groups) >= 2:
                     entities["customer_name"] = groups[0].strip()
-                    # Extract items from the items string
-                    items_str = groups[1] if len(groups) > 1 else ""
-                    # Parse items like "3 vegimax 30ml and 2 vegimax 250ml"
-                    item_pattern = r'(\d+)\s+([a-zA-Z0-9\-]+)\s+(\d+(?:ml|ML|mL|kg|KG|g|G))'
-                    item_matches = re.findall(item_pattern, items_str, re.IGNORECASE)
-                    if item_matches:
-                        entities["items"] = []
-                        for qty, name, size in item_matches:
-                            entities["items"].append({
-                                "name": f"{name} {size}",
-                                "quantity": int(qty)
-                            })
-                    else:
-                        # Try simpler pattern
-                        simple_pattern = r'(\d+)\s+([a-zA-Z0-9\-]+)'
-                        simple_matches = re.findall(simple_pattern, items_str, re.IGNORECASE)
-                        for qty, name in simple_matches:
-                            entities["items"] = entities.get("items", [])
-                            entities["items"].append({
-                                "name": name,
-                                "quantity": int(qty)
-                            })
                 
-                # Extract item name (usually the last capture group)
-                elif groups and not entities:
-                    for i, group in enumerate(groups):
-                        if group and i == len(groups) - 1 and len(group) > 1:
-                            if "customer" not in pattern.lower() and "order" not in pattern.lower():
-                                entities["item_name"] = group.strip()
-                            else:
-                                entities["customer_name"] = group.strip()
-                            break
-                        elif group and len(group) > 2 and group.isdigit():
-                            entities["quantity"] = int(group)
-                
-                # Extract limit for top selling queries
-                if intent == "GET_TOP_SELLING_ITEMS":
-                    num_match = re.search(r'top\s+(\d+)', message_lower)
-                    if num_match:
-                        entities["quantity"] = int(num_match.group(1))
-                
-                result = (intent, entities)
+                result = (intent, entities, detected_language)
                 self._fast_path_cache[cache_key] = result
-                logger.info(f"⚡ Fast-path matched: '{message}' → {intent}")  # Keep as INFO
                 return result
         
         return None
 
     # -------------------------------------------------------------------------
-    # RULE-BASED INTENT ENGINE (Cached)
-    # -------------------------------------------------------------------------
-    @lru_cache(maxsize=512)
-    def _rule_based_intent(self, text: str) -> str:
-        """Cached rule-based intent detection with natural language understanding."""
-        text = text.lower().strip()
-        
-        # =========================================================
-        # CRITICAL: Check for CHURN RISK first (HIGHEST PRIORITY)
-        # This must come before GET_CUSTOMERS
-        # =========================================================
-        if any(phrase in text for phrase in _CHURN_RISK_PHRASES):
-            logger.debug(f"⚡ Rule-based churn risk detected: {text}")  # Changed to DEBUG
-            return "GET_CUSTOMER_HEALTH"
-        
-        # =========================================================
-        # CRITICAL: Check for QUOTATION CREATION
-        # =========================================================
-        if 'quotation' in text or 'quote' in text:
-            if any(w in text for w in ['create', 'make', 'generate', 'prepare', 'new', 'cash sale']):
-                logger.debug(f"Quotation creation detected: {text}")  # Changed to DEBUG
-                return "CREATE_QUOTATION"
-        
-        # =========================================================
-        # Company Info (HIGH PRIORITY - before customer)
-        # =========================================================
-        if 'leysco' in text and any(w in text for w in ['tell me about', 'what is', 'who is', 'about']):
-            logger.debug(f"Company info detected: {text}")  # Changed to DEBUG
-            return "COMPANY_INFO"
-        
-        if any(w in text for w in ['company info', 'company information', 'about the company', 'tell me about leysco']):
-            logger.debug(f"Company info detected: {text}")  # Changed to DEBUG
-            return "COMPANY_INFO"
-        
-        # =========================================================
-        # CRITICAL: Check for TOP SELLING ITEMS
-        # =========================================================
-        if any(p in text for p in TOP_SELLING_PHRASES):
-            logger.debug(f"Rule-based top selling detected: {text}")  # Changed to DEBUG
-            return "GET_TOP_SELLING_ITEMS"
-        
-        # =========================================================
-        # CRITICAL: Check for SALES ANALYTICS
-        # =========================================================
-        if any(p in text for p in SALES_ANALYTICS_PHRASES):
-            logger.debug(f"Rule-based sales analytics detected: {text}")  # Changed to DEBUG
-            return "GET_SALES_ANALYTICS"
-        
-        # =========================================================
-        # Check for SLOW MOVING ITEMS
-        # =========================================================
-        if any(p in text for p in SLOW_MOVING_PHRASES):
-            logger.debug(f"Rule-based slow moving detected: {text}")  # Changed to DEBUG
-            return "GET_SLOW_MOVING_ITEMS"
-        
-        # =========================================================
-        # Check for PRICE queries
-        # =========================================================
-        price_patterns = [
-            r'\bprice\s+of\b',
-            r'\bcost\s+of\b', 
-            r'\bhow\s+much\b',
-            r'\bwhat\s+is\s+the\s+price\b',
-            r'\bwhat\s+is\s+the\s+cost\b',
-            r'\bwhat\'?s\s+the\s+price\b',
-            r'\bwhat\'?s\s+the\s+cost\b',
-            r'\bcan\s+you\s+tell\s+me\s+the\s+price\b',
-            r'\bmay\s+i\s+know\s+the\s+price\b',
-            r'\bi\'?d\s+like\s+to\s+know\s+the\s+price\b',
-            r'\bbei\s+ya\b',
-            r'\bgharama\s+ya\b',
-            r'\bpesa\s+ngapi\b',
-        ]
-        
-        for pattern in price_patterns:
-            if re.search(pattern, text):
-                if re.search(r'(?:for|kwa|ya)\s+([A-Za-z][A-Za-z\s]+)$', text):
-                    return "GET_CUSTOMER_PRICE"
-                return "GET_ITEM_PRICE"
-        
-        # Sell-out / customer segmentation queries
-        if any(p in text for p in _SELL_OUT_PHRASES):
-            logger.debug(f"Rule-based sell-out detected: {text}")  # Changed to DEBUG
-            return "FIND_CUSTOMERS_BY_ITEM"
-        
-        sell_out_patterns = [
-            r'^sell\s+out\s+', r'^who\s+to\s+sell\s+', r'who\s+would\s+buy\s+',
-            r'who\s+buys\s+', r'which\s+customer\s+', r'which\s+customers\s+',
-            r'customers\s+that\s+buy\s+', r'customers\s+who\s+buy\s+',
-            r'target\s+customers\s+for\s+', r'potential\s+customers\s+for\s+',
-            r'sell\s+this\s+to\s+', r'market\s+to\s+',
-        ]
-        for pattern in sell_out_patterns:
-            if re.search(pattern, text):
-                return "FIND_CUSTOMERS_BY_ITEM"
-
-        # Greeting
-        if any(w in text for w in ["hi", "hello", "hey", "greetings",
-                                    "good morning", "good afternoon", "good evening",
-                                    "howdy", "sup", "yo", "jambo", "habari", "mambo", "sasa"]):
-            return "GREETING"
-
-        # Thanks
-        if any(w in text for w in ["thanks", "thank you", "appreciate", "cheers", "asante", "shukran"]):
-            return "THANKS"
-
-        # Small talk / acknowledgements
-        stripped = text.rstrip("!?.,")
-        if stripped in _ACKNOWLEDGEMENT_WORDS or stripped in _FAREWELL_WORDS:
-            return "SMALL_TALK"
-        for phrase in _ACKNOWLEDGEMENT_WORDS | _FAREWELL_WORDS:
-            if stripped.startswith(phrase + " "):
-                return "SMALL_TALK"
-
-        # Training modules
-        training_keywords = ["how to", "learn", "training", "tutorial", "guide", "teach me", 
-                            "walk me through", "show me how", "getting started", "beginner", 
-                            "new user", "onboarding", "help me understand", "how do i", "how can i"]
-        
-        if any(p in text for p in training_keywords):
-            if not any(p in text for p in TOP_SELLING_PHRASES) and not any(p in text for p in SLOW_MOVING_PHRASES):
-                if any(w in text for w in ["video", "watch", "screencast", "demo"]):
-                    return "TRAINING_VIDEO"
-                elif any(w in text for w in ["pdf", "document", "manual", "handbook"]):
-                    return "TRAINING_GUIDE"
-                elif any(w in text for w in ["faq", "questions", "answers", "common issues"]):
-                    return "TRAINING_FAQ"
-                elif any(w in text for w in ["webinar", "live", "session", "class", "workshop"]):
-                    return "TRAINING_WEBINAR"
-                elif any(w in text for w in ["glossary", "term", "definition", "meaning",
-                                              "what does", "what is", "sku", "moq", "uom",
-                                              "eta", "grn", "dn"]):
-                    return "TRAINING_GLOSSARY"
-                else:
-                    return "TRAINING_MODULE"
-
-        # Cross-sell
-        if any(p in text for p in _CROSS_SELL_PHRASES):
-            return "GET_CROSS_SELL"
-
-        # Upsell
-        if any(p in text for p in [
-            "better version", "upgrade", "premium alternative",
-            "higher quality", "better value", "more expensive",
-            "what's better than", "superior to", "upgrade to",
-            "deluxe version", "professional grade", "commercial grade",
-            "premium version", "enhanced version"
-        ]):
-            return "GET_UPSELL"
-
-        # Seasonal recommendations
-        if any(p in text for p in [
-            "seasonal", "what to plant in", "best for this season",
-            "recommend for", "good for planting", "seasonal crops",
-            "what grows in", "planting guide for", "seasonal recommendations",
-            "what should i plant in", "what to grow in"
-        ]):
-            return "GET_SEASONAL_RECOMMENDATIONS"
-
-        # Trending products
-        if any(p in text for p in [
-            "trending", "popular now", "hot items", "best sellers",
-            "most popular", "top selling", "what's trending",
-            "customers are buying", "in demand", "high demand",
-            "what is trending", "what's popular"
-        ]):
-            return "GET_TRENDING_PRODUCTS"
-
-        # Follow-up quotations
-        if any(p in text for p in [
-            "stale quote", "follow up", "unconverted", "pending quote",
-            "quote no response", "who hasn't responded", "open quotations",
-            "quote conversion", "quotation follow", "follow up on quote",
-            "customers with pending quotes",
-        ]):
-            return "FOLLOW_UP_QUOTATIONS"
-
-        # Price alert
-        if any(p in text for p in [
-            "price alert", "notify when price drops", "alert me when price",
-            "track price", "price monitoring", "price change alert",
-        ]):
-            return "PRICE_ALERT"
-
-        # Market intelligence
-        if any(p in text for p in [
-            "market intelligence", "market analysis", "price trends",
-            "market insights", "market overview", "industry prices",
-        ]):
-            return "MARKET_INTELLIGENCE"
-
-        # Competitor price check
-        if any(p in text for p in [
-            "competitor price", "competitor prices", "price at", "prices at",
-            "market price", "market prices", "other sellers", "compare price",
-            "price comparison", "compare with", "compare prices for", "vs", "versus"
-        ]):
-            return "COMPETITOR_PRICE_CHECK"
-
-        # Find best price
-        if any(p in text for p in [
-            "best price", "cheapest", "lowest price", "where to buy",
-            "who sells cheapest", "best deal", "most affordable",
-            "who has the best price", "where can i find.*cheap",
-        ]):
-            return "FIND_BEST_PRICE"
-
-        # Inventory health
-        if any(p in text for p in [
-            "inventory health", "stock health", "inventory analysis", "health check",
-        ]):
-            return "ANALYZE_INVENTORY_HEALTH"
-
-        # Reorder decisions
-        if any(p in text for p in [
-            "reorder", "what to order", "order decisions", "what should i order",
-            "reorder recommendations", "reorder decisions",
-        ]):
-            return "GET_REORDER_DECISIONS"
-
-        # Pricing opportunities
-        if any(p in text for p in [
-            "pricing opportunities", "price opportunities", "price analysis",
-            "price drops", "price hikes",
-        ]):
-            return "ANALYZE_PRICING_OPPORTUNITIES"
-
-        # Customer behavior analysis
-        if any(p in text for p in [
-            "customer behavior", "customer analysis", "customer insights",
-            "analyze customer", "customer patterns", "purchase patterns",
-        ]):
-            return "ANALYZE_CUSTOMER_BEHAVIOR"
-
-        # Forecast demand
-        if any(p in text for p in [
-            "forecast", "demand forecast", "sales forecast", "predict demand",
-            "future demand",
-        ]):
-            return "FORECAST_DEMAND"
-
-        # List customers (but NOT churn risk)
-        if any(p in text for p in [
-            "customers", "clients", "buyers",
-            "show me customers", "list customers", "all customers", "wateja wote"
-        ]):
-            if not any(phrase in text for phrase in _CROSS_SELL_PHRASES):
-                # Check again for churn to override
-                if any(phrase in text for phrase in _CHURN_RISK_PHRASES):
-                    return "GET_CUSTOMER_HEALTH"
-                return "GET_CUSTOMERS"
-
-        # Contact info
-        if any(p in text for p in ["phone", "phone number", "contact", "email",
-                                    "support", "reach you", "call", "whatsapp"]):
-            return "CONTACT_INFO"
-
-        # Company info (fallback)
-        if any(p in text for p in ["about leysco", "tell me about", "what is leysco",
-                                    "who is leysco", "leysco information"]):
-            return "COMPANY_INFO"
-
-        # Product info
-        if any(p in text for p in ["easeed", "agriscope", "product line", "brands"]):
-            if "price" not in text and "stock" not in text:
-                return "PRODUCT_INFO"
-
-        # Payment methods
-        if any(p in text for p in [
-            "payment method", "payment methods", "payment option",
-            "how to pay", "accepted payment", "do you accept", "pay with",
-            "mpesa", "bank transfer", "cash", "card", "paybill",
-        ]):
-            return "PAYMENT_METHODS"
-
-        # How to order
-        if any(p in text for p in [
-            "how to order", "place an order", "how do i order", "ordering process",
-        ]):
-            return "HOW_TO_ORDER"
-
-        # Get quotations
-        if any(p in text for p in [
-            "show quotes", "show quotations", "list quotes", "view quotes",
-            "my quotes", "my quotations"
-        ]):
-            return "GET_QUOTATIONS"
-
-        # Recommendations
-        if any(w in text for w in ["recommend", "suggest", "best selling",
-                                    "top selling", "popular", "good for"]):
-            return "RECOMMEND_ITEMS"
-
-        # Stock levels
-        if any(p in text for p in [
-            "stock level", "stock levels", "current stock", "stock status",
-            "how much stock", "stock report",
-        ]):
-            return "GET_STOCK_LEVELS"
-
-        # Low stock alerts
-        if any(p in text for p in ["low stock", "low inventory", "stock alert",
-                                    "running low", "alert"]):
-            return "GET_LOW_STOCK_ALERTS"
-
-        # Warehouse stock
-        if any(p in text for p in ["stock in", "stock at", "inventory in",
-                                    "inventory at", "which warehouse has"]):
-            return "GET_WAREHOUSE_STOCK"
-
-        # Product detection
-        has_product = any(prod in text for prod in _COMMON_PRODUCTS)
-        if has_product:
-            if len(text.split()) <= 3:
-                return "GET_ITEMS"
-            if "stock" in text or "available" in text:
-                return "GET_STOCK_LEVELS"
-            if any(w in text for w in ["low", "alert", "running low"]):
-                return "GET_LOW_STOCK_ALERTS"
-            if "warehouse" in text:
-                return "GET_WAREHOUSE_STOCK"
-            return "GET_ITEMS"
-
-        # Delivery tracking
-        if any(p in text for p in ["track delivery", "delivery status",
-                                    "where is delivery", "track order"]):
-            return "TRACK_DELIVERY"
-
-        # Delivery history
-        if any(p in text for p in ["delivery history", "past deliveries",
-                                    "previous deliveries"]):
-            return "GET_DELIVERY_HISTORY"
-
-        # Outstanding deliveries
-        if any(p in text for p in ["outstanding deliver", "pending deliver", "undelivered"]):
-            return "GET_OUTSTANDING_DELIVERIES"
-
-        # Warehouses
-        if any(w in text for w in ["warehouse", "warehouses", "storage location", "ghala", "maghala"]):
-            if "stock" in text or "item" in text or "has" in text:
-                return "GET_WAREHOUSE_STOCK"
-            return "GET_WAREHOUSES"
-
-        # Sellable items
-        if any(w in text for w in ["sellable", "for sale", "saleable"]):
-            return "GET_SELLABLE_ITEMS"
-        
-        # Purchasable items
-        if any(w in text for w in ["purchasable", "to purchase"]):
-            return "GET_PURCHASABLE_ITEMS"
-        
-        # Inventory items
-        if any(w in text for w in ["inventory items", "in inventory"]):
-            return "GET_INVENTORY_ITEMS"
-
-        # List items
-        if any(w in text for w in ["show me items", "list items", "items", "products",
-                                    "what items", "bidhaa"]):
-            return "GET_ITEMS"
-
-        if has_product:
-            return "GET_ITEMS"
-
-        return "UNKNOWN"
-
-    # -------------------------------------------------------------------------
-    # SAFE JSON PARSER
+    # SAFE JSON PARSER (FIXED)
     # -------------------------------------------------------------------------
     def _extract_json(self, text: str) -> dict | None:
+        """Safely extract JSON from LLM response."""
         try:
-            match = re.search(r"\{.*?\}", text, re.DOTALL | re.MULTILINE)
-            if not match:
+            if not text or not text.strip():
                 return None
-            return json.loads(match.group(0))
-        except Exception:
+            
+            clean_text = text.strip()
+            
+            # Try direct JSON parsing first
+            try:
+                return json.loads(clean_text)
+            except json.JSONDecodeError:
+                pass
+            
+            # Find JSON object - simple pattern
+            json_match = re.search(r'\{[^{}]*\}', clean_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                json_str = json_str.strip()
+                json_str = json_str.replace(',}', '}')
+                json_str = json_str.replace(', ]', ']')
+                
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    intent_match = re.search(r'"intent"\s*:\s*"([^"]+)"', json_str)
+                    if intent_match:
+                        intent_value = intent_match.group(1).strip()
+                        if intent_value in _VALID_INTENTS_SET:
+                            return {"intent": intent_value}
+            
+            # Fallback: look for intent as plain word
+            for intent in _VALID_INTENTS_SET:
+                if re.search(rf'\b{intent}\b', clean_text, re.IGNORECASE):
+                    return {"intent": intent}
+            
+            return None
+        except Exception as e:
+            logger.warning(f"JSON extraction error: {e}")
             return None
 
     # -------------------------------------------------------------------------
-    # CLARIFICATION SUGGESTIONS (with churn options)
+    # RULE-BASED INTENT ENGINE
+    # -------------------------------------------------------------------------
+    @lru_cache(maxsize=512)
+    def _rule_based_intent(self, text: str) -> str:
+        """Cached rule-based intent detection."""
+        text = text.lower().strip()
+        
+        # Check for item browsing
+        browse_keywords = ['browse', 'show', 'list', 'view', 'display', 'get', 'see', 'check']
+        if any(kw in text for kw in browse_keywords) and any(t in text for t in ['items', 'products', 'inventory', 'stock']):
+            return "GET_ITEMS"
+        
+        if text in ['items', 'products', 'inventory', 'stock', 'list', 'show']:
+            return "GET_ITEMS"
+        
+        if any(phrase in text for phrase in _STOCK_LEVELS_GENERAL_PHRASES):
+            return "GET_STOCK_LEVELS"
+        
+        if any(phrase in text for phrase in _CHURN_RISK_PHRASES):
+            return "GET_CUSTOMER_HEALTH"
+        
+        if 'quotation' in text or 'quote' in text or 'nukuu' in text:
+            if any(w in text for w in ['create', 'make', 'generate', 'prepare', 'new', 'unda', 'mpya']):
+                return "CREATE_QUOTATION"
+        
+        if any(p in text for p in TOP_SELLING_PHRASES):
+            return "GET_TOP_SELLING_ITEMS"
+        
+        if any(p in text for p in SALES_ANALYTICS_PHRASES):
+            return "GET_SALES_ANALYTICS"
+        
+        if any(p in text for p in SLOW_MOVING_PHRASES):
+            return "GET_SLOW_MOVING_ITEMS"
+        
+        # Price queries
+        if any(p in text for p in ['price', 'cost', 'bei', 'how much', 'gharama']):
+            if re.search(r'(?:for|kwa|ya)\s+([A-Za-z][A-Za-z\s]+)$', text):
+                return "GET_CUSTOMER_PRICE"
+            return "GET_ITEM_PRICE"
+        
+        # Greetings
+        if any(w in text for w in _SWAHILI_GREETINGS):
+            return "GREETING"
+        
+        if any(w in text for w in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
+            return "GREETING"
+        
+        return "UNKNOWN"
+
+    # -------------------------------------------------------------------------
+    # CLARIFICATION SUGGESTIONS
     # -------------------------------------------------------------------------
     def _clarify_suggestions(self, text: str, language: str = "en") -> list[str]:
-        text_lower = text.lower()
-        sw = language in ("sw", "mixed")
-
-        # Churn risk suggestions
-        if any(w in text_lower for w in ["churn", "risk", "customer health", "at risk"]):
-            if sw:
-                return ["Onyesha wateja walio katika hatari", "Afya ya mteja", "Wateja wenye alama ya chini"]
-            return ["Show customers at churn risk", "Customer health scores", "Customers with low health score"]
-
-        if any(w in text_lower for w in ["price", "cost", "bei", "how much"]):
-            if sw:
-                return ["Bei ya bidhaa gani?", "Angalia bei ya vegimax", "Bei ya mteja"]
-            return ["Price of which item?", "Check price of vegimax", "Customer pricing"]
-
-        if any(w in text_lower for w in ["stock", "hisa", "available", "how many"]):
-            if sw:
-                return ["Hisa ya bidhaa gani?", "Angalia hisa ya maghala yote", "Arifa za hisa chini"]
-            return ["Stock of which item?", "Check all warehouse stock", "Low stock alerts"]
-
-        if any(w in text_lower for w in ["customer", "mteja", "client", "who is"]):
-            if sw:
-                return ["Maelezo ya mteja gani?", "Onyesha wateja wote", "Oda za mteja"]
-            return ["Details for which customer?", "Show all customers", "Customer orders"]
-
-        if any(w in text_lower for w in ["quote", "quotation", "nukuu", "create", "make"]):
-            if sw:
-                return ["Unda nukuu mpya", "Onyesha nukuu zilizopo", "Fuatilia nukuu"]
-            return ["Create a new quotation", "Show existing quotations", "Follow up on quotes"]
+        sw = language == "sw"
         
-        if any(w in text_lower for w in ["sell", "out", "who", "target", "buy"]):
-            if sw:
-                return ["Nani atanunua bidhaa hii?", "Wateja wanaonunua nini?", "Unda nukuu kwa wateja"]
-            return ["Who would buy this product?", "Find customers for a product", "Create quotes for potential buyers"]
-
-        if any(w in text_lower for w in ["top", "best", "popular", "selling", "trending"]):
-            if sw:
-                return ["Onyesha bidhaa 10 zinazouzwa zaidi", "Bidhaa gani zinauzwa sana?", "Top 5 bidhaa kwa mwezi huu"]
-            return ["Show top 10 selling items", "Which products sell the most?", "Top 5 items this month"]
-        
-        # Sales analytics suggestions
-        if any(w in text_lower for w in ["sales", "analytics", "revenue", "report"]):
-            if sw:
-                return ["Onyesha uchambuzi wa mauzo", "Ripoti ya mauzo kwa mwezi", "Muhtasari wa mauzo"]
-            return ["Show sales analytics", "Sales report for last month", "Sales performance overview"]
-
-        if any(w in text_lower for w in ["slow", "least", "worst", "dead stock", "not selling"]):
-            if sw:
-                return ["Onyesha bidhaa zinazosonga polepole", "Bidhaa gani hazijauzwa?", "Bidhaa za dead stock"]
-            return ["Show slow moving items", "Which products are not selling?", "Dead stock items"]
-
-        if any(w in text_lower for w in ["order", "purchase", "oda", "what did"]):
-            if sw:
-                return ["Oda za mteja gani?", "Mteja alinunua nini?", "Historia ya ununuzi"]
-            return ["Orders for which customer?", "What did the customer buy?", "Purchase history"]
-
         if sw:
             return ["Angalia bei ya bidhaa", "Angalia hisa", "Unda nukuu", "Onyesha wateja", "Bidhaa zinazouzwa sana"]
         return ["Check item price", "Check stock levels", "Create a quotation", "Show customers", "Top selling items"]
 
     # -------------------------------------------------------------------------
-    # MAIN CLASSIFIER (Sync)
+    # MAIN CLASSIFIER
     # -------------------------------------------------------------------------
     def classify(self, user_message: str) -> dict:
-        """Sync classification - used for compatibility."""
+        """Sync classification."""
         return asyncio.run(self.classify_async(user_message))
 
-    # -------------------------------------------------------------------------
-    # MAIN CLASSIFIER (Async - Optimized)
-    # -------------------------------------------------------------------------
     async def classify_async(self, user_message: str) -> dict:
-        """
-        Async intent classification with fast-path, caching, and parallel execution.
-        """
+        """Async intent classification."""
         text_lower = user_message.lower().strip()
-        language = "en"
+        detected_language = self._detect_language(user_message)
+        logger.info(f"🌐 Language detected: {detected_language.upper()} for: '{user_message[:50]}'")
+        language = detected_language
 
-        # ── STEP 1: Check cache first (fastest) ──────────────────────────────
-        cache_key = f"intent:{user_message}"
+        # Step 1: Check cache
+        cache_key = f"intent:{user_message}:{language}"
         cached = await cache_service.get_simple_async(cache_key)
         if cached:
-            logger.debug(f"Intent cache hit: {user_message[:50]}...")  # Changed to DEBUG
             return cached
 
-        # ── STEP 2: Try fast-path patterns (no LLM) ──────────────────────────
+        # Step 2: Direct intent check (bypass LLM for common phrases)
+        direct_result = self._check_direct_intents(user_message)
+        if direct_result:
+            intent, entities, direct_lang = direct_result
+            result = _result(intent=intent, language=direct_lang, confidence=_CONF["fast_path"], entities=entities)
+            await cache_service.set_simple_async(cache_key, result, ttl=300)
+            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {direct_lang})")
+            return result
+
+        # Step 3: Try fast-path patterns
         fast_path_result = self._try_fast_path(user_message)
         if fast_path_result:
-            intent, entities = fast_path_result
-            result = _result(
-                intent=intent,
-                language=language,
-                confidence=_CONF["fast_path"],
-                entities=entities,
-                original_text=user_message
-            )
+            intent, entities, fp_language = fast_path_result
+            final_language = fp_language if fp_language else language
+            result = _result(intent=intent, language=final_language, confidence=_CONF["fast_path"], entities=entities)
             await cache_service.set_simple_async(cache_key, result, ttl=300)
-            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
+            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {final_language})")
             return result
 
-        # ── STEP 3: Swahili detection ────────────────────────────────────────
-        swahili_result = self.swahili.process_swahili_query(user_message)
-
-        if swahili_result["detected_language"] != "en":
-            language = swahili_result["detected_language"]
-            logger.debug(f"Swahili detected: lang={language}")  # Changed to DEBUG
-
-            if swahili_result["intent"] != "UNKNOWN":
-                intent = swahili_result["intent"]
-                result = _result(
-                    intent=intent,
-                    language=language,
-                    confidence=_CONF["swahili"],
-                    entities=swahili_result.get("entities", {}),
-                    original_text=user_message,
-                    normalized_text=swahili_result.get("normalized_text", ""),
-                )
-                await cache_service.set_simple_async(cache_key, result, ttl=300)
-                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-                return result
-
-            if swahili_result.get("normalized_text"):
-                text_lower = swahili_result["normalized_text"].lower()
-
-        # ── STEP 4: Check for CHURN RISK (HIGH PRIORITY) ─────────────────────
-        if any(phrase in text_lower for phrase in _CHURN_RISK_PHRASES):
-            result = _result(
-                intent="GET_CUSTOMER_HEALTH",
-                language=language,
-                confidence=_CONF["rule_fallback"],
-                original_text=user_message
-            )
-            await cache_service.set_simple_async(cache_key, result, ttl=300)
-            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-            return result
-
-        # ── STEP 5: Customer Segmentation / "Sell Out" queries ───────────────
-        is_sell_out_query = False
-        
-        for phrase in _SELL_OUT_PHRASES:
-            if phrase in text_lower:
-                is_sell_out_query = True
-                logger.debug(f"Sell-out query detected: '{phrase}'")  # Changed to DEBUG
-                break
-        
-        sell_out_patterns = [
-            r'^sell\s+out\s+', r'^who\s+to\s+sell\s+', r'who\s+would\s+buy\s+',
-            r'who\s+buys\s+', r'which\s+customer\s+', r'which\s+customers\s+',
-            r'customers\s+that\s+buy\s+', r'customers\s+who\s+buy\s+',
-            r'target\s+customers\s+for\s+', r'potential\s+customers\s+for\s+',
-        ]
-        for pattern in sell_out_patterns:
-            if re.search(pattern, text_lower):
-                is_sell_out_query = True
-                break
-        
-        if is_sell_out_query:
-            product = None
-            extract_patterns = [
-                r'sell\s+out\s+([a-zA-Z0-9\-\(\)\s]+?)(?:\?|$)',
-                r'who\s+would\s+buy\s+([a-zA-Z0-9\-\(\)\s]+?)(?:\?|$)',
-                r'which\s+customers?\s+buy\s+([a-zA-Z0-9\-\(\)\s]+?)(?:\?|$)',
-                r'customers\s+who\s+buy\s+([a-zA-Z0-9\-\(\)\s]+?)(?:\?|$)',
-                r'target\s+customers\s+for\s+([a-zA-Z0-9\-\(\)\s]+?)(?:\?|$)',
-            ]
-            
-            for pattern in extract_patterns:
-                match = re.search(pattern, text_lower)
-                if match:
-                    candidate = match.group(1).strip()
-                    candidate = re.sub(r'\b(sell|out|to|for|who|would|buy|buys|target|customers)\b', '', candidate, flags=re.IGNORECASE)
-                    candidate = candidate.strip()
-                    if candidate and len(candidate) > 1:
-                        product = candidate
-                        break
-            
-            if product:
-                for known in _COMMON_PRODUCTS:
-                    if known in product.lower() or product.lower() in known:
-                        product = known
-                        break
-                
-                result = _result(
-                    intent="FIND_CUSTOMERS_BY_ITEM",
-                    language=language,
-                    confidence=0.95,
-                    entities={"item_name": product, "action": "sell_out"}
-                )
-                await cache_service.set_simple_async(cache_key, result, ttl=300)
-                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-                return result
-            else:
-                result = _result(
-                    intent="CLARIFY",
-                    language=language,
-                    confidence=0.85,
-                    alternatives=["Sell out which product?", "Find customers for which item?"]
-                )
-                await cache_service.set_simple_async(cache_key, result, ttl=300)
-                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-                return result
-
-        # ── STEP 6: Short query fast-path (no AI) ───────────────────────────
-        if len(text_lower) < 35:
-            if any(w in text_lower for w in ["hi", "hello", "hey", "jambo", "habari"]):
-                result = _result("GREETING", language, _CONF["fast_path"])
-                await cache_service.set_simple_async(cache_key, result, ttl=300)
-                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-                return result
-
-            if any(w in text_lower for w in ["thanks", "thank you", "asante"]):
-                result = _result("THANKS", language, _CONF["fast_path"])
-                await cache_service.set_simple_async(cache_key, result, ttl=300)
-                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-                return result
-
-            if any(w in text_lower for w in ["sales", "revenue", "analytics"]):
-                result = _result("GET_SALES_ANALYTICS", language, _CONF["fast_path"])
-                await cache_service.set_simple_async(cache_key, result, ttl=300)
-                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-                return result
-
-            stripped = text_lower.rstrip("!?.,")
-            if stripped in _ACKNOWLEDGEMENT_WORDS or stripped in _FAREWELL_WORDS:
-                result = _result("SMALL_TALK", language, _CONF["fast_path"])
-                await cache_service.set_simple_async(cache_key, result, ttl=300)
-                logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
-                return result
-
-        # ── STEP 7: Rule-based fallback (cached) ─────────────────────────────
+        # Step 4: Rule-based fallback
         rule_intent = self._rule_based_intent(user_message)
-        
         if rule_intent != "UNKNOWN":
-            confidence = _CONF["rule_fallback"]
-            result = _result(
-                intent=rule_intent,
-                language=language,
-                confidence=confidence,
-            )
+            result = _result(intent=rule_intent, language=language, confidence=_CONF["rule_fallback"])
             await cache_service.set_simple_async(cache_key, result, ttl=300)
-            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
+            logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {language})")
             return result
 
-        # ── STEP 8: AI classification (only if needed) ───────────────────────
+        # Step 5: AI classification (only if needed)
         try:
             prompt = self.prompt_manager.get_intent_prompt(user_message)
             response = await self.llm.generate_async(prompt)
-
+            
             if response and response.strip():
                 data = self._extract_json(response)
                 if data:
                     ai_intent = data.get("intent", "").strip().upper()
-
                     if ai_intent in _VALID_INTENTS_SET:
-                        logger.debug(f"AI raw intent: {ai_intent}")  # Changed to DEBUG
-                        
-                        # Post-AI overrides
-                        original_ai = ai_intent
-                        
-                        # Check for churn risk
-                        if any(phrase in text_lower for phrase in _CHURN_RISK_PHRASES):
-                            ai_intent = "GET_CUSTOMER_HEALTH"
-                            logger.debug(f"AI override: churn risk detected")  # Changed to DEBUG
-                        
-                        # Check for quotation creation again
-                        elif 'quotation' in text_lower or 'quote' in text_lower:
-                            if any(w in text_lower for w in ['create', 'make', 'generate', 'prepare', 'new', 'cash sale']):
-                                ai_intent = "CREATE_QUOTATION"
-                        # Check for company info
-                        elif 'leysco' in text_lower and any(w in text_lower for w in ['tell me about', 'what is', 'who is', 'about']):
-                            ai_intent = "COMPANY_INFO"
-                            logger.debug(f"AI override: company info detected")  # Changed to DEBUG
-                        # Check for sales analytics
-                        elif any(p in text_lower for p in SALES_ANALYTICS_PHRASES):
-                            ai_intent = "GET_SALES_ANALYTICS"
-                            logger.debug(f"AI override: sales analytics detected")  # Changed to DEBUG
-                        elif any(p in text_lower for p in _SELL_OUT_PHRASES):
-                            ai_intent = "FIND_CUSTOMERS_BY_ITEM"
-                        elif "customer" in text_lower and "price" in text_lower:
-                            ai_intent = "GET_CUSTOMER_PRICE"
-                        elif "low stock" in text_lower:
-                            ai_intent = "GET_LOW_STOCK_ALERTS"
-                        elif any(p in text_lower for p in TOP_SELLING_PHRASES):
-                            ai_intent = "GET_TOP_SELLING_ITEMS"
-                        elif any(p in text_lower for p in SLOW_MOVING_PHRASES):
-                            ai_intent = "GET_SLOW_MOVING_ITEMS"
-                        
-                        confidence = _CONF["ai_override"] if ai_intent != original_ai else _CONF["ai_clean"]
-                        
-                        result = _result(
-                            intent=ai_intent,
-                            language=language,
-                            confidence=confidence,
-                        )
+                        result = _result(intent=ai_intent, language=language, confidence=_CONF["ai_clean"])
                         await cache_service.set_simple_async(cache_key, result, ttl=300)
-                        logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
+                        logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {language})")
                         return result
-
         except Exception as e:
             logger.warning(f"LLM intent failed: {e}")
 
-        # ── STEP 9: Final fallback to CLARIFY ────────────────────────────────
+        # Final fallback
         suggestions = self._clarify_suggestions(user_message, language)
-        result = _result(
-            intent="CLARIFY",
-            language=language,
-            confidence=0.30,
-            alternatives=suggestions,
-        )
+        result = _result(intent="CLARIFY", language=language, confidence=0.30, alternatives=suggestions)
         await cache_service.set_simple_async(cache_key, result, ttl=60)
-        logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}) for: '{user_message[:50]}'")  # ADDED: Final log
+        logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {language})")
         return result
 
-    # -------------------------------------------------------------------------
-    # BATCH CLASSIFICATION (for multiple messages)
-    # -------------------------------------------------------------------------
     async def classify_batch(self, messages: list[str]) -> list[dict]:
         """Classify multiple messages in parallel."""
         tasks = [self.classify_async(msg) for msg in messages]

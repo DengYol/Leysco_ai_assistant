@@ -1,547 +1,81 @@
-"""
-app/services/notification_service.py
-=====================================
-Proactive Notification Engine
-Scans for opportunities and creates user notifications
-
-FEATURES:
-- Low stock alerts
-- Churn risk detection
-- Reorder recommendations
-- Price drop alerts
-- Seasonal opportunities
-- Upsell opportunities
-- Anomaly detection alerts
-"""
+"""Proactive notification service for AI assistant - Manager focused"""
 
 import logging
-import asyncio
-from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
-from enum import Enum
-from dataclasses import dataclass, asdict
-from datetime import datetime
-import uuid
+from datetime import datetime, timedelta
+import asyncio
 
 from app.services.cache_service import get_cache_service
-from app.services.leysco_api_service import create_api_service
-from app.services.pricing_service import create_pricing_service
-from app.ai_engine.decision_support import DecisionSupport
+from app.services.leysco_api import create_api_service
 
 logger = logging.getLogger(__name__)
 
 
-class NotificationType(str, Enum):
-    LOW_STOCK = "LOW_STOCK"
-    CHURN_RISK = "CHURN_RISK"
-    REORDER = "REORDER"
-    PRICE_DROP = "PRICE_DROP"
-    SEASONAL = "SEASONAL"
-    UPSELL = "UPSELL"
-    CROSS_SELL = "CROSS_SELL"
-    LEAD_OPPORTUNITY = "LEAD_OPPORTUNITY"
-    ANOMALY = "ANOMALY"  # New: Anomaly detection alerts
-
-
-class Priority(str, Enum):
-    CRITICAL = "CRITICAL"  # Act immediately (0-24 hours)
-    HIGH = "HIGH"          # Act within 24-48 hours
-    MEDIUM = "MEDIUM"      # Act within 1 week
-    LOW = "LOW"            # Nice to know
-
-
-@dataclass
-class Notification:
-    """Data class for a notification"""
-    id: str
-    user_id: int
-    user_role: str
-    tenant_code: str
-    type: NotificationType
-    title: str
-    message: str
-    message_sw: str  # Swahili version
-    action: str  # Suggested action text
-    action_intent: str  # Intent to trigger when tapped
-    action_data: Dict[str, Any]  # Data for the action
-    priority: Priority
-    score: int  # 0-100
-    potential_value: float
-    is_read: bool
-    created_at: str
-    expires_at: str
-    metadata: Dict[str, Any]
+class AINotification:
+    """Notification model for proactive alerts"""
+    
+    def __init__(self, id: str, title: str, message: str, priority: str, 
+                 action: str = "", category: str = "general", icon: str = "notifications",
+                 actionable: bool = True):
+        self.id = id
+        self.title = title
+        self.message = message
+        self.priority = priority  # HIGH, MEDIUM, LOW
+        self.action = action
+        self.category = category
+        self.icon = icon
+        self.actionable = actionable
+        self.created_at = datetime.now().isoformat()
+        self.is_read = False
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "message": self.message,
+            "priority": self.priority,
+            "action": self.action,
+            "category": self.category,
+            "icon": self.icon,
+            "actionable": self.actionable,
+            "created_at": self.created_at,
+            "is_read": self.is_read
+        }
+    
+    def get_icon(self) -> str:
+        icons = {
+            "warning": "warning",
+            "info": "info",
+            "notifications": "notifications",
+            "inventory": "inventory_2",
+            "delivery": "local_shipping",
+            "analytics": "analytics",
+            "pricing": "attach_money",
+            "quotations": "receipt_long",
+            "customer": "people",
+            "alert": "error_outline"
+        }
+        return icons.get(self.category, "notifications")
+    
+    def get_priority_color(self) -> int:
+        colors = {
+            "HIGH": 0xFFEF4444,  # Red - Critical
+            "MEDIUM": 0xFFF59E0B,  # Orange - Warning
+            "LOW": 0xFF3B82F6  # Blue - Info
+        }
+        return colors.get(self.priority, 0xFF6B7280)
+    
+    def get_localized_message(self, language: str = "en") -> str:
+        return self.message
 
 
 class NotificationService:
-    """
-    Proactive notification engine.
-    Scans for opportunities and manages user notifications.
-    """
-    
-    # Scanner intervals (seconds)
-    SCAN_INTERVAL = 900  # 15 minutes
-    
-    # Score thresholds
-    CRITICAL_SCORE = 80
-    HIGH_SCORE = 60
-    MEDIUM_SCORE = 40
-    
-    # Cache TTLs
-    NOTIFICATION_CACHE_TTL = 300  # 5 minutes
-    SCAN_LOCK_TTL = 900  # 15 minutes
+    """Service for generating proactive notifications - Manager focused"""
     
     def __init__(self):
         self.cache = get_cache_service()
-        self._scanner_task = None
-        self._is_scanning = False
-        
-        # Lazy-loaded services
-        self._api_service = None
-        self._pricing_service = None
-        self._decision_support = None
-    
-    def _get_api_service(self, user_token: str):
-        """Lazy load API service with user token."""
-        return create_api_service(user_token=user_token)
-    
-    def _get_decision_support(self, user_token: str):
-        """Lazy load decision support."""
-        api = self._get_api_service(user_token)
-        pricing = create_pricing_service(user_token=user_token)
-        return DecisionSupport(api=api, pricing=pricing, warehouse=None, recommender=None)
-    
-    # =========================================================
-    # OPPORTUNITY DETECTORS
-    # =========================================================
-    
-    async def _detect_low_stock(
-        self, 
-        user_token: str, 
-        tenant_code: str,
-        user_role: str
-    ) -> List[Notification]:
-        """Detect low stock items that need reordering."""
-        notifications = []
-        
-        try:
-            api = self._get_api_service(user_token)
-            decision_support = self._get_decision_support(user_token)
-            
-            # Get inventory health analysis
-            health = decision_support.analyze_inventory_health()
-            
-            if health.get("error"):
-                logger.warning(f"Low stock detection failed: {health.get('error')}")
-                return []
-            
-            # Process critical items
-            for item in health.get("critical_items", [])[:5]:
-                score = 95  # Critical stock = high priority
-                potential_value = item.get("value", 0) or item.get("unit_price", 0) * 100
-                
-                notification = Notification(
-                    id=str(uuid.uuid4()),
-                    user_id=0,  # Will be set per user
-                    user_role=user_role,
-                    tenant_code=tenant_code,
-                    type=NotificationType.LOW_STOCK,
-                    title=f"⚠️ Critical Stock: {item.get('name', 'Unknown')}",
-                    message=f"Only {item.get('available', 0):.0f} units left ({item.get('days_left', 'N/A')} days). Order immediately!",
-                    message_sw=f"⚠️ Hisa Muhimu: {item.get('name', 'Unknown')} imesalia vitengo {item.get('available', 0):.0f} tu. Agiza sasa!",
-                    action="View reorder recommendations",
-                    action_intent="GET_REORDER_DECISIONS",
-                    action_data={"item_code": item.get("code")},
-                    priority=Priority.CRITICAL,
-                    score=score,
-                    potential_value=potential_value,
-                    is_read=False,
-                    created_at=datetime.now().isoformat(),
-                    expires_at=(datetime.now() + timedelta(days=1)).isoformat(),
-                    metadata={"item_code": item.get("code"), "current_stock": item.get("available")}
-                )
-                notifications.append(notification)
-            
-            # Process low stock items
-            for item in health.get("risk_items", [])[:5]:
-                score = 70
-                potential_value = item.get("value", 0) or item.get("unit_price", 0) * 50
-                
-                notification = Notification(
-                    id=str(uuid.uuid4()),
-                    user_id=0,
-                    user_role=user_role,
-                    tenant_code=tenant_code,
-                    type=NotificationType.LOW_STOCK,
-                    title=f"📦 Low Stock: {item.get('name', 'Unknown')}",
-                    message=f"Only {item.get('available', 0):.0f} units left. Reorder within 3-5 days.",
-                    message_sw=f"📦 Hisa Chache: {item.get('name', 'Unknown')} imesalia vitengo {item.get('available', 0):.0f} tu. Agiza ndani ya siku 3-5.",
-                    action="Check stock levels",
-                    action_intent="GET_WAREHOUSE_STOCK",
-                    action_data={"item_code": item.get("code")},
-                    priority=Priority.HIGH,
-                    score=score,
-                    potential_value=potential_value,
-                    is_read=False,
-                    created_at=datetime.now().isoformat(),
-                    expires_at=(datetime.now() + timedelta(days=3)).isoformat(),
-                    metadata={"item_code": item.get("code"), "current_stock": item.get("available")}
-                )
-                notifications.append(notification)
-            
-            logger.info(f"🔔 Detected {len(notifications)} low stock notifications")
-            
-        except Exception as e:
-            logger.error(f"Error in low stock detection: {e}", exc_info=True)
-        
-        return notifications
-    
-    async def _detect_churn_risk(
-        self,
-        user_token: str,
-        tenant_code: str,
-        user_role: str,
-        assigned_customers: List[str] = None
-    ) -> List[Notification]:
-        """Detect customers at risk of churning."""
-        notifications = []
-        
-        try:
-            api = self._get_api_service(user_token)
-            decision_support = self._get_decision_support(user_token)
-            
-            # Get all customers (or assigned only for sales reps)
-            if assigned_customers:
-                # For sales reps, check only assigned customers
-                customers = []
-                for cust_code in assigned_customers[:20]:  # Limit for performance
-                    cust = api.resolve_customer(cust_code)
-                    if cust:
-                        customers.append(cust)
-            else:
-                # For managers, get top customers by value
-                customers = api.get_customers(limit=50)
-            
-            for customer in customers[:30]:  # Limit for performance
-                customer_code = customer.get("CardCode")
-                customer_name = customer.get("CardName", "Unknown")
-                
-                # Analyze customer behavior
-                behavior = decision_support.analyze_customer_behavior(customer_name)
-                
-                if behavior.get("error"):
-                    continue
-                
-                # Check for churn risk
-                risk_factors = behavior.get("risk_factors", [])
-                days_since_last = behavior.get("purchase_patterns", {}).get("last_purchase_days_ago", 999)
-                
-                if days_since_last > 60 or any("churn" in f.lower() for f in risk_factors):
-                    score = min(90, 50 + (days_since_last - 30))
-                    potential_value = behavior.get("purchase_patterns", {}).get("avg_order_value", 10000)
-                    
-                    notification = Notification(
-                        id=str(uuid.uuid4()),
-                        user_id=0,
-                        user_role=user_role,
-                        tenant_code=tenant_code,
-                        type=NotificationType.CHURN_RISK,
-                        title=f"⚠️ Churn Risk: {customer_name}",
-                        message=f"No purchase in {days_since_last} days. Send win-back offer with 10% discount.",
-                        message_sw=f"⚠️ Hatari ya Kuondoka: {customer_name} hajaagiza kwa siku {days_since_last}. Tuma ofa ya kurudisha kwa punguzo la 10%.",
-                        action="Create win-back quotation",
-                        action_intent="CREATE_QUOTATION",
-                        action_data={"customer_name": customer_name, "discount": 10},
-                        priority=Priority.HIGH if days_since_last > 90 else Priority.MEDIUM,
-                        score=score,
-                        potential_value=potential_value,
-                        is_read=False,
-                        created_at=datetime.now().isoformat(),
-                        expires_at=(datetime.now() + timedelta(days=7)).isoformat(),
-                        metadata={"customer_code": customer_code, "days_inactive": days_since_last}
-                    )
-                    notifications.append(notification)
-            
-            logger.info(f"🔔 Detected {len(notifications)} churn risk notifications")
-            
-        except Exception as e:
-            logger.error(f"Error in churn risk detection: {e}", exc_info=True)
-        
-        return notifications
-    
-    async def _detect_reorder_opportunities(
-        self,
-        user_token: str,
-        tenant_code: str,
-        user_role: str
-    ) -> List[Notification]:
-        """Detect items that need reordering based on sales velocity."""
-        notifications = []
-        
-        try:
-            decision_support = self._get_decision_support(user_token)
-            
-            # Get reorder decisions
-            reorders = decision_support.get_reorder_decisions()
-            
-            if reorders.get("error"):
-                return []
-            
-            # Process immediate orders
-            for item in reorders.get("immediate_orders", [])[:5]:
-                score = 85
-                
-                notification = Notification(
-                    id=str(uuid.uuid4()),
-                    user_id=0,
-                    user_role=user_role,
-                    tenant_code=tenant_code,
-                    type=NotificationType.REORDER,
-                    title=f"🔄 Reorder Needed: {item.get('name', 'Unknown')}",
-                    message=f"Order {item.get('recommended_qty', 0)} units (KES {item.get('estimated_cost', 0):,.0f}). Current stock: {item.get('available', 0)} units.",
-                    message_sw=f"🔄 Agiza Tena: {item.get('name', 'Unknown')}. Agiza vitengo {item.get('recommended_qty', 0)}. Hisa ya sasa: {item.get('available', 0)}.",
-                    action="Create purchase order",
-                    action_intent="CREATE_QUOTATION",
-                    action_data={"item_code": item.get("code"), "quantity": item.get("recommended_qty")},
-                    priority=Priority.CRITICAL if item.get("urgency") == "CRITICAL" else Priority.HIGH,
-                    score=score,
-                    potential_value=item.get("estimated_cost", 0),
-                    is_read=False,
-                    created_at=datetime.now().isoformat(),
-                    expires_at=(datetime.now() + timedelta(days=2)).isoformat(),
-                    metadata={"item_code": item.get("code"), "recommended_qty": item.get("recommended_qty")}
-                )
-                notifications.append(notification)
-            
-            logger.info(f"🔔 Detected {len(notifications)} reorder notifications")
-            
-        except Exception as e:
-            logger.error(f"Error in reorder detection: {e}", exc_info=True)
-        
-        return notifications
-    
-    async def _detect_price_drops(
-        self,
-        user_token: str,
-        tenant_code: str,
-        user_role: str
-    ) -> List[Notification]:
-        """Detect significant price drops."""
-        notifications = []
-        
-        try:
-            decision_support = self._get_decision_support(user_token)
-            
-            # Analyze pricing opportunities
-            pricing = decision_support.analyze_pricing_opportunities()
-            
-            if pricing.get("error"):
-                return []
-            
-            # Process price drops
-            for item in pricing.get("price_drops", [])[:5]:
-                score = min(80, 50 + item.get("drop_percent", 0))
-                
-                notification = Notification(
-                    id=str(uuid.uuid4()),
-                    user_id=0,
-                    user_role=user_role,
-                    tenant_code=tenant_code,
-                    type=NotificationType.PRICE_DROP,
-                    title=f"💰 Price Drop: {item.get('name', 'Unknown')}",
-                    message=f"Price dropped {item.get('drop_percent', 0)}%! Now KES {item.get('current', 0):,.0f} (was KES {item.get('avg_price', 0):,.0f}). Good time to stock up.",
-                    message_sw=f"💰 Kushuka kwa Bei: {item.get('name', 'Unknown')} imeshuka kwa {item.get('drop_percent', 0)}%! Sasa KES {item.get('current', 0):,.0f}. Wakati mwema wa kununua.",
-                    action="Check current price",
-                    action_intent="GET_ITEM_PRICE",
-                    action_data={"item_name": item.get("name")},
-                    priority=Priority.MEDIUM,
-                    score=score,
-                    potential_value=item.get("current", 0) * 100,
-                    is_read=False,
-                    created_at=datetime.now().isoformat(),
-                    expires_at=(datetime.now() + timedelta(days=3)).isoformat(),
-                    metadata={"item_code": item.get("code"), "drop_percent": item.get("drop_percent")}
-                )
-                notifications.append(notification)
-            
-            logger.info(f"🔔 Detected {len(notifications)} price drop notifications")
-            
-        except Exception as e:
-            logger.error(f"Error in price drop detection: {e}", exc_info=True)
-        
-        return notifications
-    
-    async def _detect_seasonal_opportunities(
-        self,
-        user_token: str,
-        tenant_code: str,
-        user_role: str
-    ) -> List[Notification]:
-        """Detect seasonal selling opportunities."""
-        notifications = []
-        
-        try:
-            api = self._get_api_service(user_token)
-            current_month = datetime.now().month
-            
-            # Seasonal product categories by month
-            seasonal_products = {
-                3: ["seeds", "fertilizer"],      # March - Planting
-                6: ["pesticide", "herbicide"],    # June - Growing
-                9: ["harvesting"],                 # September - Harvest
-                12: ["storage", "silo"]            # December - Storage
-            }
-            
-            keywords = seasonal_products.get(current_month, [])
-            if not keywords:
-                return []
-            
-            # Search for relevant products
-            for keyword in keywords:
-                items = api.get_items(search=keyword, limit=3)
-                for item in items[:3]:
-                    notification = Notification(
-                        id=str(uuid.uuid4()),
-                        user_id=0,
-                        user_role=user_role,
-                        tenant_code=tenant_code,
-                        type=NotificationType.SEASONAL,
-                        title=f"🌱 Seasonal: {item.get('ItemName', 'Unknown')}",
-                        message=f"In high demand for {datetime.now().strftime('%B')}. Run a promotion to boost sales.",
-                        message_sw=f"🌱 Msimu: {item.get('ItemName', 'Unknown')} inahitajika sana mwezi wa {datetime.now().strftime('%B')}. Fanya promo kuongeza mauzo.",
-                        action="Check stock levels",
-                        action_intent="GET_WAREHOUSE_STOCK",
-                        action_data={"item_code": item.get("ItemCode")},
-                        priority=Priority.MEDIUM,
-                        score=65,
-                        potential_value=50000,
-                        is_read=False,
-                        created_at=datetime.now().isoformat(),
-                        expires_at=(datetime.now() + timedelta(days=14)).isoformat(),
-                        metadata={"item_code": item.get("ItemCode")}
-                    )
-                    notifications.append(notification)
-            
-            logger.info(f"🔔 Detected {len(notifications)} seasonal notifications")
-            
-        except Exception as e:
-            logger.error(f"Error in seasonal detection: {e}", exc_info=True)
-        
-        return notifications
-    
-    # =========================================================
-    # ANOMALY DETECTION (NEW)
-    # =========================================================
-    
-    async def _detect_anomalies(
-        self,
-        user_token: str,
-        tenant_code: str,
-        user_role: str
-    ) -> List[Notification]:
-        """
-        Detect anomalies and create notifications.
-        Only for managers.
-        """
-        notifications = []
-        
-        # Only managers get anomaly alerts
-        if user_role != "manager":
-            return notifications
-        
-        try:
-            from app.services.anomaly_detection_service import get_anomaly_detection_service
-            
-            anomaly_service = get_anomaly_detection_service()
-            
-            # Run anomaly scan
-            results = await anomaly_service.scan_all_anomalies(
-                tenant_code=tenant_code,
-                user_token=user_token
-            )
-            
-            # Process sales anomalies
-            for anomaly in results.get("sales_anomalies", [])[:3]:
-                notification = Notification(
-                    id=anomaly.id,
-                    user_id=0,
-                    user_role=user_role,
-                    tenant_code=tenant_code,
-                    type=NotificationType.ANOMALY,
-                    title=anomaly.title,
-                    message=anomaly.message,
-                    message_sw=anomaly.message_sw,
-                    action="Investigate anomaly",
-                    action_intent="GET_ANALYTICS",
-                    action_data={"type": anomaly.type, "entity_code": anomaly.entity_code},
-                    priority=Priority.CRITICAL if anomaly.severity == "CRITICAL" else Priority.HIGH,
-                    score=anomaly.score,
-                    potential_value=anomaly.potential_value,
-                    is_read=False,
-                    created_at=anomaly.detected_at,
-                    expires_at=(datetime.now() + timedelta(days=7)).isoformat(),
-                    metadata=anomaly.metadata
-                )
-                notifications.append(notification)
-            
-            # Process stock anomalies
-            for anomaly in results.get("stock_anomalies", [])[:3]:
-                notification = Notification(
-                    id=anomaly.id,
-                    user_id=0,
-                    user_role=user_role,
-                    tenant_code=tenant_code,
-                    type=NotificationType.ANOMALY,
-                    title=anomaly.title,
-                    message=anomaly.message,
-                    message_sw=anomaly.message_sw,
-                    action="Check stock levels",
-                    action_intent="GET_WAREHOUSE_STOCK",
-                    action_data={"item_code": anomaly.entity_code},
-                    priority=Priority.HIGH,
-                    score=anomaly.score,
-                    potential_value=anomaly.potential_value,
-                    is_read=False,
-                    created_at=anomaly.detected_at,
-                    expires_at=(datetime.now() + timedelta(days=3)).isoformat(),
-                    metadata=anomaly.metadata
-                )
-                notifications.append(notification)
-            
-            # Process pricing anomalies
-            for anomaly in results.get("pricing_anomalies", [])[:3]:
-                notification = Notification(
-                    id=anomaly.id,
-                    user_id=0,
-                    user_role=user_role,
-                    tenant_code=tenant_code,
-                    type=NotificationType.ANOMALY,
-                    title=anomaly.title,
-                    message=anomaly.message,
-                    message_sw=anomaly.message_sw,
-                    action="Review pricing",
-                    action_intent="GET_ITEM_PRICE",
-                    action_data={"item_code": anomaly.entity_code},
-                    priority=Priority.MEDIUM,
-                    score=anomaly.score,
-                    potential_value=anomaly.potential_value,
-                    is_read=False,
-                    created_at=anomaly.detected_at,
-                    expires_at=(datetime.now() + timedelta(days=5)).isoformat(),
-                    metadata=anomaly.metadata
-                )
-                notifications.append(notification)
-            
-            logger.info(f"🔔 Detected {len(notifications)} anomaly notifications")
-            
-        except Exception as e:
-            logger.error(f"Error in anomaly detection: {e}", exc_info=True)
-        
-        return notifications
-    
-    # =========================================================
-    # MAIN SCANNER
-    # =========================================================
+        self._notifications_cache = {}  # user_id -> list of notifications
+        self._last_scan = {}
     
     async def scan_for_user(
         self,
@@ -550,191 +84,381 @@ class NotificationService:
         tenant_code: str,
         user_token: str,
         assigned_customers: List[str] = None
-    ) -> List[Notification]:
-        """
-        Run all detectors for a specific user.
-        Returns list of notifications for this user.
-        """
-        all_notifications = []
+    ) -> List[AINotification]:
+        """Scan for notifications for a specific user"""
+        notifications = []
         
         try:
-            # Only managers get inventory and pricing alerts
-            if user_role == "manager":
-                # Low stock alerts
-                low_stock = await self._detect_low_stock(user_token, tenant_code, user_role)
-                all_notifications.extend(low_stock)
-                
-                # Reorder opportunities
-                reorders = await self._detect_reorder_opportunities(user_token, tenant_code, user_role)
-                all_notifications.extend(reorders)
-                
-                # Price drops
-                price_drops = await self._detect_price_drops(user_token, tenant_code, user_role)
-                all_notifications.extend(price_drops)
-                
-                # Seasonal opportunities
-                seasonal = await self._detect_seasonal_opportunities(user_token, tenant_code, user_role)
-                all_notifications.extend(seasonal)
-                
-                # Anomaly detection (NEW)
-                anomalies = await self._detect_anomalies(user_token, tenant_code, user_role)
-                all_notifications.extend(anomalies)
+            # Create API service with user token
+            api_service = create_api_service(user_token=user_token)
             
-            # Both managers and sales reps get churn risk for their customers
-            churn_risk = await self._detect_churn_risk(
-                user_token, tenant_code, user_role, assigned_customers
-            )
-            all_notifications.extend(churn_risk)
+            logger.info(f"🔍 Scanning for notifications for user {user_id} (role: {user_role})")
             
-            # Set user_id for all notifications
-            for notif in all_notifications:
-                notif.user_id = user_id
+            # HIGH PRIORITY - Critical alerts for managers
+            high_priority_alerts = await self._check_critical_alerts(api_service, user_role)
+            notifications.extend(high_priority_alerts)
             
-            # Sort by score (highest first)
-            all_notifications.sort(key=lambda x: x.score, reverse=True)
+            # MEDIUM PRIORITY - Important business alerts
+            medium_priority_alerts = await self._check_important_alerts(api_service, user_role)
+            notifications.extend(medium_priority_alerts)
             
-            # Limit to top 20 per scan
-            all_notifications = all_notifications[:20]
+            # LOW PRIORITY - Informational alerts
+            low_priority_alerts = await self._check_informational_alerts(api_service, user_role)
+            notifications.extend(low_priority_alerts)
             
-            logger.info(f"✅ Scanned {len(all_notifications)} notifications for user {user_id}")
+            # Sort by priority
+            notifications.sort(key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(x.priority, 3))
+            
+            # Store notifications in cache
+            self._notifications_cache[user_id] = notifications
+            self._last_scan[user_id] = datetime.now()
+            
+            high_count = len([n for n in notifications if n.priority == "HIGH"])
+            medium_count = len([n for n in notifications if n.priority == "MEDIUM"])
+            low_count = len([n for n in notifications if n.priority == "LOW"])
+            
+            logger.info(f"✅ Generated {len(notifications)} notifications for user {user_id} (H:{high_count}, M:{medium_count}, L:{low_count})")
             
         except Exception as e:
-            logger.error(f"Error scanning for user {user_id}: {e}", exc_info=True)
+            logger.error(f"Error scanning notifications for user {user_id}: {e}", exc_info=True)
         
-        return all_notifications
+        return notifications
     
-    async def save_notifications(
-        self,
-        user_id: int,
-        notifications: List[Notification]
-    ) -> None:
-        """Save notifications to cache for retrieval."""
-        if not notifications:
-            return
+    async def _check_critical_alerts(self, api_service, user_role: str) -> List[AINotification]:
+        """Check for critical alerts - HIGH priority"""
+        notifications = []
         
-        # Get existing notifications
-        cache_key = f"notifications:user:{user_id}"
-        existing = self.cache.get_simple(cache_key) or []
+        try:
+            # 1. Out of Stock Items (Critical)
+            inventory = api_service.get_inventory_report(limit=200)
+            out_of_stock = []
+            critical_low = []
+            
+            for item in inventory:
+                on_hand = float(item.get("CurrentOnHand", 0))
+                committed = float(item.get("CurrentIsCommited", 0))
+                available = on_hand - committed
+                item_name = item.get("ItemName", "Unknown")
+                
+                if available <= 0:
+                    out_of_stock.append({"name": item_name, "available": available})
+                elif available < 10:
+                    critical_low.append({"name": item_name, "available": available})
+            
+            if out_of_stock:
+                notification = AINotification(
+                    id=f"out_of_stock_{datetime.now().timestamp()}",
+                    title="🔴 CRITICAL: Items Out of Stock",
+                    message=f"{len(out_of_stock)} item(s) are completely out of stock! Immediate action required.",
+                    priority="HIGH",
+                    action="show low stock alerts",
+                    category="alert",
+                    icon="warning",
+                    actionable=True
+                )
+                notifications.append(notification)
+                
+                # Add top 3 out of stock items as details
+                for item in out_of_stock[:3]:
+                    notification = AINotification(
+                        id=f"out_of_stock_{item['name']}_{datetime.now().timestamp()}",
+                        title="📦 Out of Stock",
+                        message=f"{item['name']} has 0 units available. Reorder immediately!",
+                        priority="HIGH",
+                        action=f"check stock for {item['name']}",
+                        category="alert",
+                        icon="warning",
+                        actionable=True
+                    )
+                    notifications.append(notification)
+            
+            elif critical_low:
+                notification = AINotification(
+                    id=f"critical_low_{datetime.now().timestamp()}",
+                    title="🟠 CRITICAL: Very Low Stock",
+                    message=f"{len(critical_low)} item(s) have less than 10 units left! Order urgently.",
+                    priority="HIGH",
+                    action="show low stock alerts",
+                    category="alert",
+                    icon="warning",
+                    actionable=True
+                )
+                notifications.append(notification)
+            
+            # 2. Overdue Deliveries (Critical for managers)
+            deliveries = api_service.get_outstanding_deliveries(limit=50)
+            overdue_count = sum(1 for d in deliveries if d.get("IsOverdue", False))
+            
+            if overdue_count > 0:
+                notification = AINotification(
+                    id=f"overdue_deliveries_{datetime.now().timestamp()}",
+                    title="🔴 URGENT: Overdue Deliveries",
+                    message=f"{overdue_count} delivery(s) are overdue! Customer satisfaction at risk.",
+                    priority="HIGH",
+                    action="outstanding deliveries",
+                    category="delivery",
+                    icon="warning",
+                    actionable=True
+                )
+                notifications.append(notification)
+            
+            # 3. Negative Inventory (Technical issue)
+            negative_inventory = []
+            for item in inventory:
+                on_hand = float(item.get("CurrentOnHand", 0))
+                if on_hand < 0:
+                    negative_inventory.append(item.get("ItemName", "Unknown"))
+            
+            if negative_inventory:
+                notification = AINotification(
+                    id=f"negative_inventory_{datetime.now().timestamp()}",
+                    title="🔴 ERROR: Negative Inventory Detected",
+                    message=f"{len(negative_inventory)} item(s) have negative stock levels! Investigate immediately.",
+                    priority="HIGH",
+                    action="show inventory health",
+                    category="alert",
+                    icon="error_outline",
+                    actionable=True
+                )
+                notifications.append(notification)
+            
+        except Exception as e:
+            logger.error(f"Error checking critical alerts: {e}")
         
-        # Convert new notifications to dict and filter out duplicates
-        new_dicts = [asdict(n) for n in notifications]
+        return notifications
+    
+    async def _check_important_alerts(self, api_service, user_role: str) -> List[AINotification]:
+        """Check for important alerts - MEDIUM priority"""
+        notifications = []
         
-        # Merge with existing (newer ones first)
-        all_notifs = new_dicts + existing
-        # Remove duplicates by id
-        seen = set()
-        unique_notifs = []
-        for n in all_notifs:
-            if n["id"] not in seen:
-                seen.add(n["id"])
-                unique_notifs.append(n)
+        try:
+            # 1. Low Stock Warning (Medium priority)
+            inventory = api_service.get_inventory_report(limit=200)
+            low_stock = []
+            
+            for item in inventory:
+                on_hand = float(item.get("CurrentOnHand", 0))
+                committed = float(item.get("CurrentIsCommited", 0))
+                available = on_hand - committed
+                
+                if 10 <= available < 50:
+                    low_stock.append({
+                        "name": item.get("ItemName", "Unknown"),
+                        "available": available
+                    })
+            
+            if low_stock:
+                notification = AINotification(
+                    id=f"low_stock_warning_{datetime.now().timestamp()}",
+                    title="⚠️ Low Stock Warning",
+                    message=f"{len(low_stock)} item(s) are running low (<50 units). Plan reorders soon.",
+                    priority="MEDIUM",
+                    action="show low stock alerts",
+                    category="inventory",
+                    icon="inventory_2",
+                    actionable=True
+                )
+                notifications.append(notification)
+                
+                # Add top 3 low stock items
+                for item in low_stock[:3]:
+                    notification = AINotification(
+                        id=f"low_stock_{item['name']}_{datetime.now().timestamp()}",
+                        title="📦 Low Stock Alert",
+                        message=f"{item['name']} only has {item['available']:.0f} units left. Consider reordering.",
+                        priority="MEDIUM",
+                        action=f"check stock for {item['name']}",
+                        category="inventory",
+                        icon="inventory_2",
+                        actionable=True
+                    )
+                    notifications.append(notification)
+            
+            # 2. Slow Moving Items (Manager only)
+            if user_role == "manager":
+                slow_items = api_service.get_slow_moving_items(limit=10, days=90)
+                critical_slow = [i for i in slow_items if i.get("Severity") == "critical"]
+                
+                if critical_slow:
+                    notification = AINotification(
+                        id=f"slow_moving_critical_{datetime.now().timestamp()}",
+                        title="🐢 Critical Slow Movers",
+                        message=f"{len(critical_slow)} item(s) have very low turnover. Consider markdowns or bundling.",
+                        priority="MEDIUM",
+                        action="show slow moving items",
+                        category="analytics",
+                        icon="analytics",
+                        actionable=True
+                    )
+                    notifications.append(notification)
+            
+            # 3. Stale Quotations (Manager only)
+            if user_role == "manager":
+                notification = AINotification(
+                    id=f"quotation_followup_{datetime.now().timestamp()}",
+                    title="📄 Pending Quotations",
+                    message="Some quotations need follow-up. Check which ones are still pending.",
+                    priority="MEDIUM",
+                    action="show follow-up quotations",
+                    category="quotations",
+                    icon="receipt_long",
+                    actionable=True
+                )
+                notifications.append(notification)
+            
+            # 4. Outstanding Deliveries Summary (not overdue, but pending)
+            deliveries = api_service.get_outstanding_deliveries(limit=50)
+            pending_deliveries = [d for d in deliveries if not d.get("IsOverdue", False)]
+            
+            if pending_deliveries:
+                total_value = sum(float(d.get("LineTotal", 0)) for d in pending_deliveries)
+                notification = AINotification(
+                    id=f"pending_deliveries_{datetime.now().timestamp()}",
+                    title="🚚 Pending Deliveries",
+                    message=f"{len(pending_deliveries)} delivery(s) pending, total value KES {total_value:,.2f}",
+                    priority="MEDIUM",
+                    action="outstanding deliveries",
+                    category="delivery",
+                    icon="local_shipping",
+                    actionable=True
+                )
+                notifications.append(notification)
+            
+        except Exception as e:
+            logger.error(f"Error checking important alerts: {e}")
         
-        # Keep only last 50 notifications
-        unique_notifs = unique_notifs[:50]
+        return notifications
+    
+    async def _check_informational_alerts(self, api_service, user_role: str) -> List[AINotification]:
+        """Check for informational alerts - LOW priority"""
+        notifications = []
         
-        # Save to cache
-        self.cache.set_simple(cache_key, unique_notifs, ttl=self.NOTIFICATION_CACHE_TTL)
-        logger.info(f"💾 Saved {len(new_dicts)} notifications for user {user_id} (total: {len(unique_notifs)})")
+        try:
+            # 1. Top Selling Items (Good news)
+            top_items = api_service.get_top_selling_items(limit=5, days=30)
+            
+            if top_items:
+                top_item = top_items[0]
+                item_name = top_item.get("ItemName", "Unknown")
+                quantity = top_item.get("quantity", 0)
+                
+                notification = AINotification(
+                    id=f"top_seller_{datetime.now().timestamp()}",
+                    title="🔥 Hot Seller Alert!",
+                    message=f"{item_name} is our best seller with {quantity:.0f} units sold this month! Keep stock充足.",
+                    priority="LOW",
+                    action=f"price of {item_name}",
+                    category="analytics",
+                    icon="trending_up",
+                    actionable=True
+                )
+                notifications.append(notification)
+            
+            # 2. Inventory Health Summary (for managers)
+            if user_role == "manager":
+                health = api_service.get_inventory_report(limit=500)
+                total_items = len(health)
+                total_value = sum(float(i.get("CurrentOnHand", 0)) * 500 for i in health[:100])  # Estimate
+                
+                notification = AINotification(
+                    id=f"inventory_summary_{datetime.now().timestamp()}",
+                    title="📊 Inventory Summary",
+                    message=f"Total {total_items} items in inventory, estimated value KES {total_value:,.2f}",
+                    priority="LOW",
+                    action="analyze inventory health",
+                    category="analytics",
+                    icon="analytics",
+                    actionable=True
+                )
+                notifications.append(notification)
+            
+            # 3. System Health (always good to know)
+            notification = AINotification(
+                id=f"system_health_{datetime.now().timestamp()}",
+                title="✅ System Status",
+                message="All systems operational. AI assistant is ready to help!",
+                priority="LOW",
+                action="",
+                category="general",
+                icon="check_circle",
+                actionable=False
+            )
+            notifications.append(notification)
+            
+        except Exception as e:
+            logger.error(f"Error checking informational alerts: {e}")
+        
+        return notifications
     
     async def get_notifications(
         self,
         user_id: int,
         limit: int = 20,
         unread_only: bool = False
-    ) -> List[Dict]:
-        """Get notifications for a user."""
-        cache_key = f"notifications:user:{user_id}"
-        notifications = self.cache.get_simple(cache_key) or []
+    ) -> List[dict]:
+        """Get notifications for a user"""
+        notifications = self._notifications_cache.get(user_id, [])
         
+        # Filter unread if requested
         if unread_only:
-            notifications = [n for n in notifications if not n.get("is_read", False)]
+            notifications = [n for n in notifications if not n.is_read]
         
-        return notifications[:limit]
-    
-    async def mark_as_read(
-        self,
-        user_id: int,
-        notification_id: str
-    ) -> bool:
-        """Mark a notification as read."""
-        cache_key = f"notifications:user:{user_id}"
-        notifications = self.cache.get_simple(cache_key) or []
+        # Sort by priority (HIGH first) and then by date (newest first)
+        priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        notifications.sort(key=lambda x: (priority_order.get(x.priority, 3), -datetime.fromisoformat(x.created_at).timestamp()))
         
-        found = False
-        for n in notifications:
-            if n.get("id") == notification_id:
-                n["is_read"] = True
-                found = True
-                break
-        
-        if found:
-            self.cache.set_simple(cache_key, notifications, ttl=self.NOTIFICATION_CACHE_TTL)
-            logger.info(f"📖 Marked notification {notification_id} as read for user {user_id}")
-        
-        return found
-    
-    async def mark_all_as_read(self, user_id: int) -> int:
-        """Mark all notifications as read."""
-        cache_key = f"notifications:user:{user_id}"
-        notifications = self.cache.get_simple(cache_key) or []
-        
-        unread_count = 0
-        for n in notifications:
-            if not n.get("is_read", False):
-                n["is_read"] = True
-                unread_count += 1
-        
-        if unread_count > 0:
-            self.cache.set_simple(cache_key, notifications, ttl=self.NOTIFICATION_CACHE_TTL)
-            logger.info(f"📖 Marked {unread_count} notifications as read for user {user_id}")
-        
-        return unread_count
-    
-    async def delete_notification(
-        self,
-        user_id: int,
-        notification_id: str
-    ) -> bool:
-        """Delete a notification."""
-        cache_key = f"notifications:user:{user_id}"
-        notifications = self.cache.get_simple(cache_key) or []
-        
-        original_len = len(notifications)
-        notifications = [n for n in notifications if n.get("id") != notification_id]
-        
-        if len(notifications) != original_len:
-            self.cache.set_simple(cache_key, notifications, ttl=self.NOTIFICATION_CACHE_TTL)
-            logger.info(f"🗑️ Deleted notification {notification_id} for user {user_id}")
-            return True
-        
-        return False
+        return [n.to_dict() for n in notifications[:limit]]
     
     async def get_unread_count(self, user_id: int) -> int:
-        """Get count of unread notifications."""
-        cache_key = f"notifications:user:{user_id}"
-        notifications = self.cache.get_simple(cache_key) or []
-        
-        return len([n for n in notifications if not n.get("is_read", False)])
+        """Get unread notification count for a user"""
+        notifications = self._notifications_cache.get(user_id, [])
+        unread = [n for n in notifications if not n.is_read]
+        return len(unread)
+    
+    async def mark_as_read(self, user_id: int, notification_id: str) -> bool:
+        """Mark a notification as read"""
+        notifications = self._notifications_cache.get(user_id, [])
+        for n in notifications:
+            if n.id == notification_id:
+                n.is_read = True
+                logger.info(f"Marked notification {notification_id} as read for user {user_id}")
+                return True
+        return False
+    
+    async def mark_all_as_read(self, user_id: int) -> int:
+        """Mark all notifications as read"""
+        notifications = self._notifications_cache.get(user_id, [])
+        count = 0
+        for n in notifications:
+            if not n.is_read:
+                n.is_read = True
+                count += 1
+        logger.info(f"Marked {count} notifications as read for user {user_id}")
+        return count
+    
+    async def delete_notification(self, user_id: int, notification_id: str) -> bool:
+        """Delete a notification"""
+        notifications = self._notifications_cache.get(user_id, [])
+        for i, n in enumerate(notifications):
+            if n.id == notification_id:
+                del notifications[i]
+                logger.info(f"Deleted notification {notification_id} for user {user_id}")
+                return True
+        return False
+    
+    async def save_notifications(self, user_id: int, notifications: List[AINotification]):
+        """Save notifications for a user"""
+        self._notifications_cache[user_id] = notifications
+        logger.info(f"Saved {len(notifications)} notifications for user {user_id}")
 
 
-
+# Singleton instance
 _notification_service = None
 
 
-def get_notification_service(user_token: str = None) -> NotificationService:
-    """
-    Get or create NotificationService singleton.
-    
-    Args:
-        user_token: Optional user token for authenticated API calls
-    """
+def get_notification_service() -> NotificationService:
+    """Get notification service singleton"""
     global _notification_service
     if _notification_service is None:
         _notification_service = NotificationService()
-    
-    # Update token if provided
-    if user_token:
-        _notification_service._api_service = create_api_service(user_token)
-        _notification_service._pricing_service = create_pricing_service(user_token)
-    
     return _notification_service

@@ -10,7 +10,7 @@ from typing import Optional, List
 import logging
 
 from app.core.tenant_context import TenantContext, set_current_tenant, clear_current_tenant
-from app.services.leysco_api_service import LeyscoAPIService
+from app.services.leysco_api.client import LeyscoAPIService
 
 logger = logging.getLogger(__name__)
 

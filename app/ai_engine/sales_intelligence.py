@@ -15,7 +15,7 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 import asyncio
 
-from app.services.leysco_api_service import LeyscoAPIService
+from app.services.leysco_api.client import LeyscoAPIService
 from app.services.pricing_service import PricingService
 
 logger = logging.getLogger(__name__)

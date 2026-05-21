@@ -3,7 +3,7 @@ warehouse_service.py
 ====================
 Warehouse intelligence layer for Leysco ERP - Optimized with caching and async support
 
-FIXED: Now accepts user_token parameter and passes to LeyscoAPIService
+FIXED: Now accepts user_token and company_code parameters and passes to LeyscoAPIService
 
 Features:
 1. Stock level summaries per warehouse
@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from functools import lru_cache, wraps
 from datetime import datetime, timedelta
 
-from app.services.leysco_api_service import LeyscoAPIService, create_api_service
+from app.services.leysco_api.client import LeyscoAPIService, create_api_service
 from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
@@ -52,9 +52,10 @@ def cache_result(ttl_seconds: int = WAREHOUSE_CACHE_TTL, key_prefix: str = ""):
             
             # Include user token in cache key for isolation
             user_suffix = self.user_token[:8] if self.user_token else "no_token"
+            company_suffix = self.company_code if self.company_code else "no_company"
             
             # Generate cache key
-            cache_str = f"{key_prefix or func.__name__}:{user_suffix}:{str(args)}:{str(sorted(kwargs.items()))}"
+            cache_str = f"{key_prefix or func.__name__}:{user_suffix}:{company_suffix}:{str(args)}:{str(sorted(kwargs.items()))}"
             cache_key = hashlib.md5(cache_str.encode()).hexdigest()
             
             # Check cache
@@ -78,25 +79,28 @@ def cache_result(ttl_seconds: int = WAREHOUSE_CACHE_TTL, key_prefix: str = ""):
 class WarehouseService:
     """
     Service for warehouse-related operations.
-    FIXED: Now accepts user_token and creates properly authenticated API service.
+    FIXED: Now accepts user_token and company_code for multi-tenant support.
     """
     
-    def __init__(self, user_token: str = None, api_service: LeyscoAPIService = None):
+    def __init__(self, user_token: str = None, company_code: str = None, api_service: LeyscoAPIService = None):
         """
-        Initialize WarehouseService with user token.
+        Initialize WarehouseService with user token and company code.
         
         Args:
             user_token: The authenticated user's Bearer token
+            company_code: Company code for multi-tenant URL resolution
             api_service: Optional pre-configured API service instance
         """
         self.user_token = user_token
+        self.company_code = company_code
         
         if api_service:
             self.api = api_service
             logger.debug("WarehouseService initialized with existing API service")
         elif user_token:
-            self.api = create_api_service(user_token)
-            logger.info("✅ WarehouseService initialized WITH user token")
+            # Pass company_code to API service for proper URL resolution
+            self.api = create_api_service(user_token=user_token, company_code=company_code)
+            logger.info(f"✅ WarehouseService initialized WITH user token and company_code={company_code}")
         else:
             self.api = LeyscoAPIService()
             logger.warning("⚠️ WarehouseService initialized WITHOUT user token - data access will fail")
@@ -122,6 +126,12 @@ class WarehouseService:
         self.user_token = token
         self.api.set_user_token(token)
         logger.debug("WarehouseService token updated")
+    
+    def set_company_code(self, company_code: str):
+        """Update company code for this service."""
+        self.company_code = company_code
+        self.api.set_company_code(company_code)
+        logger.debug(f"WarehouseService company code updated to: {company_code}")
     
     def _ensure_auth(self) -> bool:
         """Check if we have valid authentication."""
@@ -321,7 +331,8 @@ class WarehouseService:
         # Check cache for this warehouse's items
         cache = get_cache_service()
         user_suffix = self.user_token[:8] if self.user_token else "no_token"
-        cache_key = f"warehouse_items:{user_suffix}:{whscode}:{search}:{limit}:{include_out_of_stock}"
+        company_suffix = self.company_code if self.company_code else "no_company"
+        cache_key = f"warehouse_items:{user_suffix}:{company_suffix}:{whscode}:{search}:{limit}:{include_out_of_stock}"
         cached = cache.get(cache_key, {}, "")
         if cached is not None:
             self._record_cache_hit()
@@ -497,7 +508,8 @@ class WarehouseService:
         if not region and active_only:
             cache = get_cache_service()
             user_suffix = self.user_token[:8] if self.user_token else "no_token"
-            cache_key = f"warehouse_search:{user_suffix}:{query}"
+            company_suffix = self.company_code if self.company_code else "no_company"
+            cache_key = f"warehouse_search:{user_suffix}:{company_suffix}:{query}"
             cached = cache.get(cache_key, {}, "")
             if cached is not None:
                 self._record_cache_hit()
@@ -530,7 +542,8 @@ class WarehouseService:
         if not region and active_only:
             cache = get_cache_service()
             user_suffix = self.user_token[:8] if self.user_token else "no_token"
-            cache.set(f"warehouse_search:{user_suffix}:{query}", {}, "", {"data": results})
+            company_suffix = self.company_code if self.company_code else "no_company"
+            cache.set(f"warehouse_search:{user_suffix}:{company_suffix}:{query}", {}, "", {"data": results})
         
         return results
     
@@ -778,12 +791,13 @@ class WarehouseService:
 # Factory function
 # =========================================================
 
-def create_warehouse_service(user_token: str = None) -> WarehouseService:
+def create_warehouse_service(user_token: str = None, company_code: str = None) -> WarehouseService:
     """
-    Create a new WarehouseService instance with the user's token.
+    Create a new WarehouseService instance with the user's token and company code.
     
     Args:
         user_token: The authenticated user's Bearer token
+        company_code: Company code for multi-tenant URL resolution
     
     Returns:
         Configured WarehouseService instance
@@ -791,6 +805,6 @@ def create_warehouse_service(user_token: str = None) -> WarehouseService:
     if not user_token:
         logger.warning("⚠️ create_warehouse_service called WITHOUT user token - data access will fail")
     else:
-        logger.info("✅ create_warehouse_service called WITH user token")
+        logger.info(f"✅ create_warehouse_service called WITH user token and company_code={company_code}")
     
-    return WarehouseService(user_token=user_token)
+    return WarehouseService(user_token=user_token, company_code=company_code)
