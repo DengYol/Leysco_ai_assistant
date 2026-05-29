@@ -1,31 +1,38 @@
-"""Proactive notification service for AI assistant - Manager focused"""
+"""Proactive notification service with database persistence - Phase 1 Fixed"""
 
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import asyncio
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, desc
 
-from app.services.cache_service import get_cache_service
 from app.services.leysco_api import create_api_service
+from app.models import notification_models
+from app.models.notification_models import (
+    Notification, NotificationEscalation, NotificationAnalytics,
+    UserNotificationPreference
+)
 
 logger = logging.getLogger(__name__)
 
 
 class AINotification:
-    """Notification model for proactive alerts"""
+    """In-memory notification object (for backward compatibility with existing code)"""
     
     def __init__(self, id: str, title: str, message: str, priority: str, 
                  action: str = "", category: str = "general", icon: str = "notifications",
-                 actionable: bool = True):
+                 actionable: bool = True, metadata: dict = None):
         self.id = id
         self.title = title
         self.message = message
-        self.priority = priority  # HIGH, MEDIUM, LOW
+        self.priority = priority
         self.action = action
         self.category = category
         self.icon = icon
         self.actionable = actionable
-        self.created_at = datetime.now().isoformat()
+        self.metadata = metadata or {}
+        self.created_at = datetime.utcnow().isoformat()
         self.is_read = False
     
     def to_dict(self) -> dict:
@@ -39,43 +46,18 @@ class AINotification:
             "icon": self.icon,
             "actionable": self.actionable,
             "created_at": self.created_at,
-            "is_read": self.is_read
+            "is_read": self.is_read,
+            "metadata": self.metadata,
         }
-    
-    def get_icon(self) -> str:
-        icons = {
-            "warning": "warning",
-            "info": "info",
-            "notifications": "notifications",
-            "inventory": "inventory_2",
-            "delivery": "local_shipping",
-            "analytics": "analytics",
-            "pricing": "attach_money",
-            "quotations": "receipt_long",
-            "customer": "people",
-            "alert": "error_outline"
-        }
-        return icons.get(self.category, "notifications")
-    
-    def get_priority_color(self) -> int:
-        colors = {
-            "HIGH": 0xFFEF4444,  # Red - Critical
-            "MEDIUM": 0xFFF59E0B,  # Orange - Warning
-            "LOW": 0xFF3B82F6  # Blue - Info
-        }
-        return colors.get(self.priority, 0xFF6B7280)
-    
-    def get_localized_message(self, language: str = "en") -> str:
-        return self.message
 
 
 class NotificationService:
-    """Service for generating proactive notifications - Manager focused"""
+    """Service for generating and managing proactive notifications with database persistence"""
     
     def __init__(self):
-        self.cache = get_cache_service()
-        self._notifications_cache = {}  # user_id -> list of notifications
+        self.cache = {}
         self._last_scan = {}
+        self.ESCALATION_THRESHOLD_HOURS = 2
     
     async def scan_for_user(
         self,
@@ -83,53 +65,67 @@ class NotificationService:
         user_role: str,
         tenant_code: str,
         user_token: str,
-        assigned_customers: List[str] = None
+        assigned_customers: List[str] = None,
+        assigned_warehouses: List[str] = None
     ) -> List[AINotification]:
-        """Scan for notifications for a specific user"""
+        """Scan for notifications for a specific user (role-based filtering)"""
         notifications = []
         
         try:
-            # Create API service with user token
             api_service = create_api_service(user_token=user_token)
             
             logger.info(f"🔍 Scanning for notifications for user {user_id} (role: {user_role})")
             
-            # HIGH PRIORITY - Critical alerts for managers
-            high_priority_alerts = await self._check_critical_alerts(api_service, user_role)
+            if user_role == "sales_rep" and assigned_customers:
+                logger.debug(f"Filtering for sales rep: customers={assigned_customers}")
+            elif user_role == "warehouse_manager" and assigned_warehouses:
+                logger.debug(f"Filtering for warehouse manager: warehouses={assigned_warehouses}")
+            
+            high_priority_alerts = await self._check_critical_alerts(
+                api_service, user_role, assigned_customers, assigned_warehouses
+            )
             notifications.extend(high_priority_alerts)
             
-            # MEDIUM PRIORITY - Important business alerts
-            medium_priority_alerts = await self._check_important_alerts(api_service, user_role)
+            medium_priority_alerts = await self._check_important_alerts(
+                api_service, user_role, assigned_customers, assigned_warehouses
+            )
             notifications.extend(medium_priority_alerts)
             
-            # LOW PRIORITY - Informational alerts
-            low_priority_alerts = await self._check_informational_alerts(api_service, user_role)
+            low_priority_alerts = await self._check_informational_alerts(
+                api_service, user_role, assigned_customers, assigned_warehouses
+            )
             notifications.extend(low_priority_alerts)
             
-            # Sort by priority
-            notifications.sort(key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(x.priority, 3))
+            notifications.sort(
+                key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(x.priority, 3)
+            )
             
-            # Store notifications in cache
-            self._notifications_cache[user_id] = notifications
-            self._last_scan[user_id] = datetime.now()
+            self.cache[user_id] = notifications
+            self._last_scan[user_id] = datetime.utcnow()
             
             high_count = len([n for n in notifications if n.priority == "HIGH"])
             medium_count = len([n for n in notifications if n.priority == "MEDIUM"])
             low_count = len([n for n in notifications if n.priority == "LOW"])
             
-            logger.info(f"✅ Generated {len(notifications)} notifications for user {user_id} (H:{high_count}, M:{medium_count}, L:{low_count})")
+            logger.info(
+                f"✅ Generated {len(notifications)} notifications for user {user_id} "
+                f"(H:{high_count}, M:{medium_count}, L:{low_count})"
+            )
             
         except Exception as e:
             logger.error(f"Error scanning notifications for user {user_id}: {e}", exc_info=True)
         
         return notifications
     
-    async def _check_critical_alerts(self, api_service, user_role: str) -> List[AINotification]:
+    async def _check_critical_alerts(
+        self, api_service, user_role: str,
+        assigned_customers: List[str] = None,
+        assigned_warehouses: List[str] = None
+    ) -> List[AINotification]:
         """Check for critical alerts - HIGH priority"""
         notifications = []
         
         try:
-            # 1. Out of Stock Items (Critical)
             inventory = api_service.get_inventory_report(limit=200)
             out_of_stock = []
             critical_low = []
@@ -147,78 +143,46 @@ class NotificationService:
             
             if out_of_stock:
                 notification = AINotification(
-                    id=f"out_of_stock_{datetime.now().timestamp()}",
+                    id=f"out_of_stock_{datetime.utcnow().timestamp()}",
                     title="🔴 CRITICAL: Items Out of Stock",
-                    message=f"{len(out_of_stock)} item(s) are completely out of stock! Immediate action required.",
+                    message=f"{len(out_of_stock)} item(s) are completely out of stock!",
                     priority="HIGH",
                     action="show low stock alerts",
                     category="alert",
                     icon="warning",
-                    actionable=True
+                    actionable=True,
+                    metadata={"count": len(out_of_stock)}
                 )
                 notifications.append(notification)
-                
-                # Add top 3 out of stock items as details
-                for item in out_of_stock[:3]:
-                    notification = AINotification(
-                        id=f"out_of_stock_{item['name']}_{datetime.now().timestamp()}",
-                        title="📦 Out of Stock",
-                        message=f"{item['name']} has 0 units available. Reorder immediately!",
-                        priority="HIGH",
-                        action=f"check stock for {item['name']}",
-                        category="alert",
-                        icon="warning",
-                        actionable=True
-                    )
-                    notifications.append(notification)
             
-            elif critical_low:
+            if critical_low:
                 notification = AINotification(
-                    id=f"critical_low_{datetime.now().timestamp()}",
+                    id=f"critical_low_{datetime.utcnow().timestamp()}",
                     title="🟠 CRITICAL: Very Low Stock",
-                    message=f"{len(critical_low)} item(s) have less than 10 units left! Order urgently.",
+                    message=f"{len(critical_low)} item(s) have less than 10 units!",
                     priority="HIGH",
                     action="show low stock alerts",
                     category="alert",
                     icon="warning",
-                    actionable=True
+                    actionable=True,
+                    metadata={"count": len(critical_low)}
                 )
                 notifications.append(notification)
             
-            # 2. Overdue Deliveries (Critical for managers)
             deliveries = api_service.get_outstanding_deliveries(limit=50)
             overdue_count = sum(1 for d in deliveries if d.get("IsOverdue", False))
             
             if overdue_count > 0:
                 notification = AINotification(
-                    id=f"overdue_deliveries_{datetime.now().timestamp()}",
+                    id=f"overdue_deliveries_{datetime.utcnow().timestamp()}",
                     title="🔴 URGENT: Overdue Deliveries",
-                    message=f"{overdue_count} delivery(s) are overdue! Customer satisfaction at risk.",
+                    message=f"{overdue_count} delivery(s) are overdue!",
                     priority="HIGH",
                     action="outstanding deliveries",
                     category="delivery",
                     icon="warning",
-                    actionable=True
-                )
-                notifications.append(notification)
-            
-            # 3. Negative Inventory (Technical issue)
-            negative_inventory = []
-            for item in inventory:
-                on_hand = float(item.get("CurrentOnHand", 0))
-                if on_hand < 0:
-                    negative_inventory.append(item.get("ItemName", "Unknown"))
-            
-            if negative_inventory:
-                notification = AINotification(
-                    id=f"negative_inventory_{datetime.now().timestamp()}",
-                    title="🔴 ERROR: Negative Inventory Detected",
-                    message=f"{len(negative_inventory)} item(s) have negative stock levels! Investigate immediately.",
-                    priority="HIGH",
-                    action="show inventory health",
-                    category="alert",
-                    icon="error_outline",
-                    actionable=True
+                    actionable=True,
+                    metadata={"count": overdue_count}
                 )
                 notifications.append(notification)
             
@@ -227,12 +191,15 @@ class NotificationService:
         
         return notifications
     
-    async def _check_important_alerts(self, api_service, user_role: str) -> List[AINotification]:
+    async def _check_important_alerts(
+        self, api_service, user_role: str,
+        assigned_customers: List[str] = None,
+        assigned_warehouses: List[str] = None
+    ) -> List[AINotification]:
         """Check for important alerts - MEDIUM priority"""
         notifications = []
         
         try:
-            # 1. Low Stock Warning (Medium priority)
             inventory = api_service.get_inventory_report(limit=200)
             low_stock = []
             
@@ -249,78 +216,33 @@ class NotificationService:
             
             if low_stock:
                 notification = AINotification(
-                    id=f"low_stock_warning_{datetime.now().timestamp()}",
+                    id=f"low_stock_warning_{datetime.utcnow().timestamp()}",
                     title="⚠️ Low Stock Warning",
-                    message=f"{len(low_stock)} item(s) are running low (<50 units). Plan reorders soon.",
+                    message=f"{len(low_stock)} item(s) are running low (<50 units).",
                     priority="MEDIUM",
                     action="show low stock alerts",
                     category="inventory",
                     icon="inventory_2",
-                    actionable=True
-                )
-                notifications.append(notification)
-                
-                # Add top 3 low stock items
-                for item in low_stock[:3]:
-                    notification = AINotification(
-                        id=f"low_stock_{item['name']}_{datetime.now().timestamp()}",
-                        title="📦 Low Stock Alert",
-                        message=f"{item['name']} only has {item['available']:.0f} units left. Consider reordering.",
-                        priority="MEDIUM",
-                        action=f"check stock for {item['name']}",
-                        category="inventory",
-                        icon="inventory_2",
-                        actionable=True
-                    )
-                    notifications.append(notification)
-            
-            # 2. Slow Moving Items (Manager only)
-            if user_role == "manager":
-                slow_items = api_service.get_slow_moving_items(limit=10, days=90)
-                critical_slow = [i for i in slow_items if i.get("Severity") == "critical"]
-                
-                if critical_slow:
-                    notification = AINotification(
-                        id=f"slow_moving_critical_{datetime.now().timestamp()}",
-                        title="🐢 Critical Slow Movers",
-                        message=f"{len(critical_slow)} item(s) have very low turnover. Consider markdowns or bundling.",
-                        priority="MEDIUM",
-                        action="show slow moving items",
-                        category="analytics",
-                        icon="analytics",
-                        actionable=True
-                    )
-                    notifications.append(notification)
-            
-            # 3. Stale Quotations (Manager only)
-            if user_role == "manager":
-                notification = AINotification(
-                    id=f"quotation_followup_{datetime.now().timestamp()}",
-                    title="📄 Pending Quotations",
-                    message="Some quotations need follow-up. Check which ones are still pending.",
-                    priority="MEDIUM",
-                    action="show follow-up quotations",
-                    category="quotations",
-                    icon="receipt_long",
-                    actionable=True
+                    actionable=True,
+                    metadata={"count": len(low_stock)}
                 )
                 notifications.append(notification)
             
-            # 4. Outstanding Deliveries Summary (not overdue, but pending)
             deliveries = api_service.get_outstanding_deliveries(limit=50)
             pending_deliveries = [d for d in deliveries if not d.get("IsOverdue", False)]
             
             if pending_deliveries:
                 total_value = sum(float(d.get("LineTotal", 0)) for d in pending_deliveries)
                 notification = AINotification(
-                    id=f"pending_deliveries_{datetime.now().timestamp()}",
+                    id=f"pending_deliveries_{datetime.utcnow().timestamp()}",
                     title="🚚 Pending Deliveries",
-                    message=f"{len(pending_deliveries)} delivery(s) pending, total value KES {total_value:,.2f}",
+                    message=f"{len(pending_deliveries)} delivery(s) pending.",
                     priority="MEDIUM",
                     action="outstanding deliveries",
                     category="delivery",
                     icon="local_shipping",
-                    actionable=True
+                    actionable=True,
+                    metadata={"count": len(pending_deliveries), "total_value": total_value}
                 )
                 notifications.append(notification)
             
@@ -329,12 +251,15 @@ class NotificationService:
         
         return notifications
     
-    async def _check_informational_alerts(self, api_service, user_role: str) -> List[AINotification]:
+    async def _check_informational_alerts(
+        self, api_service, user_role: str,
+        assigned_customers: List[str] = None,
+        assigned_warehouses: List[str] = None
+    ) -> List[AINotification]:
         """Check for informational alerts - LOW priority"""
         notifications = []
         
         try:
-            # 1. Top Selling Items (Good news)
             top_items = api_service.get_top_selling_items(limit=5, days=30)
             
             if top_items:
@@ -343,40 +268,22 @@ class NotificationService:
                 quantity = top_item.get("quantity", 0)
                 
                 notification = AINotification(
-                    id=f"top_seller_{datetime.now().timestamp()}",
+                    id=f"top_seller_{datetime.utcnow().timestamp()}",
                     title="🔥 Hot Seller Alert!",
-                    message=f"{item_name} is our best seller with {quantity:.0f} units sold this month! Keep stock充足.",
+                    message=f"{item_name} is your best seller!",
                     priority="LOW",
                     action=f"price of {item_name}",
                     category="analytics",
                     icon="trending_up",
-                    actionable=True
+                    actionable=True,
+                    metadata={"item_name": item_name, "quantity": quantity}
                 )
                 notifications.append(notification)
             
-            # 2. Inventory Health Summary (for managers)
-            if user_role == "manager":
-                health = api_service.get_inventory_report(limit=500)
-                total_items = len(health)
-                total_value = sum(float(i.get("CurrentOnHand", 0)) * 500 for i in health[:100])  # Estimate
-                
-                notification = AINotification(
-                    id=f"inventory_summary_{datetime.now().timestamp()}",
-                    title="📊 Inventory Summary",
-                    message=f"Total {total_items} items in inventory, estimated value KES {total_value:,.2f}",
-                    priority="LOW",
-                    action="analyze inventory health",
-                    category="analytics",
-                    icon="analytics",
-                    actionable=True
-                )
-                notifications.append(notification)
-            
-            # 3. System Health (always good to know)
             notification = AINotification(
-                id=f"system_health_{datetime.now().timestamp()}",
+                id=f"system_health_{datetime.utcnow().timestamp()}",
                 title="✅ System Status",
-                message="All systems operational. AI assistant is ready to help!",
+                message="All systems operational. AI assistant is ready!",
                 priority="LOW",
                 action="",
                 category="general",
@@ -390,74 +297,326 @@ class NotificationService:
         
         return notifications
     
+    # ========================================================================
+    # DATABASE PERSISTENCE (Phase 1)
+    # ========================================================================
+    
+    async def save_notifications(
+        self, user_id: int, notifications: List[AINotification]
+    ) -> int:
+        """Save notifications to database"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                logger.warning("Database not initialized - cannot save notifications")
+                return 0
+            
+            session: Session = notification_models.db_manager.get_session()
+            saved_count = 0
+            
+            for notification in notifications:
+                existing = session.query(Notification).filter(
+                    Notification.id == notification.id
+                ).first()
+                
+                if existing:
+                    logger.debug(f"Notification {notification.id} already exists, skipping")
+                    continue
+                
+                db_notification = Notification(
+                    id=notification.id,
+                    user_id=user_id,
+                    title=notification.title,
+                    message=notification.message,
+                    priority=notification.priority,
+                    category=notification.category,
+                    icon=notification.icon,
+                    action=notification.action,
+                    actionable=notification.actionable,
+                    metadata_json=notification.metadata,
+                    is_read=False,
+                    created_at=datetime.utcnow(),
+                    expires_at=datetime.utcnow() + timedelta(days=7),
+                )
+                
+                session.add(db_notification)
+                saved_count += 1
+            
+            session.commit()
+            logger.info(f"✅ Saved {saved_count} notifications for user {user_id}")
+            return saved_count
+            
+        except Exception as e:
+            logger.error(f"Error saving notifications: {e}")
+            if session:
+                session.rollback()
+            return 0
+        finally:
+            if session:
+                session.close()
+    
     async def get_notifications(
         self,
         user_id: int,
         limit: int = 20,
         unread_only: bool = False
     ) -> List[dict]:
-        """Get notifications for a user"""
-        notifications = self._notifications_cache.get(user_id, [])
-        
-        # Filter unread if requested
-        if unread_only:
-            notifications = [n for n in notifications if not n.is_read]
-        
-        # Sort by priority (HIGH first) and then by date (newest first)
-        priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-        notifications.sort(key=lambda x: (priority_order.get(x.priority, 3), -datetime.fromisoformat(x.created_at).timestamp()))
-        
-        return [n.to_dict() for n in notifications[:limit]]
+        """Retrieve notifications from database"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                logger.warning("Database not initialized")
+                return []
+            
+            session: Session = notification_models.db_manager.get_session()
+            
+            query = session.query(Notification).filter(
+                Notification.user_id == user_id,
+                Notification.expires_at > datetime.utcnow()
+            )
+            
+            if unread_only:
+                query = query.filter(Notification.is_read == False)
+            
+            priority_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            notifications = query.order_by(
+                desc(Notification.created_at)
+            ).limit(limit).all()
+            
+            notifications.sort(
+                key=lambda x: (priority_order.get(x.priority, 999), -x.created_at.timestamp())
+            )
+            
+            result = [n.to_dict() for n in notifications]
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error retrieving notifications: {e}")
+            return []
+        finally:
+            if session:
+                session.close()
     
     async def get_unread_count(self, user_id: int) -> int:
-        """Get unread notification count for a user"""
-        notifications = self._notifications_cache.get(user_id, [])
-        unread = [n for n in notifications if not n.is_read]
-        return len(unread)
+        """Get unread count"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                return 0
+            
+            session: Session = notification_models.db_manager.get_session()
+            
+            count = session.query(Notification).filter(
+                Notification.user_id == user_id,
+                Notification.is_read == False,
+                Notification.expires_at > datetime.utcnow()
+            ).count()
+            
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error getting unread count: {e}")
+            return 0
+        finally:
+            if session:
+                session.close()
     
     async def mark_as_read(self, user_id: int, notification_id: str) -> bool:
-        """Mark a notification as read"""
-        notifications = self._notifications_cache.get(user_id, [])
-        for n in notifications:
-            if n.id == notification_id:
-                n.is_read = True
-                logger.info(f"Marked notification {notification_id} as read for user {user_id}")
+        """Mark as read"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                return False
+            
+            session: Session = notification_models.db_manager.get_session()
+            
+            notification = session.query(Notification).filter(
+                Notification.id == notification_id,
+                Notification.user_id == user_id
+            ).first()
+            
+            if notification:
+                notification.mark_as_read()
+                session.commit()
+                logger.info(f"✅ Marked notification {notification_id} as read")
                 return True
-        return False
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error marking as read: {e}")
+            if session:
+                session.rollback()
+            return False
+        finally:
+            if session:
+                session.close()
     
     async def mark_all_as_read(self, user_id: int) -> int:
-        """Mark all notifications as read"""
-        notifications = self._notifications_cache.get(user_id, [])
-        count = 0
-        for n in notifications:
-            if not n.is_read:
-                n.is_read = True
-                count += 1
-        logger.info(f"Marked {count} notifications as read for user {user_id}")
-        return count
+        """Mark all as read"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                return 0
+            
+            session: Session = notification_models.db_manager.get_session()
+            
+            count = session.query(Notification).filter(
+                Notification.user_id == user_id,
+                Notification.is_read == False
+            ).update(
+                {
+                    Notification.is_read: True,
+                    Notification.read_at: datetime.utcnow()
+                }
+            )
+            
+            session.commit()
+            logger.info(f"✅ Marked {count} notifications as read")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error marking all as read: {e}")
+            if session:
+                session.rollback()
+            return 0
+        finally:
+            if session:
+                session.close()
     
     async def delete_notification(self, user_id: int, notification_id: str) -> bool:
-        """Delete a notification"""
-        notifications = self._notifications_cache.get(user_id, [])
-        for i, n in enumerate(notifications):
-            if n.id == notification_id:
-                del notifications[i]
-                logger.info(f"Deleted notification {notification_id} for user {user_id}")
+        """Delete notification"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                return False
+            
+            session: Session = notification_models.db_manager.get_session()
+            
+            notification = session.query(Notification).filter(
+                Notification.id == notification_id,
+                Notification.user_id == user_id
+            ).first()
+            
+            if notification:
+                session.delete(notification)
+                session.commit()
+                logger.info(f"✅ Deleted notification {notification_id}")
                 return True
-        return False
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error deleting: {e}")
+            if session:
+                session.rollback()
+            return False
+        finally:
+            if session:
+                session.close()
     
-    async def save_notifications(self, user_id: int, notifications: List[AINotification]):
-        """Save notifications for a user"""
-        self._notifications_cache[user_id] = notifications
-        logger.info(f"Saved {len(notifications)} notifications for user {user_id}")
+    async def cleanup_expired_notifications(self) -> int:
+        """Delete expired notifications"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                return 0
+            
+            session: Session = notification_models.db_manager.get_session()
+            
+            count = session.query(Notification).filter(
+                Notification.expires_at < datetime.utcnow()
+            ).delete()
+            
+            session.commit()
+            logger.info(f"🧹 Cleaned up {count} expired notifications")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error cleanup: {e}")
+            if session:
+                session.rollback()
+            return 0
+        finally:
+            if session:
+                session.close()
+    
+    async def check_escalation_needed(self, manager_user_id: int) -> int:
+        """Check for escalations needed"""
+        session = None
+        try:
+            if notification_models.db_manager is None:
+                return 0
+            
+            session: Session = notification_models.db_manager.get_session()
+            
+            cutoff_time = datetime.utcnow() - timedelta(hours=self.ESCALATION_THRESHOLD_HOURS)
+            
+            unescalated = session.query(Notification).filter(
+                Notification.priority == 'CRITICAL',
+                Notification.is_read == False,
+                Notification.created_at < cutoff_time,
+                Notification.is_escalated == False
+            ).all()
+            
+            escalated_count = 0
+            
+            for notification in unescalated:
+                notification.mark_as_escalated(manager_user_id)
+                
+                escalation = NotificationEscalation(
+                    id=f"esc_{notification.id}",
+                    notification_id=notification.id,
+                    assigned_to_user_id=notification.user_id,
+                    escalated_to_user_id=manager_user_id,
+                    status='escalated',
+                    escalated_at=datetime.utcnow()
+                )
+                session.add(escalation)
+                
+                manager_notification = Notification(
+                    id=f"escalation_{notification.id}",
+                    user_id=manager_user_id,
+                    title=f"🔴 ESCALATED: {notification.title}",
+                    message=f"Critical alert: {notification.message}",
+                    priority="CRITICAL",
+                    category="escalation",
+                    icon="priority_high",
+                    action=notification.action,
+                    metadata_json={
+                        "original_notification_id": notification.id,
+                        "original_user_id": notification.user_id,
+                    },
+                    is_read=False,
+                    created_at=datetime.utcnow(),
+                    expires_at=datetime.utcnow() + timedelta(days=7),
+                )
+                session.add(manager_notification)
+                
+                escalated_count += 1
+            
+            session.commit()
+            
+            if escalated_count > 0:
+                logger.warning(f"⚠️ Escalated {escalated_count} notifications")
+            
+            return escalated_count
+            
+        except Exception as e:
+            logger.error(f"Error checking escalation: {e}")
+            if session:
+                session.rollback()
+            return 0
+        finally:
+            if session:
+                session.close()
 
 
-# Singleton instance
 _notification_service = None
 
 
 def get_notification_service() -> NotificationService:
-    """Get notification service singleton"""
+    """Get service singleton"""
     global _notification_service
     if _notification_service is None:
         _notification_service = NotificationService()

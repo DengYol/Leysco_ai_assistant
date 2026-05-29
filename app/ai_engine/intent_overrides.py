@@ -9,6 +9,7 @@ that are more reliable than the small LLM's intent predictions.
 
 import logging
 from typing import Dict
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,43 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
         return intent
     
     # =========================================================
+    # 🚨 CRITICAL FIX: Check for price queries FIRST
+    # =========================================================
+    # This prevents seasonal override from triggering on "Price of SPRING KICK STARTER"
+    # because "spring" would otherwise be detected as a seasonal keyword.
+    
+    # Check if this is a price query
+    price_keywords = ["price", "cost", "how much", "charge", "rate", "bei", "gharama", "thamani"]
+    is_price_query = any(keyword in original_query for keyword in price_keywords)
+    
+    # Also check if intent is already price-related
+    is_price_intent = intent in ["GET_ITEM_PRICE", "GET_CUSTOMER_PRICE", "GET_COMPETITOR_PRICE"]
+    
+    if is_price_query or is_price_intent:
+        logger.debug(f"💰 Price query detected - skipping all intent overrides")
+        return intent
+    
+    # =========================================================
+    # ⚠️ FIX: Check for same value in item_name and customer_name
+    # =========================================================
+    # This indicates an extraction error, not a real customer price query
+    # Example: "price of Punched Washer" extracts both item_name and customer_name
+    if item_name and customer_name and item_name.lower() == customer_name.lower():
+        logger.info(f"⚠️ CRITICAL FIX: Same value in item_name and customer_name: '{item_name}'")
+        
+        # Check if this is a price query (already checked above, but double-check)
+        if is_price_query:
+            # This is a price query - clear customer_name, keep item_name, fix intent
+            logger.info(f"🔧 FIX: Price query detected - clearing customer_name, keeping item_name, setting GET_ITEM_PRICE")
+            entities["customer_name"] = None
+            customer_name = None
+            return "GET_ITEM_PRICE"
+        else:
+            # Not a price query - might be a warehouse or other query
+            # Log warning and let other rules handle it
+            logger.warning(f"⚠️ Same value in item_name and customer_name but not a price query: '{item_name}' | Query: '{original_query}'")
+    
+    # =========================================================
     # 🔍 CHECK FOR WAREHOUSE QUERIES FIRST (high priority)
     # =========================================================
     # This must come BEFORE Rule 1 (item+customer) because warehouse queries
@@ -83,23 +121,6 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
     if is_warehouse_query and ("stock" in original_query or "inventory" in original_query):
         logger.info(f"🏭 Warehouse stock query detected - forcing GET_WAREHOUSE_STOCK")
         return "GET_WAREHOUSE_STOCK"
-    
-    # ✨ NEW: Check if item_name and customer_name are the SAME (indicates extraction error)
-    # This happens when "dispatch warehouse" gets set to both fields
-    if item_name and customer_name and item_name.lower() == customer_name.lower():
-        # This is likely an extraction error, not a real customer price query
-        logger.info(f"⚠️ Same value in item_name and customer_name: '{item_name}' - checking for warehouse")
-        
-        # Check if this value looks like a warehouse
-        warehouse_indicators = ["warehouse", "dispatch", "store", "depot", "branch"]
-        if any(indicator in item_name.lower() for indicator in warehouse_indicators):
-            # This is a warehouse query, not a price query
-            if "stock" in original_query or "inventory" in original_query:
-                logger.info(f"🏭 Overriding: same item/customer -> GET_WAREHOUSE_STOCK")
-                return "GET_WAREHOUSE_STOCK"
-            elif "warehouses" in original_query or "list" in original_query:
-                logger.info(f"🏭 Overriding: same item/customer -> GET_WAREHOUSES")
-                return "GET_WAREHOUSES"
     
     # =========================================================
     # 🔍 CROSS-SELL DETECTION - Even if intent got misclassified
@@ -128,20 +149,69 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
         return "GET_UPSELL"
     
     # =========================================================
-    # 🌱 SEASONAL DETECTION
+    # 🌱 SEASONAL DETECTION - WITH PRICE QUERY PROTECTION
     # =========================================================
-    seasonal_patterns = [
-        "seasonal", "what to plant", "best for", "this season",
-        "planting guide", "what grows in", "in season",
-        "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december",
-        "spring", "summer", "fall", "autumn", "winter"
+    # IMPORTANT: We already checked for price queries above, so any seasonal
+    # detection here is safe from overriding price queries.
+    
+    # Seasonal keywords - but only when they appear with seasonal context
+    # The word "spring" alone is NOT enough - must have seasonal context
+    seasonal_context_patterns = [
+        r'\bseasonal\s+(?:items?|products?|recommendations?)\b',
+        r'\b(?:summer|winter|fall|autumn)\s+(?:items?|products?|deals?|promotions?)\b',
+        r'\b(?:rainy|dry|festive|holiday)\s+season\s+(?:items?|products?)\b',
+        r'\bwhat\'?s?\s+(?:in|for)\s+season\b',
+        r'\bshow\s+seasonal\s+(?:items?|products?)\b',
+        r'\bseasonal\s+recommendations?\b',
+        r'\b(?:spring|summer|winter|fall)\s+collection\b',
+        r'\b(?:spring|summer|winter|fall)\s+sale\b',
+        r'\bplanting\s+guide\b',
+        r'\bwhat\s+to\s+plant\b',
+        r'\bin\s+season\b',
     ]
     
-    if any(pattern in original_query for pattern in seasonal_patterns):
+    # Single word seasonal check (with safeguards)
+    seasonal_words = ["spring", "summer", "fall", "autumn", "winter", "seasonal"]
+    
+    # Check if seasonal word appears but is likely part of an item name
+    # Common item name patterns that contain seasonal words
+    item_name_patterns = [
+        r'spring\s+(?:kick|starter|boot|shock|coil|leaf|washer|bolt|screw)',
+        r'summer\s+(?:tire|tyre|oil|promotion|sale)',
+        r'winter\s+(?:tire|tyre|oil|coat|jacket)',
+    ]
+    
+    is_item_name_containing_seasonal = False
+    for pattern in item_name_patterns:
+        if re.search(pattern, original_query, re.IGNORECASE):
+            is_item_name_containing_seasonal = True
+            logger.debug(f"Seasonal word appears to be part of item name: {pattern}")
+            break
+    
+    # Only apply seasonal override if:
+    # 1. We have seasonal context patterns, OR
+    # 2. Seasonal word appears but NOT as part of an item name
+    seasonal_detected = False
+    
+    for pattern in seasonal_context_patterns:
+        if re.search(pattern, original_query, re.IGNORECASE):
+            seasonal_detected = True
+            break
+    
+    # Check for standalone seasonal words (with context)
+    if not seasonal_detected and not is_item_name_containing_seasonal:
+        for word in seasonal_words:
+            if word in original_query.split():
+                # Look for seasonal context words nearby
+                seasonal_context = ["items", "products", "recommend", "guide", "plant", "crop"]
+                if any(ctx in original_query for ctx in seasonal_context):
+                    seasonal_detected = True
+                    break
+    
+    if seasonal_detected:
         logger.info(f"🌱 Seasonal pattern detected - forcing GET_SEASONAL_RECOMMENDATIONS")
         return "GET_SEASONAL_RECOMMENDATIONS"
-    
+
     # =========================================================
     # 📊 TRENDING DETECTION - Don't override top selling/slow moving
     # =========================================================
@@ -159,6 +229,7 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
     # ── RULE 1: item + customer → GET_CUSTOMER_PRICE ──────────────────
     # "price of vegimax for magomano" → both entities extracted
     # BUT skip if this is actually a warehouse query (detected above)
+    # AND skip if they're the same value (already handled above as extraction error)
     if item_name and customer_name and not is_warehouse_query:
         # Make sure they're not the same value (extraction error)
         if item_name.lower() != customer_name.lower():
@@ -175,8 +246,15 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
 
     # ── RULE 3: item only, price keyword context → GET_ITEM_PRICE ─────
     # Protects against GET_ITEMS_ADVANCED when user clearly wants a price.
+    # Also catches GET_PURCHASE_ORDERS misclassification for price queries
     if item_name and not customer_name and not is_warehouse_query:
-        if intent == "GET_ITEMS_ADVANCED" and not warehouse_name:
+        # Check if this is a price query
+        if is_price_query:
+            # Item-only price query should always be GET_ITEM_PRICE
+            logger.info(f"RULE 3 (ENHANCED): item only + price query -> GET_ITEM_PRICE")
+            return "GET_ITEM_PRICE"
+        elif intent == "GET_ITEMS_ADVANCED" and not warehouse_name:
+            # Original logic for non-price queries
             logger.debug(f"RULE 3: item only, no warehouse -> GET_ITEM_PRICE")
             return "GET_ITEM_PRICE"
 

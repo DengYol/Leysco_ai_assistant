@@ -60,7 +60,17 @@ class OrdersHandler:
                 logger.warning("Not authenticated, cannot fetch open sales orders")
                 return []
 
-            url = f"{self.base_url}/marketing/docs/17"
+            # Ensure base_url doesn't have double slashes and includes /api/v1 if needed
+            base = self.base_url.rstrip('/')
+            if '/api/v1' not in base and 'api/v1' not in base:
+                # Check if we need to add /api/v1
+                if base.endswith('.com'):
+                    url = f"{base}/api/v1/marketing/docs/17"
+                else:
+                    url = f"{base}/marketing/docs/17"
+            else:
+                url = f"{base}/marketing/docs/17"
+            
             params = {
                 "isDoc": 1,
                 "page": 1,
@@ -136,11 +146,21 @@ class OrdersHandler:
                     logger.warning(f"Could not resolve customer: {customer_name}")
                     return []
             
-            url = f"{self.base_url}/marketing/docs/17"
-            params = {"page": 1, "per_page": limit}
+            if not customer_code:
+                logger.warning("No customer code provided for orders fetch")
+                return []
             
-            if customer_code:
-                params["CardCode"] = customer_code
+            # FIX: Use the correct endpoint with /api/v1 prefix
+            # Check if base_url already has /api/v1
+            base = self.base_url.rstrip('/')
+            if '/api/v1' in base:
+                url = f"{base}/marketing/docs/{customer_code}"
+            elif base.endswith('.com'):
+                url = f"{base}/api/v1/marketing/docs/{customer_code}"
+            else:
+                url = f"{base}/marketing/docs/{customer_code}"
+            
+            params = {}
             if from_date:
                 params["FromDate"] = from_date
             if to_date:
@@ -151,10 +171,15 @@ class OrdersHandler:
             resp = self.session.get(url, params=params, timeout=30)
             
             if not self.auth_handler.check_auth(resp):
+                logger.warning(f"Authentication failed for orders fetch: {resp.status_code}")
+                return []
+            
+            if resp.status_code == 404:
+                logger.info(f"No orders found for customer {customer_code} (404 response)")
                 return []
             
             if resp.status_code != 200:
-                logger.warning(f"Failed to fetch orders: {resp.status_code}")
+                logger.warning(f"Failed to fetch orders: {resp.status_code} - {resp.text[:200]}")
                 return []
             
             if is_html_response(resp.text):
@@ -163,21 +188,47 @@ class OrdersHandler:
             
             try:
                 data = resp.json()
-            except json.JSONDecodeError:
-                logger.error("Failed to parse orders JSON")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse orders JSON: {e}")
                 return []
             
-            orders = self._parse_orders_response(data)
+            # Parse the response - different possible structures
+            orders = []
+            if isinstance(data, dict):
+                # Check for ResponseData structure
+                if data.get("ResponseData"):
+                    response_data = data["ResponseData"]
+                    if isinstance(response_data, dict):
+                        # Check for data array inside
+                        if "data" in response_data:
+                            orders = response_data["data"]
+                        else:
+                            orders = [response_data]
+                    elif isinstance(response_data, list):
+                        orders = response_data
+                elif data.get("data"):
+                    orders = data["data"]
+                elif data.get("results"):
+                    orders = data["results"]
+                else:
+                    # Assume the whole response is the order
+                    orders = [data] if data.get("DocNum") else []
+            elif isinstance(data, list):
+                orders = data
+            
+            if not orders:
+                logger.info(f"No orders found for {customer_name or customer_code}")
+                return []
             
             # Filter and format orders
             filtered_orders = self._filter_and_format_orders(orders, doc_status)
             
             logger.info(f"✅ Retrieved {len(filtered_orders)} orders for {customer_name or customer_code}")
-            return filtered_orders
+            return filtered_orders[:limit]
             
         except Exception as e:
             self.parent._record_error()
-            logger.error(f"Failed to fetch customer orders: {e}")
+            logger.error(f"Failed to fetch customer orders: {e}", exc_info=True)
             return []
     
     def _parse_orders_response(self, data: dict) -> List[Dict]:

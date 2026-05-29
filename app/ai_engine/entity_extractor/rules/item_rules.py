@@ -365,22 +365,54 @@ class ItemRules:
     
     @staticmethod
     def _looks_like_company(text: str) -> bool:
-        """Quick check if text looks like a company name."""
+        """
+        Quick check if text looks like a company name.
+        
+        DYNAMIC: This method uses only universal patterns that apply to ANY
+        company across ANY industry, not hardcoded product/industry indicators.
+        This ensures it works for agrovets, retailers, manufacturers, etc.
+        """
         if not text or len(text) < 3:
             return False
         
         text_lower = text.lower()
-        company_suffixes = [
+        
+        # UNIVERSAL COMPANY SUFFIXES (industry-agnostic)
+        # These are typical business entity types, not product categories
+        universal_suffixes = [
             "suppliers", "supplier", "vendor", "traders", "enterprises", 
             "company", "ltd", "limited", "inc", "group", "associates",
             "agency", "industries", "international", "brothers", "holdings",
-            "services", "distributors", "corporation", "corp", "llc",
+            "services", "distributors", "distributor", "corporation", "corp", "llc",
             "global", "partners", "ventures", "enterprise", "business",
-            "agrovet", "farm", "agro", "kampuni"
+            "incorporation", "pty", "co", "plc", "nv", "gmbh", "sarl",
+            "s.a.r.l", "pvt", "bv", "kft", "ood", "ehf"
         ]
         
-        for suffix in company_suffixes:
-            if suffix in text_lower:
+        # UNIVERSAL LEGAL/FORMAL INDICATORS (not product-related)
+        formal_indicators = [
+            "and co", "and company", "& co", "& company",
+            "the company", "the group", "the firm", "the house",
+        ]
+        
+        # Check suffixes
+        for suffix in universal_suffixes:
+            if text_lower.endswith(suffix):
                 return True
+            if f" {suffix}" in text_lower:
+                return True
+        
+        # Check formal indicators
+        for indicator in formal_indicators:
+            if indicator in text_lower:
+                return True
+        
+        # Check if it contains multiple capitalized words (trademark pattern)
+        # Examples: "John & Sons", "Mary's Farm", "ABC Traders"
+        words = text.split()
+        capitalized_count = sum(1 for word in words if word and word[0].isupper())
+        if len(words) >= 2 and capitalized_count >= 2:
+            # Multiple proper nouns suggest company name
+            return True
         
         return False

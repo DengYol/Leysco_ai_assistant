@@ -22,6 +22,9 @@ from .handlers.knowledge_handler import KnowledgeHandler
 from .handlers.analytics_handler import AnalyticsHandler
 from .handlers.decision_handler import DecisionHandler
 from .handlers.training_handler import TrainingHandler
+from .handlers.invoice_handler import InvoiceHandler           # NEW
+from .handlers.purchase_handler import PurchaseHandler         # NEW
+from .handlers.inventory_movement_handler import InventoryMovementHandler  # NEW
 from .utils.helpers import resolve_customer
 from app.services.leysco_api.client import LeyscoAPIService, create_api_service
 from app.services.pricing_service import PricingService, create_pricing_service
@@ -92,6 +95,11 @@ class ActionRouter:
         self._analytics_handler = None
         self._decision_handler = None
         self._training_handler = None
+        
+        # NEW handlers
+        self._invoice_handler = None
+        self._purchase_handler = None
+        self._inventory_movement_handler = None
 
     # ------------------------------------------------------------------
     # LAZY SERVICE PROPERTIES
@@ -248,6 +256,28 @@ class ActionRouter:
         return self._training_handler
 
     # ------------------------------------------------------------------
+    # NEW HANDLER PROPERTIES
+    # ------------------------------------------------------------------
+
+    @property
+    def invoice_handler(self) -> InvoiceHandler:
+        if self._invoice_handler is None:
+            self._invoice_handler = InvoiceHandler(self)
+        return self._invoice_handler
+
+    @property
+    def purchase_handler(self) -> PurchaseHandler:
+        if self._purchase_handler is None:
+            self._purchase_handler = PurchaseHandler(self)
+        return self._purchase_handler
+
+    @property
+    def inventory_movement_handler(self) -> InventoryMovementHandler:
+        if self._inventory_movement_handler is None:
+            self._inventory_movement_handler = InventoryMovementHandler(self)
+        return self._inventory_movement_handler
+
+    # ------------------------------------------------------------------
     # TOKEN MANAGEMENT
     # ------------------------------------------------------------------
 
@@ -368,14 +398,43 @@ class ActionRouter:
             "GET_CUSTOMER_PRICE": lambda: self.pricing_handler.get_customer_price(item_name, customer_name, language),
 
             # Quotations
-            "CREATE_QUOTATION":     lambda: self.quotation_handler.create_quotation(entities, message, language),
-            "GET_QUOTATIONS":       lambda: self.quotation_handler.get_quotations(customer_name, quantity, language),
-            "FOLLOW_UP_QUOTATIONS": lambda: self.quotation_handler.follow_up_quotations(entities, language),
+            "CREATE_QUOTATION":           lambda: self.quotation_handler.create_quotation(entities, message, language),
+            "GET_QUOTATIONS":             lambda: self.quotation_handler.get_quotations(customer_name, quantity, language),
+            "FOLLOW_UP_QUOTATIONS":       lambda: self.quotation_handler.follow_up_quotations(entities, language),
+            "CONVERT_QUOTATION_TO_ORDER": lambda: self.quotation_handler.convert_quotation_to_order(entities, message, language),  # NEW
 
             # Deliveries
             "GET_OUTSTANDING_DELIVERIES": lambda: self.delivery_handler.get_outstanding_deliveries(customer_name, quantity, language),
             "TRACK_DELIVERY":             lambda: self.delivery_handler.track_delivery(item_name, language),
             "GET_DELIVERY_HISTORY":       lambda: self.delivery_handler.get_delivery_history(customer_name, quantity, language),
+            "POST_INVOICE":               lambda: self.delivery_handler.post_invoice(entities, message, language),  # NEW
+
+            # NEW - Invoice Management
+            "GET_AR_INVOICES":        lambda: self.invoice_handler.handle_get_ar_invoices(entities, message, language),
+            "GET_AP_INVOICES":        lambda: self.invoice_handler.handle_get_ap_invoices(entities, message, language),
+            "GET_OVERDUE_INVOICES":   lambda: self.invoice_handler.handle_get_overdue_invoices(entities, message, language),
+            "GET_CUSTOMER_BALANCE":   lambda: self.invoice_handler.handle_get_customer_balance(entities, message, language),
+            "SEND_PAYMENT_REMINDER":  lambda: self.invoice_handler.handle_send_payment_reminder(entities, message, language),
+            "GET_AGING_REPORT":       lambda: self.invoice_handler.handle_get_aging_report(entities, message, language),
+
+            # NEW - Purchase Cycle
+            "GET_PURCHASE_ORDERS":     lambda: self.purchase_handler.handle_get_purchase_orders(entities, message, language),
+            "CREATE_PURCHASE_ORDER":   lambda: self.purchase_handler.handle_create_purchase_order(entities, message, language),
+            "GET_PURCHASE_REQUESTS":   lambda: self.purchase_handler.handle_get_purchase_requests(entities, message, language),
+            "GET_GOODS_RECEIPT_PO":    lambda: self.purchase_handler.handle_get_goods_receipt(entities, message, language),
+            "APPROVE_PURCHASE_ORDER":  lambda: self.purchase_handler.handle_approve_purchase_order(entities, message, language),
+
+            # NEW - Inventory Movements
+            "CREATE_GOODS_ISSUE":      lambda: self.inventory_movement_handler.handle_create_goods_issue(entities, message, language),
+            "CREATE_GOODS_RECEIPT":    lambda: self.inventory_movement_handler.handle_create_goods_receipt(entities, message, language),
+            "CREATE_STOCK_TRANSFER":   lambda: self.inventory_movement_handler.handle_create_stock_transfer(entities, message, language),
+            "GET_INVENTORY_VALUATION": lambda: self.inventory_movement_handler.handle_get_inventory_valuation(entities, message, language),
+            "GET_REORDER_REPORT":      lambda: self.inventory_movement_handler.handle_get_reorder_report(entities, message, language),
+            "ALLOCATE_STOCK":          lambda: self.inventory_movement_handler.handle_allocate_stock(entities, message, language),
+
+            # NEW - Business Rules
+            "CHECK_CREDIT_LIMIT":      lambda: self.invoice_handler.handle_check_credit_limit(entities, message, language),
+            "CHECK_STOCK_AVAILABILITY": lambda: self.inventory_movement_handler.handle_check_stock_availability(entities, message, language),
 
             # Recommendations
             "RECOMMEND_ITEMS":              lambda: self.recommendation_handler.recommend_items(item_name, customer_name, quantity, language),

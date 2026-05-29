@@ -8,6 +8,8 @@ FIXED: Correctly extracts manager role from Laravel SUPERUSER field
 FIXED: Proper role detection for both SUPERUSER flag and role field
 FIXED: Stable session ID derived from user identity to prevent new session
        on every notification poll (was calling uuid.uuid4() as fallback)
+FIXED: Token validation now correctly uses company_code from header AND from token
+FIXED: Multi-tenant session isolation - different companies have separate sessions
 """
 
 from fastapi import Header, HTTPException, status, Request, Depends
@@ -29,7 +31,7 @@ _user_session_cache: Dict[str, Dict] = {}
 
 
 # =========================================================
-# TENANT → BACKEND URL RESOLUTION   ← NEW
+# TENANT → BACKEND URL RESOLUTION
 # =========================================================
 
 def resolve_backend_url(company_code: Optional[str] = None, request: Optional[Request] = None) -> str:
@@ -38,56 +40,57 @@ def resolve_backend_url(company_code: Optional[str] = None, request: Optional[Re
 
     Resolution order:
       1. Per-tenant env var  e.g. LARAVEL_BACKEND_URL_TEST001=https://dev100-be.leysco100.com
-      2. Origin-header sniffing  (dev100.leysco100.com  → dev100-be.leysco100.com)
-      3. X-Tenant-Env header     (explicit override for testing)
-      4. LARAVEL_BACKEND_URL     (global default / single-tenant fallback)
-      5. Hard error              (nothing configured)
-
-    Examples
-    --------
-    Company TEST001 on dev100:
-        env  LARAVEL_BACKEND_URL_TEST001=https://dev100-be.leysco100.com
-        → https://dev100-be.leysco100.com
-
-    Any request from https://dev109.leysco100.com (no per-tenant env var):
-        origin sniff → https://dev109-be.leysco100.com
+      2. X-Tenant-Env header     (explicit override for testing)
+      3. Origin-header sniffing  (dev100.leysco100.com  → dev100-be.leysco100.com)
+      4. Company code mapping
+      5. LARAVEL_BACKEND_URL     (global default / single-tenant fallback)
+      6. Hard error              (nothing configured)
     """
-
-    # 1. Per-tenant env var  (LARAVEL_BACKEND_URL_<COMPANY_CODE>)
+    
+    # 1. Per-tenant env var (LARAVEL_BACKEND_URL_<COMPANY_CODE>)
     if company_code:
         env_key = f"LARAVEL_BACKEND_URL_{company_code.upper()}"
         per_tenant = os.getenv(env_key)
         if per_tenant:
             logger.debug(f"🔀 Backend URL from env {env_key}: {per_tenant}")
             return per_tenant.rstrip("/")
-
-    # 2. Derive from the Origin / Referer header
-    #    dev100.leysco100.com  → dev100-be.leysco100.com
-    #    dev109.leysco100.com  → dev109-be.leysco100.com
+    
+    # 2. Explicit X-Tenant-Env header (useful for Postman / integration tests)
     if request:
-        origin = request.headers.get("origin") or request.headers.get("referer", "")
-        match = re.search(r"https?://(dev\d+)\.leysco100\.com", origin)
-        if match:
-            env_slug = match.group(1)           # e.g. "dev100"
-            derived = f"https://{env_slug}-be.leysco100.com"
-            logger.debug(f"🔀 Backend URL derived from origin '{origin}': {derived}")
-            return derived
-
-    # 3. Explicit X-Tenant-Env header  (useful for Postman / integration tests)
-    if request:
-        tenant_env = request.headers.get("x-tenant-env")  # e.g. "dev100"
+        tenant_env = request.headers.get("x-tenant-env") or request.headers.get("X-Tenant-Env")
         if tenant_env and re.fullmatch(r"[a-zA-Z0-9_-]{3,30}", tenant_env):
             derived = f"https://{tenant_env}-be.leysco100.com"
             logger.debug(f"🔀 Backend URL from X-Tenant-Env header: {derived}")
             return derived
+    
+    # 3. Derive from the Origin / Referer header
+    if request:
+        origin = request.headers.get("origin") or request.headers.get("referer", "")
+        match = re.search(r"https?://(dev\d+)\.leysco100\.com", origin)
+        if match:
+            env_slug = match.group(1)
+            derived = f"https://{env_slug}-be.leysco100.com"
+            logger.debug(f"🔀 Backend URL derived from origin '{origin}': {derived}")
+            return derived
+    
+    # 4. Company code to backend mapping (fallback)
+    if company_code:
+        backend_map = {
+            "TEST001": os.getenv("LARAVEL_BACKEND_URL_TEST001", "https://dev100-be.leysco100.com"),
+            "TEST002": os.getenv("LARAVEL_BACKEND_URL_TEST002", "https://dev109-be.leysco100.com"),
+        }
+        mapped = backend_map.get(company_code.upper())
+        if mapped:
+            logger.debug(f"🔀 Backend URL from company code mapping: {mapped}")
+            return mapped
 
-    # 4. Global fallback env var
+    # 5. Global fallback env var
     global_url = getattr(settings, "LARAVEL_BACKEND_URL", None) or os.getenv("LARAVEL_BACKEND_URL")
     if global_url:
         logger.debug(f"🔀 Backend URL from global setting: {global_url}")
         return global_url.rstrip("/")
 
-    # 5. Nothing configured — fail loudly
+    # 6. Nothing configured — fail loudly
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="Authentication service is not configured for this tenant.",
@@ -158,7 +161,7 @@ async def get_company_code_header(request: Request) -> Optional[str]:
             if re.match(r'^[A-Za-z0-9_-]{3,50}$', value):
                 return value.upper()
             else:
-                logger.warning(f"Invalid company code format received")
+                logger.warning(f"Invalid company code format received: {value}")
                 return None
     return None
 
@@ -169,17 +172,51 @@ async def get_company_code(
 ) -> str:
     """
     Resolve company code:
-      1. X-Company-Code header  (preferred for opaque tokens)
-      2. Token validation response from Laravel backend
+      1. X-Company-Code header (preferred)
+      2. From cached session
+      3. Token validation response from Laravel backend
     """
+    # Priority 1: Header
     code = await get_company_code_header(request)
     if code:
         logger.info(f"✅ Company code from header: {code}")
         return code
-
-    validation = await validate_token_with_backend(token, request=request)
-    if validation and validation.get("company_code"):
-        return validation["company_code"]
+    
+    # Priority 2: From cached session
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    cached = _user_session_cache.get(token_hash)
+    if cached and cached.get("user", {}).get("company_code"):
+        cached_code = cached["user"]["company_code"]
+        logger.info(f"✅ Company code from cached session: {cached_code}")
+        return cached_code
+    
+    # Priority 3: Validate token with backend (without company code to detect)
+    # Try to detect from origin first
+    backend_url = resolve_backend_url(request=request)
+    
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{backend_url}/api/user",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+        
+        if response.status_code == 200:
+            data = response.json()
+            company_code_val = (
+                data.get("company_code") or
+                data.get("tenant_code") or
+                data.get("CompanyID") or
+                data.get("company_id")
+            )
+            if company_code_val:
+                if str(company_code_val).isdigit():
+                    company_code_val = f"C{company_code_val}"
+                logger.info(f"✅ Company code from token validation: {company_code_val}")
+                return company_code_val
+    except Exception as e:
+        logger.error(f"Error extracting company code from token: {e}")
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
@@ -188,51 +225,61 @@ async def get_company_code(
 
 
 # =========================================================
-# SESSION CACHE MANAGER
+# SESSION CACHE MANAGER (Multi-tenant aware)
 # =========================================================
 
 class UserSessionManager:
-    """In-memory user session cache keyed by token hash."""
+    """In-memory user session cache keyed by (token_hash, company_code)."""
 
     @staticmethod
-    def get(token: str) -> Optional[Dict]:
+    def _get_cache_key(token: str, company_code: str = None) -> str:
+        """Create cache key with optional company code for isolation."""
         token_hash = hashlib.sha256(token.encode()).hexdigest()
-        entry = _user_session_cache.get(token_hash)
+        if company_code:
+            return f"{token_hash}:{company_code}"
+        return token_hash
+
+    @staticmethod
+    def get(token: str, company_code: str = None) -> Optional[Dict]:
+        cache_key = UserSessionManager._get_cache_key(token, company_code)
+        entry = _user_session_cache.get(cache_key)
         if entry:
             if datetime.now() < entry["expires_at"]:
                 return entry["user"]
-            del _user_session_cache[token_hash]
+            del _user_session_cache[cache_key]
         return None
 
     @staticmethod
     def store(token: str, user_info: Dict, ttl_seconds: int = 3600) -> None:
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        _user_session_cache[token_hash] = {
+        company_code = user_info.get("company_code")
+        cache_key = UserSessionManager._get_cache_key(token, company_code)
+        _user_session_cache[cache_key] = {
             "user":       user_info,
             "expires_at": datetime.now() + timedelta(seconds=ttl_seconds),
         }
+        logger.debug(f"Session stored for company: {company_code}")
 
     @staticmethod
-    def clear(token: str) -> None:
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        _user_session_cache.pop(token_hash, None)
+    def clear(token: str, company_code: str = None) -> None:
+        cache_key = UserSessionManager._get_cache_key(token, company_code)
+        _user_session_cache.pop(cache_key, None)
 
     # Backward-compatible aliases
     @staticmethod
-    def get_user_from_token(token: str) -> Optional[Dict]:
-        return UserSessionManager.get(token)
+    def get_user_from_token(token: str, company_code: str = None) -> Optional[Dict]:
+        return UserSessionManager.get(token, company_code)
 
     @staticmethod
     def store_user_session(token: str, user_info: Dict, ttl_seconds: int = 3600) -> None:
         UserSessionManager.store(token, user_info, ttl_seconds)
 
     @staticmethod
-    def clear_user_session(token: str) -> None:
-        UserSessionManager.clear(token)
+    def clear_user_session(token: str, company_code: str = None) -> None:
+        UserSessionManager.clear(token, company_code)
 
 
 # =========================================================
-# TOKEN VALIDATION WITH LARAVEL BACKEND
+# TOKEN VALIDATION WITH LARAVEL BACKEND (Multi-tenant)
 # =========================================================
 
 async def validate_token_with_backend(
@@ -244,25 +291,27 @@ async def validate_token_with_backend(
     Validate opaque Sanctum token against the correct Laravel backend
     for this tenant.
 
-    Backend URL is resolved dynamically via resolve_backend_url() so
-    tokens from dev100.leysco100.com validate against dev100-be, tokens
-    from dev109.leysco100.com validate against dev109-be, etc.
-
-    Returns canonical user_info dict with keys:
-        user_id, user_role, user_email, company_code,
-        assigned_customers, is_manager, backend_url (for debugging)
+    CRITICAL FIX: Uses company_code AND request to resolve the correct backend.
+    Tokens from TEST001 validate against dev100-be, TEST002 against dev109-be.
     """
-    # Cache hit — skip network call
-    cached = UserSessionManager.get(token)
+    # Get company code from various sources
+    resolved_company_code = company_code
+    
+    # If no company code provided, try to get from request header
+    if not resolved_company_code and request:
+        resolved_company_code = await get_company_code_header(request)
+    
+    # Cache hit with company code - use it
+    cached = UserSessionManager.get(token, resolved_company_code)
     if cached:
-        logger.info("✅ Using cached user session")
+        logger.info(f"✅ Using cached user session for company: {resolved_company_code}")
         return cached
-
-    # ← CHANGED: resolve dynamically instead of reading a single setting
-    backend_url = resolve_backend_url(company_code=company_code, request=request)
+    
+    # CRITICAL FIX: Resolve backend URL using both company code and request
+    backend_url = resolve_backend_url(company_code=resolved_company_code, request=request)
     validate_url = f"{backend_url}/api/user"
 
-    logger.info(f"🔍 Validating token against: {validate_url}")
+    logger.info(f"🔍 Validating token against: {validate_url} (company: {resolved_company_code})")
 
     try:
         import httpx
@@ -270,7 +319,7 @@ async def validate_token_with_backend(
             response = await client.get(
                 validate_url,
                 headers={"Authorization": f"Bearer {token}"},
-                follow_redirects=False,   # surface mis-routed requests immediately
+                follow_redirects=False,
             )
 
         if response.status_code == 302:
@@ -278,7 +327,7 @@ async def validate_token_with_backend(
             logger.error(
                 f"Token validation redirected (302) to '{location}'. "
                 f"Likely wrong backend URL '{backend_url}' for this token. "
-                f"Check resolve_backend_url() or per-tenant env vars."
+                f"Company code: {resolved_company_code}"
             )
             return None
 
@@ -295,11 +344,14 @@ async def validate_token_with_backend(
 
             # Company code extraction
             company_code_val = (
+                resolved_company_code or
                 data.get("company_code") or
                 data.get("tenant_code") or
                 data.get("CompanyID") or
                 data.get("company_id")
             )
+            
+            # If company code is numeric, prefix with 'C'
             if company_code_val and str(company_code_val).isdigit():
                 company_code_val = f"C{company_code_val}"
 
@@ -307,10 +359,11 @@ async def validate_token_with_backend(
                 "user_id":            data.get("id"),
                 "user_role":          user_role,
                 "user_email":         data.get("email"),
+                "user_name":          data.get("name"),
                 "company_code":       company_code_val,
                 "assigned_customers": data.get("assigned_customers", []),
                 "is_manager":         is_manager,
-                "backend_url":        backend_url,   # useful for debugging
+                "backend_url":        backend_url,
                 "raw_user_data": {
                     "name":      data.get("name"),
                     "SUPERUSER": data.get("SUPERUSER"),
@@ -320,9 +373,11 @@ async def validate_token_with_backend(
 
             logger.info(
                 f"✅ Token validated — User: {data.get('name')}, "
-                f"Role: {user_role}, SUPERUSER: {data.get('SUPERUSER')}, "
+                f"Role: {user_role}, Company: {company_code_val}, "
                 f"Backend: {backend_url}"
             )
+            
+            # Store with company code for proper isolation
             UserSessionManager.store(token, user_info)
             return user_info
 
@@ -350,6 +405,7 @@ async def extract_user_info_from_token(
     request: Request = None,
 ) -> Dict[str, Any]:
     """Return full user_info dict for a token."""
+    # Get company code from request if available
     company_code = None
     if request:
         company_code = await get_company_code_header(request)
@@ -447,12 +503,12 @@ async def get_session_id_from_request(
 
 
 # =========================================================
-# CONVERSATION CONTEXT  ← MAIN DEPENDENCY
+# CONVERSATION CONTEXT (Main Dependency)
 # =========================================================
 
 async def get_conversation_context(
     request: Request,
-    token:        str = Depends(get_token_from_header),
+    token: str = Depends(get_token_from_header),
     company_code: str = Depends(get_company_code),
 ) -> Dict[str, Any]:
     """
@@ -467,7 +523,7 @@ async def get_conversation_context(
     user_email         = user_info.get("user_email")
     assigned_customers = user_info.get("assigned_customers", [])
     is_manager         = user_info.get("is_manager", user_role == "manager")
-    tenant_code        = company_code
+    tenant_code        = company_code or user_info.get("company_code")
 
     effective_session_id = await get_session_id_from_request(
         request,
@@ -527,9 +583,9 @@ async def sync_user_session(token: str, user_data: Dict) -> None:
     logger.info(f"User session synced: {user_data.get('user_email')}")
 
 
-async def logout_user(token: str) -> None:
+async def logout_user(token: str, company_code: str = None) -> None:
     """Clear user session on logout."""
-    UserSessionManager.clear(token)
+    UserSessionManager.clear(token, company_code)
 
 
 # =========================================================

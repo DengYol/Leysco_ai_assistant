@@ -76,4 +76,26 @@ plotly>=5.0.0                   # UNCOMMENTED - fixes plotly import error
 # =========================================================
 # asyncpg>=0.29.0      # PostgreSQL (async)
 # aiomysql>=0.2.0      # MySQL
-# sqlalchemy>=2.0.0    # ORM
+sqlalchemy>=2.0.0               # ORM
+psycopg2-binary>=2.9.0          # PostgreSQL adapter (already above, keeping for clarity)
+
+# =========================================================
+# SCHEDULING & TASKS (NEW)
+# =========================================================
+APScheduler>=3.10.0              # Advanced Python Scheduler for background jobs
+
+# =========================================================
+# EXCEL & REPORTING (NEW)
+# =========================================================
+openpyxl>=3.1.0                  # Excel file support
+xlrd>=2.0.0                      # Excel reading (legacy format)
+xlsxwriter>=3.1.0                # Excel writing
+
+# =========================================================
+# ADDITIONAL UTILITIES (NEW)
+# =========================================================
+python-dateutil>=2.8.0           # Date parsing utilities
+pytz>=2023.3                     # Timezone support
+click>=8.1.0                     # CLI utilities
+colorama>=0.4.6                  # Terminal colors
+tqdm>=4.66.0                     # Progress bars

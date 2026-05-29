@@ -51,14 +51,13 @@ _FAREWELL_WORDS = {
     "good night", "take care", "ttyl", "cya",
 }
 
-# Swahili specific words for language detection
 _SWAHILI_GREETINGS = {
-    "mambo", "habari", "sasa", "vipi", "jambo", "hujambo", "sijambo", 
+    "mambo", "habari", "sasa", "vipi", "jambo", "hujambo", "sijambo",
     "shikamoo", "marahaba", "poa", "fresh", "nzuri", "salama", "njema", "noma"
 }
 
 _SWAHILI_WORDS = {
-    "naomba", "tafadhali", "asante", "samahani", "karibu", "kwaheri", 
+    "naomba", "tafadhali", "asante", "samahani", "karibu", "kwaheri",
     "sawa", "ndio", "hapana", "unauza", "bei", "ghali", "nafuu", "huduma",
     "hisa", "ghala", "maghala", "mteja", "wateja", "oda", "nukuu", "bidhaa",
     "unauza", "nanunua", "kipimo", "kiasi", "sana", "kidogo", "ngapi"
@@ -86,9 +85,6 @@ _SELL_OUT_PHRASES = {
     "customer that buys", "customer segment for", "who purchases",
 }
 
-# =========================================================
-# CHURN RISK PHRASES
-# =========================================================
 _CHURN_RISK_PHRASES = {
     "churn risk", "churning", "at risk", "risk of leaving",
     "customer health", "health score", "unhealthy customers",
@@ -101,9 +97,8 @@ _CHURN_RISK_PHRASES = {
     "wateja walio katika hatari", "hatari ya kuondoka", "afya ya mteja"
 }
 
-# Top selling phrases
 TOP_SELLING_PHRASES = {
-    "top selling", "best selling", "most popular", "top items", 
+    "top selling", "best selling", "most popular", "top items",
     "bestsellers", "best sellers", "most sold", "highest selling",
     "top 5", "top 10", "top 15", "top 20", "top products",
     "what sells most", "popular items", "fast moving", "fastest selling",
@@ -114,7 +109,6 @@ TOP_SELLING_PHRASES = {
     "bidhaa zinazouzwa sana", "zinazouzwa zaidi", "maarufu"
 }
 
-# Slow moving phrases
 SLOW_MOVING_PHRASES = {
     "slow moving", "slow selling", "least popular", "worst selling",
     "lowest selling", "slowest selling", "dead stock", "obsolete",
@@ -125,7 +119,6 @@ SLOW_MOVING_PHRASES = {
     "zinazosonga polepole", "hazijauzwa", "haziuZiki", "zimelala"
 }
 
-# Sales analytics phrases
 SALES_ANALYTICS_PHRASES = {
     "sales analytics", "sales analysis", "sales report", "sales data",
     "sales overview", "sales summary", "sales performance", "sales metrics",
@@ -139,9 +132,45 @@ SALES_ANALYTICS_PHRASES = {
     "uchambuzi wa mauzo", "ripoti ya mauzo", "mauzo kwa mwezi"
 }
 
-# =========================================================
-# STOCK LEVELS GENERAL PHRASES
-# =========================================================
+_INVOICE_PHRASES = {
+    "ar invoice", "customer invoice", "sales invoice", "receivable invoice",
+    "show invoices", "list invoices", "get invoices", "view invoices",
+    "overdue invoices", "past due invoices", "late invoices", "unpaid invoices",
+    "invoice aging", "aging report", "invoice balance", "customer balance",
+    "send reminder", "payment reminder", "follow up payment",
+    "who owes money", "outstanding payments", "unpaid bills",
+    "invoice za wateja", "baki ya invoice", "malipo yaliyochelewa"
+}
+
+_PURCHASE_PHRASES = {
+    "purchase order", "buy order", "supplier order", "vendor order",
+    "create po", "make purchase order", "new purchase order",
+    "purchase request", "requisition", "buy request",
+    "goods receipt", "gr po", "receive goods", "stock in",
+    "ap invoice", "supplier invoice", "vendor invoice", "payable invoice",
+    "approve po", "authorize purchase", "po approval",
+    "agizo la ununuzi", "mapokezi ya bidhaa", "invoice ya muuzaji"
+}
+# NOTE: bare "po" removed from _PURCHASE_PHRASES — too short, causes false matches
+# on phrases like "customer details for..." when Groq sees "po" in its context.
+
+_INVENTORY_MOVEMENT_PHRASES = {
+    "goods issue", "issue stock", "stock out", "dispatch goods",
+    "goods receipt", "receive stock", "stock in", "goods in",
+    "stock transfer", "move stock", "transfer inventory", "warehouse transfer",
+    "allocate stock", "reserve stock", "hold stock",
+    "inventory valuation", "stock value", "inventory worth",
+    "reorder report", "what to reorder", "low stock report",
+    "utoaji wa bidhaa", "upokaji wa bidhaa", "uhamisho wa hisa"
+}
+
+_DOCUMENT_TRANSITION_PHRASES = {
+    "convert quotation", "quote to order", "turn quote into order",
+    "post invoice", "invoice delivery", "bill delivery",
+    "cancel document", "void document", "reverse document",
+    "approve purchase order", "authorize po"
+}
+
 _STOCK_LEVELS_GENERAL_PHRASES = {
     "stock levels", "show stock levels", "show me stock levels",
     "view stock levels", "display stock levels", "get stock levels",
@@ -154,19 +183,33 @@ _STOCK_LEVELS_GENERAL_PHRASES = {
     "hisa zote", "hisa za maghala yote", "hisa ya bidhaa"
 }
 
-# =========================================================
-# COMMON PRODUCTS LIST
-# =========================================================
 _COMMON_PRODUCTS = [
     "cabbage", "tomato", "maize", "pepper", "cauliflower", "onion",
     "vegimax", "easeed", "tosheka", "kh500", "mh401", "snowball",
     "yolo wonder", "seed", "seeds", "fertilizer", "pesticide"
 ]
 
-# Enhanced Fast-path patterns for natural language understanding
+# ---------------------------------------------------------------------------
+# CUSTOMER DETAIL PATTERNS
+# Used by _check_direct_intents as the very first guard so queries like
+# "customer details for Mahakali Enterprises" are never misrouted to
+# GET_PURCHASE_ORDERS by the LLM.
+# ---------------------------------------------------------------------------
+_CUSTOMER_DETAIL_PATTERNS = [
+    r'customer\s+details?\s+for\s+',
+    r'details?\s+(?:for|of|about)\s+(?:the\s+)?customer\s+',
+    r'show\s+(?:me\s+)?(?:the\s+)?customer\s+details?\s+(?:for|of)\s+',
+    r'tell\s+me\s+(?:more\s+)?about\s+(?:the\s+)?customer\s+',
+    r'info(?:rmation)?\s+(?:on|about|for)\s+(?:the\s+)?customer\s+',
+    r'get\s+(?:me\s+)?(?:the\s+)?customer\s+details?\s+(?:for|of)\s+',
+    r'customer\s+info(?:rmation)?\s+(?:for|on|about)\s+',
+    r'maelezo\s+ya\s+mteja\s+',          # Swahili: "details of customer"
+    r'taarifa\s+ya\s+mteja\s+',           # Swahili: "info of customer"
+]
+
 FAST_PATH_PATTERNS = [
     # =========================================================
-    # CRITICAL: ITEM BROWSING PATTERNS (HIGHEST PRIORITY)
+    # ITEM BROWSING PATTERNS
     # =========================================================
     (r'^(?:show|list|display|view|get|browse|find|fetch|see|check|pull\s+up|look\s+up|search\s+for|explore)\s+me\s+(?:all\s+)?(?:items|products|inventory|stock)$', "GET_ITEMS"),
     (r'^(?:show|list|display|view|get|browse|find|fetch|see|check|pull\s+up|look\s+up|search\s+for|explore)\s+(?:all\s+)?(?:items|products|inventory|stock|available\s+items|sellable\s+items)$', "GET_ITEMS"),
@@ -175,9 +218,51 @@ FAST_PATH_PATTERNS = [
     (r'^tell\s+me\s+about\s+(?:your\s+)?(?:items|products|inventory)$', "GET_ITEMS"),
     (r'^show\s+me\s+(?:the\s+)?(?:items|products|inventory)$', "GET_ITEMS"),
     (r'^list\s+(?:all\s+)?(?:items|products|inventory)$', "GET_ITEMS"),
-    
+
     # =========================================================
-    # CRITICAL: STOCK LEVELS GENERAL
+    # INVOICE PATTERNS
+    # =========================================================
+    (r'^(?:show|list|get|view|display)\s+(?:ar|sales|customer)?\s*invoices?$', "GET_AR_INVOICES"),
+    (r'^(?:overdue|past due|late)\s+invoices?$', "GET_OVERDUE_INVOICES"),
+    (r'^(?:what|show me)\s+(?:is\s+the\s+)?(?:customer\s+balance|balance\s+for)\s+(?:of\s+)?([A-Za-z0-9\s]+)$', "GET_CUSTOMER_BALANCE"),
+    (r'^(?:send|email)\s+(?:payment\s+)?reminder\s+(?:to|for)\s+([A-Za-z0-9\s]+)$', "SEND_PAYMENT_REMINDER"),
+    (r'^(?:aging|invoice aging)\s+report$', "GET_AGING_REPORT"),
+
+    # =========================================================
+    # PURCHASE PATTERNS
+    # =========================================================
+    (r'^(?:show|list|get)\s+(?:purchase\s+)?orders?\s*(?:for\s+([A-Za-z0-9\s]+))?$', "GET_PURCHASE_ORDERS"),
+    (r'^create\s+(?:a\s+)?purchase\s+order\s+(?:for\s+)?([A-Za-z0-9\s]+)(?:\s+with\s+|\s+containing\s+)(.+)$', "CREATE_PURCHASE_ORDER"),
+    (r'^create\s+purchase\s+order$', "CREATE_PURCHASE_ORDER"),
+    (r'^(?:show|list|get)\s+(?:purchase\s+)?requests?$', "GET_PURCHASE_REQUESTS"),
+    (r'^(?:goods|stock)\s+receipt\s+(?:for\s+po\s+)?(\d+)$', "GET_GOODS_RECEIPT_PO"),
+    (r'^approve\s+(?:purchase\s+)?order\s+(\d+)$', "APPROVE_PURCHASE_ORDER"),
+
+    # =========================================================
+    # INVENTORY MOVEMENT PATTERNS
+    # =========================================================
+    (r'^create\s+(?:a\s+)?(?:goods|stock)\s+issue\s+(?:from\s+)?([A-Z0-9]+)?\s+for\s+(.+)$', "CREATE_GOODS_ISSUE"),
+    (r'^create\s+(?:a\s+)?(?:goods|stock)\s+receipt\s+(?:from\s+po\s+(\d+)|for\s+(.+))$', "CREATE_GOODS_RECEIPT"),
+    (r'^transfer\s+stock\s+from\s+([A-Z0-9]+)\s+to\s+([A-Z0-9]+)\s+for\s+(.+)$', "CREATE_STOCK_TRANSFER"),
+    (r'^what\s+needs\s+reordering$', "GET_REORDER_REPORT"),
+    (r'^(?:allocate|reserve)\s+stock\s+for\s+order\s+(\d+)$', "ALLOCATE_STOCK"),
+
+    # =========================================================
+    # DOCUMENT TRANSITION PATTERNS
+    # =========================================================
+    (r'^convert\s+(?:quotation|quote)\s+(\d+)\s+to\s+(?:order|sales order)$', "CONVERT_QUOTATION_TO_ORDER"),
+    (r'^convert\s+it\s+to\s+order$', "CONVERT_QUOTATION_TO_ORDER"),
+    (r'^post\s+invoice\s+for\s+delivery\s+(\d+)$', "POST_INVOICE"),
+    (r'^post\s+the\s+invoice$', "POST_INVOICE"),
+
+    # =========================================================
+    # BUSINESS RULES PATTERNS
+    # =========================================================
+    (r'^check\s+credit\s+limit\s+for\s+([A-Za-z0-9\s]+)$', "CHECK_CREDIT_LIMIT"),
+    (r'^(?:is|check)\s+stock\s+available\s+for\s+(.+)$', "CHECK_STOCK_AVAILABILITY"),
+
+    # =========================================================
+    # STOCK LEVELS GENERAL
     # =========================================================
     (r'^(?:show|view|display|get|check)\s+(?:me\s+)?(?:the\s+)?stock\s+levels?\s*$', "GET_STOCK_LEVELS"),
     (r'^(?:stock|inventory)\s+(?:levels?|overview|summary|report|status|check)\s*$', "GET_STOCK_LEVELS"),
@@ -186,9 +271,9 @@ FAST_PATH_PATTERNS = [
     (r'^(?:all|overall|general)\s+stock\s+(?:levels?|overview)\s*$', "GET_STOCK_LEVELS"),
     (r'^(?:onyesha|angalia|tazama)\s+(?:hisa|stock)\s+(?:zote|yote)?\s*$', "GET_STOCK_LEVELS"),
     (r'^hisa\s+(?:za|ya|kwa)?\s*$', "GET_STOCK_LEVELS"),
-    
+
     # =========================================================
-    # CRITICAL: CHURN RISK PATTERNS
+    # CHURN RISK PATTERNS
     # =========================================================
     (r'(?:show|list|get|view|display)\s+(?:customers|wateja)\s+(?:at|with|having)\s+(?:churn|churn risk|risk|customer health)', "GET_CUSTOMER_HEALTH"),
     (r'(?:churn\s+risk|customer\s+health|health\s+score).*(?:customers|wateja)', "GET_CUSTOMER_HEALTH"),
@@ -198,13 +283,13 @@ FAST_PATH_PATTERNS = [
     (r'(?:high|medium|low)\s+risk\s+customers', "GET_CUSTOMER_HEALTH"),
     (r'wateja\s+walio\s+katika\s+hatari', "GET_CUSTOMER_HEALTH"),
     (r'afya\s+ya\s+mteja', "GET_CUSTOMER_HEALTH"),
-    
+
     # =========================================================
     # Swahili greeting patterns
     # =========================================================
     (r'^(?:mambo|habari|sasa|vipi|jambo|hujambo|shikamoo|poa)(?:\s|$)', "GREETING", "sw"),
     (r'^(?:nzuri|salama|njema|sawa|fresh)(?:\s|$)', "GREETING", "sw"),
-    
+
     # =========================================================
     # Quotation creation patterns
     # =========================================================
@@ -217,7 +302,7 @@ FAST_PATH_PATTERNS = [
     (r'^make\s+quotation$', "CREATE_QUOTATION"),
     (r'^unda\s+(?:nukuu|quote)\s+(?:kwa|ya|kwa ajili ya)?\s*([A-Za-z0-9\s]+)', "CREATE_QUOTATION"),
     (r'^nukuu\s+(?:mpya)?\s*(?:kwa)?\s*([A-Za-z0-9\s]+)', "CREATE_QUOTATION"),
-    
+
     # =========================================================
     # Company Info
     # =========================================================
@@ -227,14 +312,14 @@ FAST_PATH_PATTERNS = [
     (r'^what\s+is\s+leysco\s*$', "COMPANY_INFO"),
     (r'^who\s+is\s+leysco\s*$', "COMPANY_INFO"),
     (r'^about\s+leysco\s*$', "COMPANY_INFO"),
-    
+
     # =========================================================
     # Top Selling & Analytics
     # =========================================================
     (r'^(?:show|get|list)\s+(?:top|best)\s+(?:selling|sellers)\s+(?:items|products)$', "GET_TOP_SELLING_ITEMS"),
     (r'^(?:top|best)\s+(\d+)\s+(?:selling|sellers)\s+(?:items|products)$', "GET_TOP_SELLING_ITEMS"),
     (r'^(?:show|get|list)\s+(?:slow|least)\s+(?:moving|selling)\s+(?:items|products)$', "GET_SLOW_MOVING_ITEMS"),
-    
+
     # =========================================================
     # Sales Analytics & Reporting
     # =========================================================
@@ -244,14 +329,14 @@ FAST_PATH_PATTERNS = [
     (r'^sales\s+(?:performance|metrics|statistics|insights|trends)$', "GET_SALES_ANALYTICS"),
     (r'^(?:monthly|weekly|daily|yearly|quarterly)\s+sales$', "GET_SALES_ANALYTICS"),
     (r'^(?:what|show me)\s+(?:are\s+)?(?:my\s+)?(?:total|gross|net)\s+sales$', "GET_SALES_ANALYTICS"),
-    
+
     # Price patterns
     (r'^(price|bei)\s+(of|ya)?\s*([a-zA-Z0-9\-\(\)\s]+)$', "GET_ITEM_PRICE"),
     (r'^(stock|hisa)\s+(level|kiwango)?\s*(for|of|ya)?\s*([a-zA-Z0-9\-\(\)\s]{3,})$', "GET_STOCK_LEVELS"),
     (r'^(show|list|onyesha|orodhesha)\s+(me)?\s*(customers|wateja)$', "GET_CUSTOMERS"),
     (r'^(show|list|onyesha|orodhesha)\s+(me)?\s*(items|bidhaa)$', "GET_ITEMS"),
     (r'^low\s+stock\s+(alert|arifa)$', "GET_LOW_STOCK_ALERTS"),
-    
+
     # Price query patterns
     (r'^(what|whats|what\'s)\s+is\s+the\s+price\s+of\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_ITEM_PRICE"),
     (r'^(what|whats|what\'s)\s+is\s+the\s+cost\s+of\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_ITEM_PRICE"),
@@ -262,24 +347,24 @@ FAST_PATH_PATTERNS = [
     (r'^i\'?d\s+like\s+to\s+know\s+the\s+price\s+of\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_ITEM_PRICE"),
     (r'^price\s+of\s+([a-zA-Z0-9\-\(\)\s]+)\??$', "GET_ITEM_PRICE"),
     (r'^bei\s+ya\s+([a-zA-Z0-9\-\(\)\s]+)\??$', "GET_ITEM_PRICE"),
-    
+
     # Conversational greetings (English)
     (r'^(?:hi|hello|hey|good morning|good afternoon|good evening|howdy|sup|yo)(?:\s|$)', "GREETING", "en"),
-    
+
     # Conversational greetings (Swahili)
     (r'^(?:jambo|habari|mambo|sasa|vipi|hujambo|shikamoo|poa|fresh)(?:\s|$)', "GREETING", "sw"),
-    
+
     (r'^(?:thanks|thank you|appreciate it|nice one|good one|asante|shukran)(?:\s|$)', "THANKS"),
-    
+
     # Help queries
     (r'^(?:help|what can you do|how do i use this|capabilities|what do you do)(?:\s|\?)?$', "FAQ"),
     (r'^(?:msaada|unaweza kufanya nini|unafanya nini|uwezo wako)(?:\s|\?)?$', "FAQ"),
-    
+
     # Warehouse queries
     (r'^(?:show|list|where are).*(?:warehouses?|maghala|storage|depots?)$', "GET_WAREHOUSES"),
     (r'^(?:what|which).*(?:warehouses?|maghala).*(?:have|has|stock|hisa).*(?:for|of|ya)\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_WAREHOUSE_STOCK"),
     (r'^(?:onyesha|orodhesha|wapi)\s+(?:maghala|warehouses|ghala)\s*$', "GET_WAREHOUSES"),
-    
+
     # Low stock alerts
     (r'^(?:what|which).*(?:low|critical|danger).*(?:stock|inventory|hisa|items|bidhaa).*(?:alert|alerts?|warning|arifa)$', "GET_LOW_STOCK_ALERTS"),
     (r'^(?:what\'?s|what is).*(?:low|running low|almost out)$', "GET_LOW_STOCK_ALERTS"),
@@ -317,32 +402,32 @@ class IntentClassifier:
     def _detect_language(self, message: str) -> str:
         """Detect if the message is in Swahili or English."""
         message_lower = message.lower().strip()
-        
+
         swahili_score = 0
         english_score = 0
-        
+
         for greeting in _SWAHILI_GREETINGS:
             if greeting in message_lower:
                 swahili_score += 3
-        
+
         for word in _SWAHILI_WORDS:
             if word in message_lower:
                 swahili_score += 1
-        
+
         for phrase in _SWAHILI_QUESTION_PHRASES:
             if phrase in message_lower:
                 swahili_score += 2
-        
+
         english_indicators = ["the", "this", "that", "these", "those", "please", "help", "show", "list"]
         for word in english_indicators:
             if word in message_lower:
                 english_score += 1
-        
+
         if len(message_lower.split()) <= 3:
             for greeting in _SWAHILI_GREETINGS:
                 if greeting == message_lower or message_lower.startswith(greeting):
                     return "sw"
-        
+
         if swahili_score > english_score and swahili_score >= 2:
             return "sw"
         elif english_score > swahili_score:
@@ -357,7 +442,62 @@ class IntentClassifier:
         """Direct pattern matching for common phrases before LLM."""
         message_lower = message.lower().strip()
         language = self._detect_language(message)
-        
+
+        # =====================================================================
+        # FIX: Customer detail queries MUST be checked first.
+        # Without this guard, queries like "customer details for Mahakali
+        # Enterprises" fall through to the purchase phrase check (or the LLM),
+        # which incorrectly returns GET_PURCHASE_ORDERS.
+        # =====================================================================
+        for pattern in _CUSTOMER_DETAIL_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                logger.info(f"Direct intent match (customer detail): '{message}' → GET_CUSTOMER_DETAILS")
+                return ("GET_CUSTOMER_DETAILS", {}, language)
+
+        # Check for invoice queries
+        if any(phrase in message_lower for phrase in _INVOICE_PHRASES):
+            if "overdue" in message_lower or "past due" in message_lower:
+                return ("GET_OVERDUE_INVOICES", {}, language)
+            if "balance" in message_lower:
+                return ("GET_CUSTOMER_BALANCE", {}, language)
+            if "reminder" in message_lower:
+                return ("SEND_PAYMENT_REMINDER", {}, language)
+            return ("GET_AR_INVOICES", {}, language)
+
+        # Check for purchase queries
+        if any(phrase in message_lower for phrase in _PURCHASE_PHRASES):
+            if "create" in message_lower or "make" in message_lower or "new" in message_lower:
+                return ("CREATE_PURCHASE_ORDER", {}, language)
+            if "approve" in message_lower:
+                return ("APPROVE_PURCHASE_ORDER", {}, language)
+            if "request" in message_lower:
+                return ("GET_PURCHASE_REQUESTS", {}, language)
+            if "receipt" in message_lower:
+                return ("GET_GOODS_RECEIPT_PO", {}, language)
+            return ("GET_PURCHASE_ORDERS", {}, language)
+
+        # Check for inventory movement queries
+        if any(phrase in message_lower for phrase in _INVENTORY_MOVEMENT_PHRASES):
+            if "transfer" in message_lower or "move" in message_lower:
+                return ("CREATE_STOCK_TRANSFER", {}, language)
+            if "issue" in message_lower or "dispatch" in message_lower:
+                return ("CREATE_GOODS_ISSUE", {}, language)
+            if "receipt" in message_lower or "receive" in message_lower:
+                return ("CREATE_GOODS_RECEIPT", {}, language)
+            if "reorder" in message_lower:
+                return ("GET_REORDER_REPORT", {}, language)
+            if "allocate" in message_lower or "reserve" in message_lower:
+                return ("ALLOCATE_STOCK", {}, language)
+
+        # Check for document transitions
+        if any(phrase in message_lower for phrase in _DOCUMENT_TRANSITION_PHRASES):
+            if "convert" in message_lower and "quotation" in message_lower:
+                return ("CONVERT_QUOTATION_TO_ORDER", {}, language)
+            if "post" in message_lower and "invoice" in message_lower:
+                return ("POST_INVOICE", {}, language)
+            if "approve" in message_lower and "purchase" in message_lower:
+                return ("APPROVE_PURCHASE_ORDER", {}, language)
+
         # Direct check for item browsing
         browse_patterns = [
             r'^(?:show|list|display|view|get|browse|find|fetch|see|check)\s+me\s+(?:all\s+)?(?:items|products|inventory|stock)',
@@ -370,19 +510,19 @@ class IntentClassifier:
             r'^show\s+me\s+(?:the\s+)?(?:items|products)',
             r'^list\s+items$',
         ]
-        
+
         for pattern in browse_patterns:
             if re.search(pattern, message_lower, re.IGNORECASE):
                 logger.info(f"Direct intent match: '{message}' → GET_ITEMS")
                 return ("GET_ITEMS", {}, language)
-        
+
         # Check for greetings
         if any(w in message_lower for w in _SWAHILI_GREETINGS):
             return ("GREETING", {}, "sw")
-        
+
         if any(w in message_lower for w in ["hi", "hello", "hey", "good morning", "good afternoon"]):
             return ("GREETING", {}, "en")
-        
+
         return None
 
     # -------------------------------------------------------------------------
@@ -391,68 +531,80 @@ class IntentClassifier:
     def _try_fast_path(self, message: str) -> Optional[Tuple[str, dict, str]]:
         """Try to classify using fast-path patterns (no LLM call)."""
         message_lower = message.lower().strip()
-        
+
         cache_key = f"fast_path:{message_lower}"
         if cache_key in self._fast_path_cache:
             return self._fast_path_cache[cache_key]
-        
+
         detected_language = self._detect_language(message)
-        
+
         for phrase in _STOCK_LEVELS_GENERAL_PHRASES:
             if phrase in message_lower:
                 result = ("GET_STOCK_LEVELS", {}, detected_language)
                 self._fast_path_cache[cache_key] = result
                 return result
-        
+
         for pattern_tuple in FAST_PATH_PATTERNS:
             if len(pattern_tuple) == 2:
                 pattern, intent = pattern_tuple
                 pattern_lang = None
             else:
                 pattern, intent, pattern_lang = pattern_tuple
-            
+
             if pattern_lang and pattern_lang != detected_language and detected_language != "en":
                 continue
-                
+
             match = re.match(pattern, message_lower, re.IGNORECASE)
             if match:
                 entities = {}
                 groups = match.groups()
-                
+
                 if intent == "CREATE_QUOTATION" and len(groups) >= 2:
                     entities["customer_name"] = groups[0].strip()
-                
+                elif intent == "CREATE_PURCHASE_ORDER" and len(groups) >= 2:
+                    entities["vendor_name"] = groups[0].strip()
+                elif intent == "GET_CUSTOMER_BALANCE" and groups:
+                    entities["customer_name"] = groups[0].strip()
+                elif intent == "SEND_PAYMENT_REMINDER" and groups:
+                    entities["customer_name"] = groups[0].strip()
+                elif intent == "CONVERT_QUOTATION_TO_ORDER" and groups:
+                    entities["doc_num"] = groups[0].strip()
+                elif intent == "POST_INVOICE" and groups:
+                    entities["doc_num"] = groups[0].strip()
+                elif intent == "APPROVE_PURCHASE_ORDER" and groups:
+                    entities["doc_num"] = groups[0].strip()
+                elif intent == "CREATE_STOCK_TRANSFER" and len(groups) >= 3:
+                    entities["from_warehouse"] = groups[0].strip()
+                    entities["to_warehouse"] = groups[1].strip()
+
                 result = (intent, entities, detected_language)
                 self._fast_path_cache[cache_key] = result
                 return result
-        
+
         return None
 
     # -------------------------------------------------------------------------
-    # SAFE JSON PARSER (FIXED)
+    # SAFE JSON PARSER
     # -------------------------------------------------------------------------
     def _extract_json(self, text: str) -> dict | None:
         """Safely extract JSON from LLM response."""
         try:
             if not text or not text.strip():
                 return None
-            
+
             clean_text = text.strip()
-            
-            # Try direct JSON parsing first
+
             try:
                 return json.loads(clean_text)
             except json.JSONDecodeError:
                 pass
-            
-            # Find JSON object - simple pattern
+
             json_match = re.search(r'\{[^{}]*\}', clean_text, re.DOTALL)
             if json_match:
-                json_str = json_match.group(0)
-                json_str = json_str.strip()
+                json_str = json_match.group(0).strip()
                 json_str = json_str.replace(',}', '}')
                 json_str = json_str.replace(', ]', ']')
-                
+
                 try:
                     return json.loads(json_str)
                 except json.JSONDecodeError:
@@ -461,12 +613,11 @@ class IntentClassifier:
                         intent_value = intent_match.group(1).strip()
                         if intent_value in _VALID_INTENTS_SET:
                             return {"intent": intent_value}
-            
-            # Fallback: look for intent as plain word
+
             for intent in _VALID_INTENTS_SET:
                 if re.search(rf'\b{intent}\b', clean_text, re.IGNORECASE):
                     return {"intent": intent}
-            
+
             return None
         except Exception as e:
             logger.warning(f"JSON extraction error: {e}")
@@ -479,47 +630,88 @@ class IntentClassifier:
     def _rule_based_intent(self, text: str) -> str:
         """Cached rule-based intent detection."""
         text = text.lower().strip()
-        
-        # Check for item browsing
+
+        # Customer detail check first (mirrors _check_direct_intents priority)
+        for pattern in _CUSTOMER_DETAIL_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return "GET_CUSTOMER_DETAILS"
+
+        # Invoice intents
+        if any(phrase in text for phrase in _INVOICE_PHRASES):
+            if "overdue" in text:
+                return "GET_OVERDUE_INVOICES"
+            if "balance" in text:
+                return "GET_CUSTOMER_BALANCE"
+            return "GET_AR_INVOICES"
+
+        # Purchase intents
+        if any(phrase in text for phrase in _PURCHASE_PHRASES):
+            if "create" in text or "make" in text:
+                return "CREATE_PURCHASE_ORDER"
+            if "request" in text:
+                return "GET_PURCHASE_REQUESTS"
+            if "receipt" in text:
+                return "GET_GOODS_RECEIPT_PO"
+            if "approve" in text:
+                return "APPROVE_PURCHASE_ORDER"
+            return "GET_PURCHASE_ORDERS"
+
+        # Inventory movement intents
+        if any(phrase in text for phrase in _INVENTORY_MOVEMENT_PHRASES):
+            if "transfer" in text:
+                return "CREATE_STOCK_TRANSFER"
+            if "issue" in text:
+                return "CREATE_GOODS_ISSUE"
+            if "receipt" in text:
+                return "CREATE_GOODS_RECEIPT"
+            if "reorder" in text:
+                return "GET_REORDER_REPORT"
+            return "CREATE_GOODS_RECEIPT"
+
+        # Document transitions
+        if "convert" in text and "quotation" in text:
+            return "CONVERT_QUOTATION_TO_ORDER"
+        if "post" in text and "invoice" in text:
+            return "POST_INVOICE"
+
+        # Item browsing
         browse_keywords = ['browse', 'show', 'list', 'view', 'display', 'get', 'see', 'check']
         if any(kw in text for kw in browse_keywords) and any(t in text for t in ['items', 'products', 'inventory', 'stock']):
             return "GET_ITEMS"
-        
+
         if text in ['items', 'products', 'inventory', 'stock', 'list', 'show']:
             return "GET_ITEMS"
-        
+
         if any(phrase in text for phrase in _STOCK_LEVELS_GENERAL_PHRASES):
             return "GET_STOCK_LEVELS"
-        
+
         if any(phrase in text for phrase in _CHURN_RISK_PHRASES):
             return "GET_CUSTOMER_HEALTH"
-        
+
         if 'quotation' in text or 'quote' in text or 'nukuu' in text:
             if any(w in text for w in ['create', 'make', 'generate', 'prepare', 'new', 'unda', 'mpya']):
                 return "CREATE_QUOTATION"
-        
+
         if any(p in text for p in TOP_SELLING_PHRASES):
             return "GET_TOP_SELLING_ITEMS"
-        
+
         if any(p in text for p in SALES_ANALYTICS_PHRASES):
             return "GET_SALES_ANALYTICS"
-        
+
         if any(p in text for p in SLOW_MOVING_PHRASES):
             return "GET_SLOW_MOVING_ITEMS"
-        
-        # Price queries
+
         if any(p in text for p in ['price', 'cost', 'bei', 'how much', 'gharama']):
             if re.search(r'(?:for|kwa|ya)\s+([A-Za-z][A-Za-z\s]+)$', text):
                 return "GET_CUSTOMER_PRICE"
             return "GET_ITEM_PRICE"
-        
-        # Greetings
+
         if any(w in text for w in _SWAHILI_GREETINGS):
             return "GREETING"
-        
+
         if any(w in text for w in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
             return "GREETING"
-        
+
         return "UNKNOWN"
 
     # -------------------------------------------------------------------------
@@ -527,7 +719,7 @@ class IntentClassifier:
     # -------------------------------------------------------------------------
     def _clarify_suggestions(self, text: str, language: str = "en") -> list[str]:
         sw = language == "sw"
-        
+
         if sw:
             return ["Angalia bei ya bidhaa", "Angalia hisa", "Unda nukuu", "Onyesha wateja", "Bidhaa zinazouzwa sana"]
         return ["Check item price", "Check stock levels", "Create a quotation", "Show customers", "Top selling items"]
@@ -579,11 +771,11 @@ class IntentClassifier:
             logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {language})")
             return result
 
-        # Step 5: AI classification (only if needed)
+        # Step 5: AI classification (only if all rule-based methods failed)
         try:
             prompt = self.prompt_manager.get_intent_prompt(user_message)
             response = await self.llm.generate_async(prompt)
-            
+
             if response and response.strip():
                 data = self._extract_json(response)
                 if data:

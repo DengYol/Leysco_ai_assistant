@@ -289,8 +289,12 @@ class ConversationEnhancer:
         """Generate hash from data for cache key."""
         if not data:
             return "none"
-        # Simple hash of first few items
         import json
+        # FIX: data can be a dict (e.g. single customer detail result) or any
+        # non-list type. Wrapping in a list before slicing prevents:
+        #   TypeError: unhashable type: 'slice'
+        if not isinstance(data, list):
+            data = [data]
         data_str = json.dumps(data[:5] if len(data) > 5 else data, default=str)
         return hashlib.md5(data_str.encode()).hexdigest()[:16]
 
@@ -407,7 +411,12 @@ class ConversationEnhancer:
         """Generate a summary of the data found"""
         if not data:
             return None
-        
+
+        # FIX: guard against non-list data (e.g. single dict from GET_CUSTOMER_DETAILS).
+        # len() and slicing on a plain dict counts keys, not records — wrap it first.
+        if not isinstance(data, list):
+            data = [data]
+
         count = len(data)
         s = "s" if count != 1 else ""
         

@@ -15,8 +15,13 @@ class QueryRewriter:
     """
 
     def __init__(self):
-        # Price-related patterns
+        # =========================================================
+        # CRITICAL: PRICE-RELATED PATTERNS - HIGHEST PRIORITY
+        # =========================================================
         self.price_patterns = [
+            (r"^(?:what is|what\'s|whats)\s+the\s+price\s+of\s+(.+)", "price"),
+            (r"^(?:price|cost|bei|gharama)\s+(?:of|ya)?\s*(.+)", "price"),
+            (r"^how\s+much\s+(?:is|does)\s+(.+)\s+(?:cost|price)?$", "price"),
             (r"(?:how much|what'?s the price|how much is|price of|cost of|bei ya|gharama ya)\s+(.+)", "price"),
             (r"(.+)\s+(?:price|cost|bei|gharama)", "price"),
             (r"(?:expensive|cheap|costly)\s+(.+)", "price"),
@@ -33,6 +38,63 @@ class QueryRewriter:
             (r"(.+)\s+(?:stock|inventory|hisa)", "stock"),
         ]
 
+        # =========================================================
+        # INVOICE PATTERNS
+        # =========================================================
+        self.invoice_patterns = [
+            (r"(?:show|list|get|view|display)\s+(?:ar|sales|customer)?\s*invoices?\s*(?:for\s+([A-Za-z0-9\s]+))?", "ar_invoices"),
+            (r"(?:overdue|past due|late)\s+invoices?\s*(?:for\s+([A-Za-z0-9\s]+))?", "overdue_invoices"),
+            (r"(?:customer\s+balance|balance\s+for|what does)\s+([A-Za-z0-9\s]+)\s+owe", "customer_balance"),
+            (r"(?:send|email)\s+(?:payment\s+)?reminder\s+(?:to|for)\s+([A-Za-z0-9\s]+)", "payment_reminder"),
+            (r"(?:aging|invoice aging)\s+report", "aging_report"),
+            (r"(?:who\s+owes|outstanding\s+payments|unpaid\s+bills)", "overdue_invoices"),
+        ]
+
+        # =========================================================
+        # PURCHASE PATTERNS - LOWER PRIORITY
+        # =========================================================
+        self.purchase_patterns = [
+            (r"^(?:show|list|get)\s+(?:purchase\s+)?orders?\s*(?:for\s+([A-Za-z0-9\s]+))?$", "purchase_orders"),
+            (r"create\s+(?:a\s+)?purchase\s+order\s+(?:for\s+)?([A-Za-z0-9\s]+)(?:\s+with\s+|\s+containing\s+)(.+)", "create_purchase_order"),
+            (r"create\s+purchase\s+order$", "create_purchase_order"),
+            (r"(?:show|list|get)\s+(?:purchase\s+)?requests?", "purchase_requests"),
+            (r"(?:goods|stock)\s+receipt\s+(?:for\s+po\s+)?(\d+)", "goods_receipt"),
+            (r"approve\s+(?:purchase\s+)?order\s+(\d+)", "approve_purchase_order"),
+        ]
+
+        # =========================================================
+        # INVENTORY MOVEMENT PATTERNS
+        # =========================================================
+        self.inventory_movement_patterns = [
+            (r"create\s+(?:a\s+)?(?:goods|stock)\s+issue\s+(?:from\s+)?([A-Z0-9]+)?\s+for\s+(.+)", "goods_issue"),
+            (r"create\s+(?:a\s+)?(?:goods|stock)\s+receipt\s+(?:from\s+po\s+(\d+)|for\s+(.+))", "goods_receipt"),
+            (r"transfer\s+stock\s+from\s+([A-Z0-9]+)\s+to\s+([A-Z0-9]+)\s+for\s+(.+)", "stock_transfer"),
+            (r"(?:what|which)\s+needs\s+reordering", "reorder_report"),
+            (r"(?:allocate|reserve)\s+stock\s+for\s+order\s+(\d+)", "allocate_stock"),
+            (r"inventory\s+valuation|stock\s+value|worth\s+of\s+inventory", "inventory_valuation"),
+        ]
+
+        # =========================================================
+        # DOCUMENT TRANSITION PATTERNS
+        # =========================================================
+        self.document_transition_patterns = [
+            (r"convert\s+(?:quotation|quote)\s+(\d+)\s+to\s+(?:order|sales order)", "convert_quotation"),
+            (r"convert\s+it\s+to\s+order", "convert_quotation"),
+            (r"post\s+invoice\s+for\s+delivery\s+(\d+)", "post_invoice"),
+            (r"post\s+the\s+invoice", "post_invoice"),
+            (r"cancel\s+(?:order|quotation|purchase order)\s+(\d+)", "cancel_document"),
+            (r"reverse\s+(?:goods receipt|transfer)\s+(\d+)", "reverse_document"),
+        ]
+
+        # =========================================================
+        # BUSINESS RULES PATTERNS
+        # =========================================================
+        self.business_rules_patterns = [
+            (r"check\s+credit\s+limit\s+for\s+([A-Za-z0-9\s]+)", "credit_limit"),
+            (r"(?:is|check)\s+stock\s+available\s+for\s+(.+)", "stock_availability"),
+            (r"(?:does|can)\s+([A-Za-z0-9\s]+)\s+need\s+approval", "approval_check"),
+        ]
+
         # Critical: Churn risk / Customer health patterns (HIGH PRIORITY)
         self.churn_risk_patterns = [
             (r"(?:show|customer|list|get|find)\s+customers?\s+(?:at|with|having)?\s+(?:churn\s+risk|churn risk|risk)", "customer_health"),
@@ -44,9 +106,7 @@ class QueryRewriter:
             (r"afya\s+ya\s+wateja", "customer_health"),
         ]
 
-        # Warehouse-related patterns (FIXED: added before stock patterns so
-        # "view warehouse stock" / "warehouse stock" routes to GET_WAREHOUSES
-        # rather than being mangled into "stock of view warehouse?")
+        # Warehouse-related patterns
         self.warehouse_patterns = [
             (r"(?:view|show|list|get|display|see)\s+(?:all\s+)?warehouse(?:s)?\s*(?:stock|inventory|items)?", "warehouses"),
             (r"warehouse(?:s)?\s+(?:stock|inventory|list|summary|overview|report)", "warehouses"),
@@ -152,6 +212,16 @@ class QueryRewriter:
             "GET_CUSTOMER_ORDERS": "customer orders for",
             "GET_WAREHOUSES": "show warehouses",
             "FIND_CUSTOMERS_BY_ITEM": "customers who buy",
+            "GET_AR_INVOICES": "show invoices",
+            "GET_OVERDUE_INVOICES": "overdue invoices",
+            "GET_CUSTOMER_BALANCE": "customer balance for",
+            "SEND_PAYMENT_REMINDER": "send reminder to",
+            "GET_PURCHASE_ORDERS": "purchase orders",
+            "CREATE_PURCHASE_ORDER": "create purchase order for",
+            "GET_REORDER_REPORT": "what needs reordering",
+            "CREATE_STOCK_TRANSFER": "transfer stock",
+            "CONVERT_QUOTATION_TO_ORDER": "convert quotation to order",
+            "POST_INVOICE": "post invoice for",
         }
 
     def rewrite(self, message: str) -> Tuple[str, str, Optional[dict]]:
@@ -166,7 +236,19 @@ class QueryRewriter:
         detected_intent = None
         extracted_entities = {}
 
-        # Step 0: Check for PROTECTED patterns FIRST (don't rewrite these)
+        # =========================================================
+        # STEP 0: CHECK FOR PRICE QUERIES FIRST (CRITICAL!)
+        # =========================================================
+        for pattern, _ in self.price_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                item_name = self._extract_item_name(match.group(1) if match.groups() else message)
+                if item_name:
+                    extracted_entities = {"item_name": item_name}
+                    logger.info(f"Price pattern detected: '{original}' → intent: GET_ITEM_PRICE (item: {item_name})")
+                    return f"price of {item_name}", "GET_ITEM_PRICE", extracted_entities
+
+        # Step 1: Check for PROTECTED patterns
         protected_patterns = [
             (self.churn_risk_patterns, "GET_CUSTOMER_HEALTH"),
         ]
@@ -177,30 +259,147 @@ class QueryRewriter:
                     logger.info(f"Protected pattern detected: '{original}' → intent: {intent_type}")
                     return original, intent_type, {}
 
-        # Step 0b: FIXED — check warehouse patterns before any rewriting so
-        # queries like "View warehouse stock" or "warehouse stock" are not
-        # first transformed into "stock of view warehouse?" by the stock
-        # patterns, which then confuses the warehouse entity extractor.
+        # Step 2: Check for INVOICE patterns
+        for pattern, inv_type in self.invoice_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if match.groups() and match.group(1):
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
+                
+                if inv_type == "overdue_invoices":
+                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_OVERDUE_INVOICES")
+                    return f"overdue invoices for {entities.get('customer_name', '')}".strip(), "GET_OVERDUE_INVOICES", entities
+                elif inv_type == "customer_balance":
+                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_CUSTOMER_BALANCE")
+                    return f"customer balance for {entities.get('customer_name', '')}".strip(), "GET_CUSTOMER_BALANCE", entities
+                elif inv_type == "payment_reminder":
+                    logger.info(f"Invoice pattern detected: '{original}' → intent: SEND_PAYMENT_REMINDER")
+                    return f"send reminder to {entities.get('customer_name', '')}".strip(), "SEND_PAYMENT_REMINDER", entities
+                elif inv_type == "aging_report":
+                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_AGING_REPORT")
+                    return "aging report", "GET_AGING_REPORT", {}
+                else:
+                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_AR_INVOICES")
+                    return f"show invoices for {entities.get('customer_name', '')}".strip(), "GET_AR_INVOICES", entities
+
+        # Step 3: Check for PURCHASE patterns (only if not a price query)
+        for pattern, po_type in self.purchase_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if po_type == "create_purchase_order" and match.groups():
+                    if len(match.groups()) >= 2:
+                        entities["vendor_name"] = self._extract_customer_name(match.group(1))
+                        entities["items_raw"] = match.group(2)
+                    elif match.groups():
+                        entities["vendor_name"] = self._extract_customer_name(match.group(1))
+                    logger.info(f"Purchase pattern detected: '{original}' → intent: CREATE_PURCHASE_ORDER")
+                    return message, "CREATE_PURCHASE_ORDER", entities
+                elif po_type == "purchase_orders" and match.groups() and match.group(1):
+                    entities["vendor_name"] = self._extract_customer_name(match.group(1))
+                    return f"purchase orders for {entities['vendor_name']}", "GET_PURCHASE_ORDERS", entities
+                elif po_type == "purchase_requests":
+                    return "purchase requests", "GET_PURCHASE_REQUESTS", {}
+                elif po_type == "goods_receipt" and match.groups():
+                    entities["po_num"] = match.group(1)
+                    return f"goods receipt for po {entities['po_num']}", "GET_GOODS_RECEIPT_PO", entities
+                elif po_type == "approve_purchase_order" and match.groups():
+                    entities["po_num"] = match.group(1)
+                    return f"approve purchase order {entities['po_num']}", "APPROVE_PURCHASE_ORDER", entities
+                else:
+                    logger.info(f"Purchase pattern detected: '{original}' → intent: GET_PURCHASE_ORDERS")
+                    return "purchase orders", "GET_PURCHASE_ORDERS", {}
+
+        # Step 4: Check for INVENTORY MOVEMENT patterns
+        for pattern, inv_type in self.inventory_movement_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if inv_type == "goods_issue" and match.groups():
+                    if len(match.groups()) >= 2:
+                        entities["warehouse"] = match.group(1) if match.group(1) else "MAIN"
+                        entities["items_raw"] = match.group(2)
+                    logger.info(f"Inventory movement pattern detected: '{original}' → intent: CREATE_GOODS_ISSUE")
+                    return message, "CREATE_GOODS_ISSUE", entities
+                elif inv_type == "goods_receipt":
+                    if match.groups():
+                        if match.group(1):  # PO number
+                            entities["po_num"] = match.group(1)
+                            logger.info(f"Inventory movement pattern detected: '{original}' → intent: CREATE_GOODS_RECEIPT")
+                            return f"create goods receipt for po {entities['po_num']}", "CREATE_GOODS_RECEIPT", entities
+                        elif match.group(2):
+                            entities["items_raw"] = match.group(2)
+                    return message, "CREATE_GOODS_RECEIPT", entities
+                elif inv_type == "stock_transfer" and len(match.groups()) >= 3:
+                    entities["from_warehouse"] = match.group(1)
+                    entities["to_warehouse"] = match.group(2)
+                    entities["items_raw"] = match.group(3)
+                    logger.info(f"Inventory movement pattern detected: '{original}' → intent: CREATE_STOCK_TRANSFER")
+                    return message, "CREATE_STOCK_TRANSFER", entities
+                elif inv_type == "reorder_report":
+                    return "what needs reordering", "GET_REORDER_REPORT", {}
+                elif inv_type == "allocate_stock" and match.groups():
+                    entities["order_num"] = match.group(1)
+                    return f"allocate stock for order {entities['order_num']}", "ALLOCATE_STOCK", entities
+                elif inv_type == "inventory_valuation":
+                    return "inventory valuation", "GET_INVENTORY_VALUATION", {}
+
+        # Step 5: Check for DOCUMENT TRANSITION patterns
+        for pattern, trans_type in self.document_transition_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if trans_type == "convert_quotation":
+                    if match.groups() and match.group(1):
+                        entities["doc_num"] = match.group(1)
+                    logger.info(f"Document transition pattern detected: '{original}' → intent: CONVERT_QUOTATION_TO_ORDER")
+                    return message, "CONVERT_QUOTATION_TO_ORDER", entities
+                elif trans_type == "post_invoice":
+                    if match.groups() and match.group(1):
+                        entities["doc_num"] = match.group(1)
+                    logger.info(f"Document transition pattern detected: '{original}' → intent: POST_INVOICE")
+                    return message, "POST_INVOICE", entities
+                elif trans_type == "cancel_document" and match.groups():
+                    entities["doc_num"] = match.group(1)
+                    return f"cancel document {entities['doc_num']}", "CANCEL_DOCUMENT", entities
+                elif trans_type == "reverse_document" and match.groups():
+                    entities["doc_num"] = match.group(1)
+                    return f"reverse document {entities['doc_num']}", "REVERSE_DOCUMENT", entities
+
+        # Step 6: Check for BUSINESS RULES patterns
+        for pattern, rule_type in self.business_rules_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if rule_type == "credit_limit" and match.groups():
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
+                    return f"check credit limit for {entities['customer_name']}", "CHECK_CREDIT_LIMIT", entities
+                elif rule_type == "stock_availability" and match.groups():
+                    entities["item_name"] = self._extract_item_name(match.group(1))
+                    return f"check stock availability for {entities['item_name']}", "CHECK_STOCK_AVAILABILITY", entities
+
+        # Step 7: Check warehouse patterns
         for pattern, _ in self.warehouse_patterns:
             if re.search(pattern, message, re.IGNORECASE):
                 logger.info(f"Warehouse pattern detected: '{original}' → intent: GET_WAREHOUSES")
                 return "show warehouses?", "GET_WAREHOUSES", {}
 
-        # Step 1: Fix common misspellings
+        # Step 8: Fix common misspellings
         rewritten = self._fix_misspellings(rewritten)
 
-        # Step 2: Try to detect intent and extract entities
+        # Step 9: Try to detect intent and extract entities
         detected_intent, extracted_entities = self._detect_intent_and_extract(rewritten)
 
-        # Step 3: Rewrite based on detected intent
+        # Step 10: Rewrite based on detected intent
         if detected_intent:
             rewritten = self._rewrite_for_intent(rewritten, detected_intent, extracted_entities)
 
-        # Step 4: If no intent detected, try pattern matching
+        # Step 11: If no intent detected, try pattern matching
         if not detected_intent:
             detected_intent, rewritten, extracted_entities = self._pattern_based_rewrite(rewritten)
 
-        # Step 5: Clean up the rewritten query
+        # Step 12: Clean up the rewritten query
         rewritten = self._clean_query(rewritten)
 
         if rewritten != original:
@@ -322,14 +521,7 @@ class QueryRewriter:
         return None
 
     def _rewrite_for_intent(self, text: str, intent: str, entities: dict) -> str:
-        """Rewrite query into standard format for the detected intent.
-
-        IMPORTANT — CREATE_QUOTATION must never be rewritten to a shorter
-        form.  The full original text (including the 'with <items>' clause)
-        is needed by multi_turn_quotation._extract_items_from_message().
-        Truncating to just the customer name causes the item parser to find
-        nothing and start an empty draft instead of creating the quotation.
-        """
+        """Rewrite query into standard format for the detected intent."""
         standard_phrase = self.intent_phrases.get(intent, "")
 
         if intent == "GET_ITEM_PRICE" and entities.get("item_name"):
@@ -341,13 +533,26 @@ class QueryRewriter:
         if intent == "GET_CUSTOMER_ORDERS" and entities.get("customer_name"):
             return f"{standard_phrase} {entities['customer_name']}"
 
-        # CREATE_QUOTATION: return original text unchanged so the items
-        # clause ('with 3 vegimax 30ml') is preserved for the item parser.
+        if intent == "GET_CUSTOMER_BALANCE" and entities.get("customer_name"):
+            return f"{standard_phrase} {entities['customer_name']}"
+
+        if intent == "SEND_PAYMENT_REMINDER" and entities.get("customer_name"):
+            return f"{standard_phrase} {entities['customer_name']}"
+
+        if intent == "CREATE_PURCHASE_ORDER" and entities.get("vendor_name"):
+            return f"{standard_phrase} {entities['vendor_name']}"
+
+        # CREATE_QUOTATION: return original text unchanged
         if intent == "CREATE_QUOTATION":
             return text
 
-        # GET_CUSTOMER_HEALTH: preserve original text unchanged.
+        # GET_CUSTOMER_HEALTH: preserve original text unchanged
         if intent == "GET_CUSTOMER_HEALTH":
+            return text
+
+        # For document transitions, preserve original text
+        if intent in ["CONVERT_QUOTATION_TO_ORDER", "POST_INVOICE", "CREATE_STOCK_TRANSFER", 
+                      "CREATE_GOODS_ISSUE", "CREATE_GOODS_RECEIPT"]:
             return text
 
         return text
@@ -369,6 +574,9 @@ class QueryRewriter:
                 if item:
                     return "GET_STOCK_LEVELS", f"stock of {item}", {"item_name": item}
 
+            if "overdue" in text_lower or "invoice" in text_lower:
+                return "GET_OVERDUE_INVOICES", "overdue invoices", {}
+
         # How many/much patterns
         if text_lower.startswith("how many") or text_lower.startswith("how much"):
             if "stock" in text_lower or "available" in text_lower or "left" in text_lower:
@@ -388,8 +596,14 @@ class QueryRewriter:
             if "churn risk" in rest or "customer health" in rest or "at risk" in rest:
                 return "GET_CUSTOMER_HEALTH", text, {}
 
-            # FIXED: warehouse check before stock so "view warehouse stock"
-            # maps to GET_WAREHOUSES, not GET_STOCK_LEVELS
+            if "invoice" in rest:
+                if "overdue" in rest:
+                    return "GET_OVERDUE_INVOICES", "overdue invoices", {}
+                return "GET_AR_INVOICES", "show invoices", {}
+
+            if "purchase order" in rest or "po" in rest:
+                return "GET_PURCHASE_ORDERS", "purchase orders", {}
+
             if "warehouse" in rest or "warehouses" in rest:
                 return "GET_WAREHOUSES", "show warehouses", {}
 

@@ -3,6 +3,8 @@ app/services/conversation_memory.py
 ====================================
 Manages conversation context across multiple turns.
 Stores session data, remembers previous queries, and enables contextual understanding.
+
+UPDATED: Added chat persistence to save conversations to database
 """
 
 import json
@@ -10,6 +12,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from collections import deque
+from uuid import uuid4
 import hashlib
 
 from app.services.cache_service import get_cache_service
@@ -21,6 +24,8 @@ class ConversationMemory:
     """
     Stores and retrieves conversation context for each session.
     Enables AI to remember previous questions and answers.
+    
+    UPDATED: Now persists to PostgreSQL via ChatPersistenceService
     """
     
     # Maximum number of messages to keep per session
@@ -35,6 +40,19 @@ class ConversationMemory:
     def __init__(self):
         self.cache = get_cache_service()
         self._sessions = {}  # Fallback in-memory store
+        self.persistence = None  # Lazy load
+    
+    def _get_persistence_service(self):
+        """Get chat persistence service (lazy load to avoid circular imports)"""
+        if self.persistence is None:
+            try:
+                from app.services.chat_persistence_service import get_chat_persistence_service
+                self.persistence = get_chat_persistence_service()
+            except Exception as e:
+                logger.warning(f"⚠️ Chat persistence not available: {e}")
+                self.persistence = False  # Mark as unavailable
+        
+        return self.persistence if self.persistence else None
     
     def _get_session_key(self, session_id: str) -> str:
         """Generate cache key for session."""
@@ -84,11 +102,48 @@ class ConversationMemory:
         }
         
         self.cache.set_simple(cache_key, session, ttl=self.SESSION_TIMEOUT)
+        
+        # NEW: Persist session to database
+        self._create_session_in_db(session_id, user_id, tenant_code)
+        
         logger.info(f"✨ Created new session: {session_id}")
         
         return session
     
-    def add_message(self, session_id: str, role: str, content: str, data: Any = None) -> None:
+    def _create_session_in_db(self, session_id: str, user_id: str = None, tenant_code: str = None) -> None:
+        """Create session in database"""
+        try:
+            persistence = self._get_persistence_service()
+            if not persistence:
+                return
+            
+            # Use async context if available, otherwise log warning
+            import asyncio
+            try:
+                # Try to get running loop
+                loop = asyncio.get_running_loop()
+                # If we're in an async context, create task
+                asyncio.create_task(persistence.create_session(
+                    session_id=session_id,
+                    user_id=int(user_id) if user_id else 1,
+                    company_code=tenant_code or "UNKNOWN"
+                ))
+            except RuntimeError:
+                # No running loop, try to run it
+                try:
+                    asyncio.run(persistence.create_session(
+                        session_id=session_id,
+                        user_id=int(user_id) if user_id else 1,
+                        company_code=tenant_code or "UNKNOWN"
+                    ))
+                except Exception as e:
+                    logger.debug(f"Could not create session in DB (not critical): {e}")
+        
+        except Exception as e:
+            logger.debug(f"⚠️ Could not persist session: {e}")
+    
+    def add_message(self, session_id: str, role: str, content: str, data: Any = None, 
+                   intent: str = None, entities: Dict = None) -> None:
         """
         Add a message to conversation history.
         
@@ -97,13 +152,21 @@ class ConversationMemory:
             role: "user" or "assistant"
             content: Message text
             data: Optional structured data (e.g., API results)
+            intent: Optional intent from this message
+            entities: Optional entities from this message
         """
         session = self.get_or_create_session(session_id)
         
+        # Generate message ID
+        message_id = f"msg_{uuid4().hex[:12]}"
+        
         message = {
+            "id": message_id,
             "role": role,
             "content": content,
             "timestamp": datetime.now().isoformat(),
+            "intent": intent,
+            "entities": entities or {}
         }
         
         if data:
@@ -128,7 +191,61 @@ class ConversationMemory:
         session["last_activity"] = datetime.now().isoformat()
         
         self._save_session(session)
+        
+        # NEW: Save message to database
+        self._save_message_to_db(
+            message_id=message_id,
+            session_id=session_id,
+            user_id=session.get("user_id", 1),
+            role=role,
+            content=content,
+            intent=intent,
+            entities=entities
+        )
+        
         logger.info(f"📝 Added {role} message to session {session_id} (total: {session['message_count']})")
+    
+    def _save_message_to_db(self, message_id: str, session_id: str, user_id: str, role: str, 
+                           content: str, intent: str = None, entities: Dict = None) -> None:
+        """Save message to database"""
+        try:
+            persistence = self._get_persistence_service()
+            if not persistence:
+                return
+            
+            import asyncio
+            try:
+                # Try to get running loop
+                loop = asyncio.get_running_loop()
+                # If we're in an async context, create task
+                asyncio.create_task(persistence.save_message(
+                    message_id=message_id,
+                    session_id=session_id,
+                    user_id=int(user_id) if user_id else 1,
+                    role=role,
+                    content=content,
+                    intent=intent,
+                    entities=entities or {}
+                ))
+            except RuntimeError:
+                # No running loop, try to run it
+                try:
+                    asyncio.run(persistence.save_message(
+                        message_id=message_id,
+                        session_id=session_id,
+                        user_id=int(user_id) if user_id else 1,
+                        role=role,
+                        content=content,
+                        intent=intent,
+                        entities=entities or {}
+                    ))
+                except Exception as e:
+                    logger.debug(f"Could not save message to DB (not critical): {e}")
+            
+            logger.info(f"✅ Saved message {message_id} to database")
+        
+        except Exception as e:
+            logger.debug(f"⚠️ Could not persist message: {e}")
     
     def update_context(
         self, 

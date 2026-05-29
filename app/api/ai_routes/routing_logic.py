@@ -10,7 +10,7 @@ the 5-tier routing system:
 - Tier 5: Action router (business operations)
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Union
 from datetime import datetime, timedelta
 import logging
 
@@ -38,6 +38,142 @@ from app.services.conversation_memory import get_conversation_memory
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# HELPER FUNCTION TO ENSURE DATA IS ALWAYS A LIST
+# ============================================================================
+
+def _ensure_list(data: Any) -> List[Any]:
+    """
+    Ensure data is a list (wrap dict in list, convert None to empty list).
+    
+    This prevents the ValidationError that occurs when AIResponse expects
+    a list but receives a dict or None.
+    
+    Args:
+        data: Input data (could be dict, list, None, or other)
+        
+    Returns:
+        List version of the data
+    """
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return data
+    # For other types (str, int, etc.), wrap in list
+    return [data] if data else []
+
+
+# ============================================================================
+# CUSTOMER BEHAVIOR RESPONSE FORMATTER
+# ============================================================================
+
+def _format_customer_behavior_response(data: dict, language: str) -> str:
+    """Format customer behavior analysis response in a user-friendly way."""
+    
+    customer = data.get("customer", {})
+    customer_name = customer.get("name", "Customer")
+    
+    # Build the response
+    lines = []
+    
+    # Header
+    if language == "sw":
+        lines.append(f"📊 **Uchambuzi wa Tabia za Mteja: {customer_name}**\n")
+    else:
+        lines.append(f"📊 **Customer Behavior Analysis: {customer_name}**\n")
+    
+    # Customer Info
+    lines.append("**Customer Information:**")
+    lines.append(f"• Name: {customer_name}")
+    if customer.get("code"):
+        lines.append(f"• Code: {customer.get('code')}")
+    if customer.get("phone") and customer.get("phone") != "Unknown" and customer.get("phone") != "N/A":
+        lines.append(f"• Phone: {customer.get('phone')}")
+    if customer.get("city") and customer.get("city") != "Unknown":
+        lines.append(f"• City: {customer.get('city')}")
+    if customer.get("since") and customer.get("since") != "Unknown":
+        lines.append(f"• Customer Since: {customer.get('since')}")
+    if customer.get("email") and customer.get("email") != "Unknown" and customer.get("email") != "N/A":
+        lines.append(f"• Email: {customer.get('email')}")
+    
+    # Purchase Patterns
+    purchase_patterns = data.get("purchase_patterns", {})
+    if purchase_patterns and any(purchase_patterns.values()):
+        lines.append("\n**🛒 Purchase Patterns:**")
+        
+        # Average order value
+        avg_order = purchase_patterns.get("average_order_value")
+        if avg_order and avg_order > 0:
+            lines.append(f"• Average Order Value: KES {avg_order:,.2f}")
+        
+        # Order frequency
+        frequency = purchase_patterns.get("order_frequency_days")
+        if frequency and frequency > 0:
+            lines.append(f"• Order Frequency: Every {frequency} days")
+        
+        # Last order
+        last_order = purchase_patterns.get("last_order_date")
+        if last_order and last_order != "Never":
+            lines.append(f"• Last Order: {last_order}")
+        
+        # Total orders
+        total_orders = purchase_patterns.get("total_orders")
+        if total_orders and total_orders > 0:
+            lines.append(f"• Total Orders: {total_orders}")
+    
+    # RFM Score
+    rfm = data.get("rfm_score", {})
+    if rfm and any(rfm.values()):
+        lines.append("\n**⭐ RFM Score Analysis:**")
+        if rfm.get("recency"):
+            lines.append(f"• Recency: {rfm.get('recency')}/5")
+        if rfm.get("frequency"):
+            lines.append(f"• Frequency: {rfm.get('frequency')}/5")
+        if rfm.get("monetary"):
+            lines.append(f"• Monetary: {rfm.get('monetary')}/5")
+        if rfm.get("overall"):
+            lines.append(f"• Overall Score: {rfm.get('overall')}/15 ({rfm.get('segment', 'N/A')})")
+    
+    # Risk Factors
+    risk_factors = data.get("risk_factors", [])
+    if risk_factors:
+        lines.append("\n**⚠️ Risk Factors:**")
+        for risk in risk_factors:
+            lines.append(f"• {risk}")
+    
+    # Recommendations
+    recommendations = data.get("recommendations", [])
+    if recommendations:
+        lines.append("\n**💡 Recommendations:**")
+        for rec in recommendations[:5]:  # Top 5
+            lines.append(f"• {rec}")
+    
+    # Upsell Opportunities
+    upsell = data.get("upsell_opportunities", [])
+    if upsell:
+        lines.append("\n**📈 Upsell Opportunities:**")
+        for opp in upsell[:3]:  # Top 3
+            lines.append(f"• {opp}")
+    
+    # Next Best Actions
+    next_actions = data.get("next_best_actions", [])
+    if next_actions:
+        lines.append("\n**🎯 Next Best Actions:**")
+        for action in next_actions[:3]:
+            priority = action.get("priority", "MEDIUM")
+            action_text = action.get("action", "")
+            priority_icon = "🔴" if priority == "HIGH" else "🟡" if priority == "MEDIUM" else "🟢"
+            lines.append(f"• {priority_icon} [{priority}] {action_text}")
+    
+    # Footer
+    lines.append("\n---")
+    lines.append("💬 Need more details? Just ask!")
+    
+    return "\n".join(lines)
+
+
 async def route_async(
     intent: str,
     entities: dict,
@@ -50,7 +186,7 @@ async def route_async(
     context: Dict = None,
     assigned_customers: List[str] = None,
     user_role: str = "sales_rep",
-    company_code: str = None  # <-- ADDED company_code parameter
+    company_code: str = None
 ) -> AIResponse:
     """Async routing with proper await, user token, context awareness, and permissions.
     
@@ -85,15 +221,15 @@ async def route_async(
     # Create per-request services with user token and company code
     action_router = create_action_router(
         user_token=user_token,
-        company_code=company_code  # <-- PASS company_code HERE
+        company_code=company_code
     )
     pricing_service = create_pricing_service(
         user_token=user_token,
-        company_code=company_code  # <-- PASS company_code HERE
+        company_code=company_code
     )
     db = create_db_query_service(
         user_token=user_token,
-        company_code=company_code  # <-- PASS company_code HERE
+        company_code=company_code
     )
     
     decision_support = DecisionSupport(
@@ -320,7 +456,7 @@ async def _handle_delivery_tracking(
             intent=intent,
             entities=entities,
             result=formatted.get("message", ""),
-            data=formatted.get("data", rows),
+            data=_ensure_list(formatted.get("data", rows)),
             suggestions=[],
             session_id=session_id,
         )
@@ -332,7 +468,7 @@ async def _handle_delivery_tracking(
             intent=intent,
             entities=entities,
             result=result_message,
-            data=rows,
+            data=_ensure_list(rows),
             suggestions=[],
             session_id=session_id,
         )
@@ -348,14 +484,14 @@ async def _handle_delivery_tracking(
         intent=intent,
         entities=entities,
         result=answer,
-        data=rows,
+        data=_ensure_list(rows),
         suggestions=[],
         session_id=session_id,
     )
 
 
 # ============================================================================
-# TIER 3 HANDLERS - FIXED
+# TIER 3 HANDLERS
 # ============================================================================
 
 async def _handle_decision_support(
@@ -399,7 +535,7 @@ async def _handle_decision_support(
                     intent=intent,
                     entities=entities,
                     result=formatted.get("message", ""),
-                    data=items,  # items is a list
+                    data=_ensure_list(items),
                     suggestions=[],
                     session_id=session_id,
                 )
@@ -424,33 +560,62 @@ async def _handle_decision_support(
                     intent=intent,
                     entities=entities,
                     result=formatted.get("message", ""),
-                    data=items,  # items is a list
+                    data=_ensure_list(items),
                     suggestions=[],
                     session_id=session_id,
                 )
             
-            # GET_SALES_ANALYTICS - FIXED: Wrap result_data in a list
+            # GET_SALES_ANALYTICS - wrap result_data in a list
             elif intent == "GET_SALES_ANALYTICS":
                 formatted = formatter.format_sales_analytics(result_data, language)
                 return AIResponse(
                     intent=intent,
                     entities=entities,
                     result=formatted.get("message", ""),
-                    data=[result_data],  # FIXED: Wrap dict in list
+                    data=_ensure_list(result_data),
                     suggestions=[],
+                    session_id=session_id,
+                )
+            
+            # ANALYZE_CUSTOMER_BEHAVIOR - Format nicely for users
+            elif intent == "ANALYZE_CUSTOMER_BEHAVIOR":
+                formatted_message = _format_customer_behavior_response(result_data, language)
+                
+                # Generate suggestions based on next best actions
+                suggestions = []
+                next_best_actions = result_data.get("next_best_actions", [])
+                for action in next_best_actions[:3]:  # Top 3 actions
+                    action_text = action.get("action", "")
+                    if action_text:
+                        suggestions.append(action_text)
+                
+                # Add default suggestions if none found
+                if not suggestions:
+                    customer_name = result_data.get("customer", {}).get("name", "")
+                    suggestions = [
+                        f"Create quote for {customer_name}",
+                        f"View orders for {customer_name}",
+                        f"Recommend items for {customer_name}",
+                        f"Track delivery for {customer_name}"
+                    ]
+                
+                return AIResponse(
+                    intent=intent,
+                    entities=entities,
+                    result=formatted_message,
+                    data=_ensure_list(result_data),
+                    suggestions=suggestions,
                     session_id=session_id,
                 )
             
             # Other decision support intents - use summary
             else:
                 summary = create_summary_from_analysis(intent, result_data)
-                # Ensure data is a list
-                data_list = [result_data] if isinstance(result_data, dict) else result_data if isinstance(result_data, list) else []
                 return AIResponse(
                     intent=intent,
                     entities=entities,
                     result=summary,
-                    data=data_list,
+                    data=_ensure_list(result_data),
                     suggestions=[],
                     session_id=session_id,
                 )
@@ -550,7 +715,7 @@ async def _handle_db_query(
             intent=intent,
             entities=entities,
             result=formatted.get("message", ""),
-            data=formatted.get("data", rows),
+            data=_ensure_list(formatted.get("data", rows)),
             suggestions=[],
             session_id=session_id,
         )
@@ -579,7 +744,7 @@ async def _handle_db_query(
         intent=intent,
         entities=entities,
         result=answer,
-        data=rows if isinstance(rows, list) else [rows],
+        data=_ensure_list(rows),
         suggestions=[],
         session_id=session_id,
     )
@@ -612,18 +777,31 @@ async def _handle_action_router(
             intent=intent,
             entities=entities,
             result=api_result["message"],
-            data=api_result.get("data", []),
+            data=_ensure_list(api_result.get("data")),
+            suggestions=[],
+            session_id=session_id,
+        )
+    
+    # Handle case where api_result is a dict with ResponseData
+    if isinstance(api_result, dict) and "ResponseData" in api_result:
+        response_data = api_result.get("ResponseData", [])
+        return AIResponse(
+            intent=intent,
+            entities=entities,
+            result=api_result.get("message", "Operation completed successfully."),
+            data=_ensure_list(response_data),
             suggestions=[],
             session_id=session_id,
         )
     
     # Default legacy formatting
     formatted = legacy_format(intent, api_result, formatter)
+    
     return AIResponse(
         intent=intent,
         entities=entities,
         result=formatted.get("message", "I couldn't process your request."),
-        data=formatted.get("data", []),
+        data=_ensure_list(formatted.get("data")),
         suggestions=[],
         session_id=session_id,
     )
@@ -667,7 +845,7 @@ async def _handle_quotation_creation(
             intent="CREATE_QUOTATION",
             entities=entities,
             result=message_text,
-            data=formatted["data"],
+            data=_ensure_list(formatted.get("data")),
             suggestions=[],
             session_id=session_id,
         )
@@ -685,15 +863,11 @@ async def _handle_quotation_creation(
             intent="CREATE_QUOTATION",
             entities=entities,
             result=formatted["message"],
-            data=formatted["data"],
+            data=_ensure_list(formatted.get("data")),
             suggestions=[],
             session_id=session_id,
         )
 
-
-# ============================================================================
-# FIXED: RECOMMENDATIONS HANDLER
-# ============================================================================
 
 def _handle_recommendations(
     intent: str, entities: dict, api_result, 
@@ -708,7 +882,7 @@ def _handle_recommendations(
             intent=intent,
             entities=entities,
             result=api_result["message"],
-            data=api_result.get("data", []),
+            data=_ensure_list(api_result.get("data")),
             suggestions=["Get seasonal recommendations", "Show trending products"],
             session_id=session_id,
         )
@@ -731,7 +905,7 @@ def _handle_recommendations(
         intent=intent,
         entities=entities,
         result=result_message,
-        data=formatted.get("data", []),
+        data=_ensure_list(formatted.get("data")),
         suggestions=["Get seasonal recommendations", "Show trending products"],
         session_id=session_id,
     )

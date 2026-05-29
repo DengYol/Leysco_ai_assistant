@@ -21,6 +21,7 @@ class AnalyticsHandler:
         self.base_url     = parent.base_url
         self.auth_handler = parent.auth_handler
         self.inventory    = parent.inventory
+        self._item_name_cache = {}  # Cache for item names
 
     def _record_cache_hit(self):
         if hasattr(self.parent, '_record_cache_hit'):
@@ -74,6 +75,51 @@ class AnalyticsHandler:
             logger.warning(f"_fetch_orders error: {e}")
             return []
 
+    def _enrich_item_names_from_inventory(self, item_codes: List[str]) -> Dict[str, str]:
+        """
+        Fetch item names from inventory report for codes that don't have names.
+        """
+        if not item_codes:
+            return {}
+        
+        # Check cache first
+        result = {}
+        uncached_codes = []
+        
+        for code in item_codes:
+            if code in self._item_name_cache:
+                result[code] = self._item_name_cache[code]
+            else:
+                uncached_codes.append(code)
+        
+        if not uncached_codes:
+            return result
+        
+        try:
+            # Fetch inventory items
+            inventory = self.inventory.get_inventory_report(limit=2000)
+            if inventory:
+                for item in inventory:
+                    item_code = item.get("ItemCode")
+                    item_name = item.get("ItemName")
+                    if item_code and item_name:
+                        self._item_name_cache[item_code] = item_name
+                        if item_code in uncached_codes:
+                            result[item_code] = item_name
+            
+            # For any codes still not found, use the code as name
+            for code in uncached_codes:
+                if code not in result:
+                    result[code] = code
+                    self._item_name_cache[code] = code
+                    
+        except Exception as e:
+            logger.warning(f"Failed to fetch inventory for item names: {e}")
+            for code in uncached_codes:
+                result[code] = code
+        
+        return result
+
     @staticmethod
     def _aggregate_item_sales(orders: List[Dict]) -> Dict[str, Dict]:
         """
@@ -91,16 +137,31 @@ class AnalyticsHandler:
                 qty  = safe_float(line.get("Quantity"))
                 if qty <= 0:
                     continue
-                name = line.get("ItemName") or line.get("item_name") or code
+                
+                # Try multiple fields for item name
+                name = (
+                    line.get("ItemName") or 
+                    line.get("item_name") or 
+                    line.get("Description") or
+                    line.get("ItemDescription") or
+                    code  # Fallback to code if no name found
+                )
+                
                 rev  = qty * safe_float(line.get("Price"))
+                
                 if code not in sales:
                     sales[code] = {
-                        "name": name, "code": code,
-                        "quantity": 0.0, "revenue": 0.0,
+                        "name": name, 
+                        "code": code,
+                        "quantity": 0.0, 
+                        "revenue": 0.0,
                     }
                 else:
-                    if sales[code]["name"] == code and name != code:
+                    # Update name if we have a better one (not just the code)
+                    existing_name = sales[code]["name"]
+                    if (existing_name == code or existing_name == "Unknown") and name != code:
                         sales[code]["name"] = name
+                
                 sales[code]["quantity"] += qty
                 sales[code]["revenue"]  += rev
         return sales
@@ -191,7 +252,7 @@ class AnalyticsHandler:
             lines = order.get("document_lines", []) or order.get("DocumentLines", [])
             for line in lines:
                 ic  = line.get("ItemCode")
-                nm  = line.get("ItemName", "Unknown")
+                nm  = line.get("ItemName") or line.get("Description") or "Unknown"
                 qty = safe_float(line.get("Quantity"))
                 prc = safe_float(line.get("Price"))
                 total_items_sold += qty
@@ -285,6 +346,19 @@ class AnalyticsHandler:
             if not current_sales:
                 return self._calculate_top_selling_from_inventory(limit, days)
 
+            # Collect all item codes that need names from inventory
+            codes_needing_names = [
+                code for code, data in current_sales.items() 
+                if data["name"] == code or data["name"] == "Unknown"
+            ]
+            
+            # Enrich names from inventory if needed
+            if codes_needing_names:
+                name_map = self._enrich_item_names_from_inventory(codes_needing_names)
+                for code, name in name_map.items():
+                    if code in current_sales and name != code:
+                        current_sales[code]["name"] = name
+
             sorted_items = sorted(
                 current_sales.values(),
                 key=lambda x: x["quantity"], reverse=True,
@@ -295,6 +369,12 @@ class AnalyticsHandler:
 
             for i, item in enumerate(sorted_items, 1):
                 code     = item["code"]
+                name     = item["name"]
+                
+                # If name is still just the code, try to get a better name
+                if name == code or name == "Unknown":
+                    name = self._enrich_item_names_from_inventory([code]).get(code, code)
+                
                 prev_qty = previous_sales.get(code, {}).get("quantity", 0.0)
 
                 if prev_qty > 0:
@@ -305,9 +385,9 @@ class AnalyticsHandler:
                     trend_pct = None   # no previous data — omit trend arrow
 
                 result.append({
-                    "name":            item["name"],
+                    "name":            name,
                     "code":            code,
-                    "quantity":        item["quantity"],
+                    "quantity":        int(item["quantity"]),
                     "revenue":         round(item["revenue"], 2),
                     "rank":            i,
                     "analysis_days":   days,
@@ -340,6 +420,8 @@ class AnalyticsHandler:
                 on_hand    = safe_float(item.get("CurrentOnHand"))
                 committed  = safe_float(item.get("CurrentIsCommited"))
                 period_out = safe_float(item.get("PeriodOutQty", 0))
+                item_name  = item.get("ItemName") or item.get("ItemCode", "Unknown")
+                item_code  = item.get("ItemCode", "")
 
                 if period_out > 0:
                     score = min(100.0, (period_out / days) * 10)
@@ -351,9 +433,9 @@ class AnalyticsHandler:
                     continue
 
                 scored.append({
-                    "name":            item.get("ItemName") or item.get("ItemCode", "Unknown"),
-                    "code":            item.get("ItemCode", ""),
-                    "quantity":        period_out,
+                    "name":            item_name,
+                    "code":            item_code,
+                    "quantity":        int(period_out),
                     "revenue":         0.0,
                     "trend_pct":       None,
                     "PopularityScore": round(score, 2),
@@ -409,6 +491,8 @@ class AnalyticsHandler:
                 code = row.get("ItemCode")
                 if not code:
                     continue
+                item_name = row.get("ItemName") or code
+                
                 if code in inv_map:
                     inv_map[code]["CurrentOnHand"]     += safe_float(row.get("CurrentOnHand"))
                     inv_map[code]["CurrentIsCommited"] += safe_float(row.get("CurrentIsCommited"))
@@ -418,7 +502,7 @@ class AnalyticsHandler:
                         inv_map[code]["LastTransactionDate"] = incoming
                 else:
                     inv_map[code] = {
-                        "ItemName":            row.get("ItemName") or code,
+                        "ItemName":            item_name,
                         "ItemCode":            code,
                         "CurrentOnHand":       safe_float(row.get("CurrentOnHand")),
                         "CurrentIsCommited":   safe_float(row.get("CurrentIsCommited")),
@@ -450,7 +534,7 @@ class AnalyticsHandler:
                     continue
 
                 qty_sold = sold_in_period.get(code, inv.get("PeriodOutQty", 0.0))
-                turnover = qty_sold / on_hand
+                turnover = qty_sold / on_hand if on_hand > 0 else 0
 
                 if turnover >= turnover_threshold:
                     continue

@@ -5,6 +5,7 @@
 # ============================================================================
 
 ACTION_ROUTER_INTENTS = {
+    # Existing - Items
     "GET_ITEMS",
     "GET_SELLABLE_ITEMS",
     "GET_PURCHASABLE_ITEMS",
@@ -12,6 +13,8 @@ ACTION_ROUTER_INTENTS = {
     "GET_ITEMS_ADVANCED",
     "GET_ITEM_DETAILS",
     "GET_STOCK_LEVELS",
+    
+    # Existing - Customers
     "GET_CUSTOMERS",
     "GET_CUSTOMER_DETAILS",
     "GET_CUSTOMER_HEALTH",
@@ -19,31 +22,79 @@ ACTION_ROUTER_INTENTS = {
     "GET_CUSTOMER_INVOICES",
     "GET_OUTSTANDING_INVOICES",
     "FIND_CUSTOMERS_BY_ITEM",
+    
+    # Existing - Pricing
     "GET_ITEM_PRICE",
     "GET_CUSTOMER_PRICE",
+    
+    # Existing - Quotations
     "CREATE_QUOTATION",
     "GET_QUOTATIONS",
     "FOLLOW_UP_QUOTATIONS",
+    "CONVERT_QUOTATION_TO_ORDER",      # NEW: Convert quotation to sales order
+    "POST_INVOICE",                    # NEW: Post AR invoice from delivery
+    
+    # Existing - Deliveries
     "GET_OUTSTANDING_DELIVERIES",
     "TRACK_DELIVERY",
     "GET_DELIVERY_HISTORY",
+    
+    # NEW - Invoice Management
+    "GET_AR_INVOICES",
+    "GET_AP_INVOICES",
+    "GET_OVERDUE_INVOICES",
+    "GET_CUSTOMER_BALANCE",
+    "GET_PAYMENT_STATUS",
+    "SEND_PAYMENT_REMINDER",
+    "GET_AGING_REPORT",
+    
+    # NEW - Purchase Cycle
+    "GET_PURCHASE_ORDERS",
+    "CREATE_PURCHASE_ORDER",
+    "GET_PURCHASE_REQUESTS",
+    "GET_GOODS_RECEIPT_PO",
+    "APPROVE_PURCHASE_ORDER",
+    "GET_AP_INVOICES_PURCHASE",
+    
+    # NEW - Inventory Movements
+    "CREATE_GOODS_ISSUE",
+    "CREATE_GOODS_RECEIPT",
+    "CREATE_STOCK_TRANSFER",
+    "GET_INVENTORY_VALUATION",
+    "GET_REORDER_REPORT",
+    "ALLOCATE_STOCK",
+    
+    # NEW - Business Rules
+    "CHECK_CREDIT_LIMIT",
+    "CHECK_STOCK_AVAILABILITY",
+    "GET_APPROVAL_STATUS",
+    
+    # Existing - Recommendations
     "RECOMMEND_ITEMS",
     "RECOMMEND_CUSTOMERS",
     "GET_CROSS_SELL",
     "GET_UPSELL",
     "GET_SEASONAL_RECOMMENDATIONS",
     "GET_TRENDING_PRODUCTS",
+    
+    # Existing - Analytics
     "GET_TOP_SELLING_ITEMS",
     "GET_SLOW_MOVING_ITEMS",
     "GET_SALES_ANALYTICS",
+    
+    # Existing - Decision Support
     "ANALYZE_INVENTORY_HEALTH",
     "GET_REORDER_DECISIONS",
     "ANALYZE_PRICING_OPPORTUNITIES",
     "ANALYZE_CUSTOMER_BEHAVIOR",
     "FORECAST_DEMAND",
+    
+    # Existing - Warehouses
     "GET_WAREHOUSES",
     "GET_WAREHOUSE_STOCK",
     "GET_LOW_STOCK_ALERTS",
+    
+    # Existing - Knowledge Base
     "COMPANY_INFO",
     "PRODUCT_INFO",
     "HOW_TO_ORDER",
@@ -57,6 +108,15 @@ DATA_INTENTS = ACTION_ROUTER_INTENTS.copy()
 
 OPERATIONAL_INTENTS = {
     "CREATE_QUOTATION",
+    "CREATE_PURCHASE_ORDER",           # NEW
+    "CREATE_GOODS_ISSUE",              # NEW
+    "CREATE_GOODS_RECEIPT",            # NEW
+    "CREATE_STOCK_TRANSFER",           # NEW
+    "CONVERT_QUOTATION_TO_ORDER",      # NEW
+    "POST_INVOICE",                    # NEW
+    "SEND_PAYMENT_REMINDER",           # NEW
+    "APPROVE_PURCHASE_ORDER",          # NEW
+    "ALLOCATE_STOCK",                  # NEW
 }
 
 RECOMMENDATION_INTENTS = {
@@ -70,7 +130,51 @@ RECOMMENDATION_INTENTS = {
 }
 
 PRICE_INTENTS = {"GET_ITEM_PRICE", "GET_CUSTOMER_PRICE"}
-DELIVERY_INTENTS = {"GET_OUTSTANDING_DELIVERIES", "TRACK_DELIVERY", "GET_DELIVERY_HISTORY"}
+
+DELIVERY_INTENTS = {
+    "GET_OUTSTANDING_DELIVERIES", 
+    "TRACK_DELIVERY", 
+    "GET_DELIVERY_HISTORY"
+}
+
+# NEW: Invoice intent groups
+INVOICE_INTENTS = {
+    "GET_AR_INVOICES",
+    "GET_AP_INVOICES", 
+    "GET_OVERDUE_INVOICES",
+    "GET_CUSTOMER_BALANCE",
+    "GET_PAYMENT_STATUS",
+    "SEND_PAYMENT_REMINDER",
+    "GET_AGING_REPORT",
+}
+
+# NEW: Purchase intent groups
+PURCHASE_INTENTS = {
+    "GET_PURCHASE_ORDERS",
+    "CREATE_PURCHASE_ORDER",
+    "GET_PURCHASE_REQUESTS",
+    "GET_GOODS_RECEIPT_PO",
+    "APPROVE_PURCHASE_ORDER",
+    "GET_AP_INVOICES_PURCHASE",
+}
+
+# NEW: Inventory movement intents
+INVENTORY_MOVEMENT_INTENTS = {
+    "CREATE_GOODS_ISSUE",
+    "CREATE_GOODS_RECEIPT",
+    "CREATE_STOCK_TRANSFER",
+    "GET_INVENTORY_VALUATION",
+    "GET_REORDER_REPORT",
+    "ALLOCATE_STOCK",
+}
+
+# NEW: Business rules intents
+BUSINESS_RULES_INTENTS = {
+    "CHECK_CREDIT_LIMIT",
+    "CHECK_STOCK_AVAILABILITY",
+    "GET_APPROVAL_STATUS",
+}
+
 CUSTOMER_INTENTS = {
     "GET_CUSTOMERS",
     "GET_CUSTOMER_DETAILS",
@@ -79,9 +183,47 @@ CUSTOMER_INTENTS = {
     "GET_CUSTOMER_INVOICES",
     "GET_OUTSTANDING_INVOICES",
     "FIND_CUSTOMERS_BY_ITEM",
+    "GET_CUSTOMER_BALANCE",           # NEW
 }
-INVENTORY_INTENTS = {"GET_STOCK_LEVELS", "GET_LOW_STOCK_ALERTS", "GET_WAREHOUSE_STOCK"}
-ANALYTICS_INTENTS = {"GET_TOP_SELLING_ITEMS", "GET_SLOW_MOVING_ITEMS", "GET_SALES_ANALYTICS"}
+
+INVENTORY_INTENTS = {
+    "GET_STOCK_LEVELS", 
+    "GET_LOW_STOCK_ALERTS", 
+    "GET_WAREHOUSE_STOCK",
+    "GET_INVENTORY_VALUATION",        # NEW
+    "GET_REORDER_REPORT",             # NEW
+}
+
+ANALYTICS_INTENTS = {
+    "GET_TOP_SELLING_ITEMS", 
+    "GET_SLOW_MOVING_ITEMS", 
+    "GET_SALES_ANALYTICS",
+    "GET_AGING_REPORT",               # NEW
+}
+
+# ============================================================================
+# DOCUMENT LIFECYCLE TRANSITIONS
+# ============================================================================
+
+# Mapping of document transitions (for query_rewriter and router)
+DOCUMENT_TRANSITIONS = {
+    "quotation": ["sales_order", "cancelled"],
+    "sales_order": ["delivery", "ar_invoice", "cancelled"],
+    "delivery": ["ar_invoice", "returns"],
+    "purchase_order": ["goods_receipt_po", "ap_invoice", "cancelled"],
+    "goods_receipt_po": ["ap_invoice"],
+    "ar_invoice": ["incoming_payment", "credit_memo"],
+    "ap_invoice": ["outgoing_payment", "credit_memo"],
+}
+
+# Action phrases that trigger document transitions
+TRANSITION_PHRASES = {
+    "convert": ("quotation", "sales_order"),
+    "post": ("delivery", "ar_invoice"),
+    "approve": ("purchase_order", "approved"),
+    "cancel": (None, "cancelled"),
+    "reverse": (None, "reversed"),
+}
 
 # ============================================================================
 # SKIP PATTERNS FOR ITEM FILTERING
@@ -170,6 +312,9 @@ ERROR_MESSAGES = {
         "network_error": "Network error. Please check your connection and try again.",
         "timeout_error": "The request timed out. Please try again.",
         "rate_limit": "Too many requests. Please wait a moment and try again.",
+        "credit_limit_exceeded": "Order exceeds customer's credit limit.",
+        "insufficient_stock": "Insufficient stock available for this item.",
+        "approval_required": "This action requires manager approval.",
     },
     "sw": {
         "auth_failed": "Samahani, sikuweza kuthibitisha na seva. Tafadhali angalia hati zako.",
@@ -181,6 +326,9 @@ ERROR_MESSAGES = {
         "network_error": "Hitilafu ya mtandao. Tafadhali angalia muunganisho wako na ujaribu tena.",
         "timeout_error": "Ombi limechukua muda mrefu. Tafadhali jaribu tena.",
         "rate_limit": "Maombi mengi sana. Tafadhali subiri kidogo na ujaribu tena.",
+        "credit_limit_exceeded": "Oda inazidi kikomo cha mkopo cha mteja.",
+        "insufficient_stock": "Hisa za kutosha hazipo kwa bidhaa hii.",
+        "approval_required": "Kitendo hiki kinahitaji idhini ya meneja.",
     },
 }
 
@@ -192,16 +340,30 @@ SUCCESS_MESSAGES = {
     "en": {
         "quotation_created": "✓ Quotation created successfully!",
         "order_created": "✓ Sales order created successfully!",
+        "purchase_order_created": "✓ Purchase order created successfully!",
+        "goods_receipt_created": "✓ Goods receipt created successfully!",
+        "goods_issue_created": "✓ Goods issue created successfully!",
+        "stock_transfer_created": "✓ Stock transfer created successfully!",
+        "invoice_posted": "✓ Invoice posted successfully!",
+        "payment_reminder_sent": "✓ Payment reminder sent successfully!",
         "price_retrieved": "✓ Price retrieved successfully.",
         "stock_retrieved": "✓ Stock information retrieved.",
         "delivery_tracked": "✓ Delivery information retrieved.",
+        "quotation_converted": "✓ Quotation converted to sales order successfully!",
     },
     "sw": {
         "quotation_created": "✓ Nukuu imeundwa kwa mafanikio!",
         "order_created": "✓ Oda ya mauzo imeundwa kwa mafanikio!",
+        "purchase_order_created": "✓ Agizo la ununuzi limeundwa kwa mafanikio!",
+        "goods_receipt_created": "✓ Upokaji wa bidhaa umeundwa kwa mafanikio!",
+        "goods_issue_created": "✓ Utoaji wa bidhaa umeundwa kwa mafanikio!",
+        "stock_transfer_created": "✓ Uhamisho wa hisa umeundwa kwa mafanikio!",
+        "invoice_posted": "✓ Invoice imetumwa kwa mafanikio!",
+        "payment_reminder_sent": "✓ Kumbusho la malipo limetumwa kwa mafanikio!",
         "price_retrieved": "✓ Bei imepatikana kwa mafanikio.",
         "stock_retrieved": "✓ Taarifa za hisa zimepatikana.",
         "delivery_tracked": "✓ Taarifa za usafirishaji zimepatikana.",
+        "quotation_converted": "✓ Nukuu imebadilishwa kuwa oda ya mauzo kwa mafanikio!",
     },
 }
 

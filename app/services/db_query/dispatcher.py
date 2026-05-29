@@ -1,586 +1,621 @@
-"""Intent dispatch logic - routes intents to appropriate handlers"""
+"""
+Dispatcher - Routes intents to appropriate query handlers
+"""
 
 import logging
-import re
-from typing import List, Dict, Optional
+from typing import Dict, List, Any, Optional
 
-from .constants import ACTION_ROUTER_INTENTS, KNOWLEDGE_BASE_INTENTS
 from .transformers import (
-    ItemTransformer,
     CustomerTransformer,
-    WarehouseTransformer,
     DeliveryTransformer,
     AnalyticsTransformer,
-    InventoryTransformer
+    PriceTransformer,
 )
-from .fallback import get_fallback_warehouses, get_fallback_deliveries, get_fallback_sales_analytics
+from .constants import DELIVERY_INTENTS, PRICE_INTENTS
 
 logger = logging.getLogger(__name__)
 
 
 class Dispatcher:
-    """Handles intent dispatch to appropriate API calls"""
-    
-    def __init__(self, parent):
-        self.parent = parent
-        self.api = parent.api
-        self.warehouse_service = parent.warehouse_service
-    
+    """
+    Routes intents to specific query methods.
+    FALLBACK: If no specific handler exists, returns None (let caller handle).
+    """
+
+    def __init__(self, service):
+        """Initialize with reference to the DBQueryService instance."""
+        self.service = service
+
     def should_process(self, intent: str) -> bool:
-        """Check if this intent should be processed here."""
-        # Customer details should be processed by DB query, not action router
-        if intent == "GET_CUSTOMER_DETAILS":
-            return True
-        
-        # Warehouse stock should be processed by DB query
-        if intent == "GET_WAREHOUSE_STOCK":
-            return True
-        
-        if intent in ACTION_ROUTER_INTENTS:
-            logger.info(f"🎯 {intent} handled by action router - skipping DB query")
-            return False
-        
-        if intent in KNOWLEDGE_BASE_INTENTS:
-            logger.info(f"📚 {intent} handled by knowledge base")
-            return False
-        
-        return True
-    
-    # ------------------------------------------------------------------
-    # WAREHOUSE RESOLUTION: name/alias → SAP WhsCode
-    # ------------------------------------------------------------------
-
-    def _resolve_warehouse_code(self, warehouse: str) -> Optional[str]:
         """
-        Dynamically resolve a human-readable warehouse name/alias to its
-        SAP WhsCode by querying the warehouse list.
-
-        Strategy (in order):
-        1. Exact match on WhsCode  (e.g. "KDISPAT1")
-        2. Exact match on WhsName  (e.g. "Dispatch Warehouse")
-        3. WhsCode starts-with     (e.g. "kdispat" → "KDISPAT1")
-        4. WhsName contains        (e.g. "dispatch" inside "Dispatch Warehouse")
-        5. WhsCode contains        (e.g. "dispat" inside "KDISPAT1")
-
-        Returns the resolved WhsCode string, or the original value if no
-        match is found (allows the service layer to handle it gracefully).
+        Determine if this intent should be processed by DBQueryService.
+        Returns True for intents that DBQueryService can handle directly.
         """
-        if not warehouse:
-            return None
+        db_handled_intents = {
+            # Customer intents
+            "GET_CUSTOMERS",
+            "GET_CUSTOMER_DETAILS",
+            "GET_CUSTOMER_ORDERS",
+            "GET_CUSTOMER_INVOICES",
+            "GET_OUTSTANDING_INVOICES",
+            "GET_CUSTOMER_HEALTH",
+            "GET_CUSTOMER_BALANCE",
 
-        query = warehouse.strip()
-        query_upper = query.upper()
-        query_lower = query.lower()
+            # Delivery intents
+            "GET_OUTSTANDING_DELIVERIES",
+            "TRACK_DELIVERY",
+            "GET_DELIVERY_HISTORY",
 
-        try:
-            # Fetch all warehouses (WarehouseService caches this internally)
-            warehouses = self.parent._safe_api_call(self.api.get_warehouses)
-            if not warehouses:
-                logger.warning("_resolve_warehouse_code: no warehouses returned from API")
-                return query  # fall through to service layer
+            # Item/Stock intents
+            "GET_ITEMS",
+            "GET_SELLABLE_ITEMS",
+            "GET_PURCHASABLE_ITEMS",
+            "GET_INVENTORY_ITEMS",
+            "GET_ITEM_DETAILS",
+            "GET_STOCK_LEVELS",
+            "GET_WAREHOUSES",
+            "GET_WAREHOUSE_STOCK",
+            "GET_LOW_STOCK_ALERTS",
 
-            # 1. Exact WhsCode match (already a code — pass through quickly)
-            for wh in warehouses:
-                if (wh.get("WhsCode") or "").upper() == query_upper:
-                    logger.info(f"Warehouse exact code match: '{query}' → '{wh['WhsCode']}'")
-                    return wh["WhsCode"]
+            # Price intents
+            "GET_ITEM_PRICE",
+            "GET_CUSTOMER_PRICE",
 
-            # 2. Exact WhsName match
-            for wh in warehouses:
-                if (wh.get("WhsName") or "").upper() == query_upper:
-                    logger.info(f"Warehouse exact name match: '{query}' → '{wh['WhsCode']}'")
-                    return wh["WhsCode"]
+            # Invoice intents
+            "GET_AR_INVOICES",
+            "GET_AP_INVOICES",
+            "GET_OVERDUE_INVOICES",
+            "GET_CUSTOMER_BALANCE",
 
-            # 3. WhsCode starts-with (handles partial codes)
-            for wh in warehouses:
-                if (wh.get("WhsCode") or "").upper().startswith(query_upper):
-                    logger.info(f"Warehouse code starts-with match: '{query}' → '{wh['WhsCode']}'")
-                    return wh["WhsCode"]
+            # Purchase intents
+            "GET_PURCHASE_ORDERS",
+            "GET_PURCHASE_REQUESTS",
+            "GET_GOODS_RECEIPT_PO",
 
-            # 4. WhsName contains (most common: "dispatch" inside "Dispatch Warehouse")
-            for wh in warehouses:
-                if query_lower in (wh.get("WhsName") or "").lower():
-                    logger.info(f"Warehouse name contains match: '{query}' → '{wh['WhsCode']}'")
-                    return wh["WhsCode"]
+            # Inventory intents
+            "GET_INVENTORY_VALUATION",
+            "GET_REORDER_REPORT",
+        }
 
-            # 5. WhsCode contains (e.g. "dispat" inside "KDISPAT1")
-            for wh in warehouses:
-                if query_upper in (wh.get("WhsCode") or "").upper():
-                    logger.info(f"Warehouse code contains match: '{query}' → '{wh['WhsCode']}'")
-                    return wh["WhsCode"]
+        action_router_intents = {
+            "CREATE_QUOTATION",
+            "CREATE_PURCHASE_ORDER",
+            "CREATE_GOODS_ISSUE",
+            "CREATE_GOODS_RECEIPT",
+            "CREATE_STOCK_TRANSFER",
+            "CONVERT_QUOTATION_TO_ORDER",
+            "POST_INVOICE",
+            "SEND_PAYMENT_REMINDER",
+            "APPROVE_PURCHASE_ORDER",
+            "ALLOCATE_STOCK",
+            "CHECK_CREDIT_LIMIT",
+            "CHECK_STOCK_AVAILABILITY",
+            "RECOMMEND_ITEMS",
+            "RECOMMEND_CUSTOMERS",
+            "GET_CROSS_SELL",
+            "GET_UPSELL",
+            "GET_SEASONAL_RECOMMENDATIONS",
+            "GET_TRENDING_PRODUCTS",
+            "GET_TOP_SELLING_ITEMS",
+            "GET_SLOW_MOVING_ITEMS",
+            "GET_SALES_ANALYTICS",
+            "ANALYZE_INVENTORY_HEALTH",
+            "GET_REORDER_DECISIONS",
+            "ANALYZE_PRICING_OPPORTUNITIES",
+            "ANALYZE_CUSTOMER_BEHAVIOR",
+            "FORECAST_DEMAND",
+        }
 
-            # No match found — log and return original so the service layer
-            # can decide what to do (return empty rather than crash)
-            logger.warning(
-                f"_resolve_warehouse_code: no match found for '{query}' "
-                f"among {[wh.get('WhsCode') for wh in warehouses]}"
-            )
-            return query
+        if intent in db_handled_intents:
+            return True
+        if intent in action_router_intents:
+            return False
 
-        except Exception as e:
-            logger.error(f"_resolve_warehouse_code error: {e}")
-            return query  # safe fallback
+        return False
 
-    # ------------------------------------------------------------------
-    # ASYNC / SYNC DISPATCH
-    # ------------------------------------------------------------------
+    def dispatch(
+        self,
+        intent: str,
+        item: str,
+        customer: str,
+        warehouse: str,
+        limit: int,
+        language: str = "en"
+    ) -> Optional[List[Dict]]:
+        """
+        Route intent to appropriate handler method.
+        Returns None if no handler exists (caller should fall back to ActionRouter).
+        """
+        logger.info(f"Dispatching intent: {intent}")
 
-    async def dispatch_async(self, intent: str, item: str, customer: str,
-                              warehouse: str, limit: int, language: str) -> Optional[List[Dict]]:
-        """Async dispatch to appropriate handler"""
-        import asyncio
-        return await asyncio.to_thread(self.dispatch, intent, item, customer, warehouse, limit, language)
-    
-    def dispatch(self, intent: str, item: str, customer: str,
-                 warehouse: str, limit: int, language: str) -> Optional[List[Dict]]:
-        """Dispatch intent to the right API method"""
-        
-        # Customer Details (specific customer) - HIGH PRIORITY
-        if intent == "GET_CUSTOMER_DETAILS":
-            return self._handle_customer_details(customer, limit)
-        
-        # Warehouse Stock - NEW
-        if intent == "GET_WAREHOUSE_STOCK":
-            return self._handle_warehouse_stock(warehouse, item, limit)
-        
-        # Sales Analytics
-        if intent == "GET_SALES_ANALYTICS":
-            return self._handle_sales_analytics(item, customer, limit)
-        
-        # Price queries
-        if intent in ["GET_ITEM_PRICE", "GET_ITEM_BASE_PRICE", "GET_CUSTOMER_PRICE"]:
-            return self.parent.resolve_and_price(
-                item_name=item,
-                customer_name=customer if intent == "GET_CUSTOMER_PRICE" else None
-            )
-        
-        # Items
-        if intent in ["GET_ITEMS", "GET_SELLABLE_ITEMS", "GET_INVENTORY_ITEMS"]:
-            return self._handle_items(item, limit)
-        
-        # Customers (listing)
+        # =========================================================
+        # Invoice Intents
+        # =========================================================
+        if intent == "GET_AR_INVOICES":
+            return self._get_ar_invoices(customer, limit)
+
+        if intent == "GET_AP_INVOICES":
+            return self._get_ap_invoices(customer, limit)
+
+        if intent == "GET_OVERDUE_INVOICES":
+            return self._get_overdue_invoices(customer, limit)
+
+        if intent == "GET_CUSTOMER_BALANCE":
+            return self._get_customer_balance(customer)
+
+        # =========================================================
+        # Purchase Intents
+        # =========================================================
+        if intent == "GET_PURCHASE_ORDERS":
+            return self._get_purchase_orders(customer, limit)
+
+        if intent == "GET_PURCHASE_REQUESTS":
+            return self._get_purchase_requests(limit)
+
+        if intent == "GET_GOODS_RECEIPT_PO":
+            return self._get_goods_receipt(customer, limit)
+
+        # =========================================================
+        # Inventory Intents
+        # =========================================================
+        if intent == "GET_INVENTORY_VALUATION":
+            return self._get_inventory_valuation()
+
+        if intent == "GET_REORDER_REPORT":
+            return self._get_reorder_report(limit)
+
+        # =========================================================
+        # Customer Intents
+        # =========================================================
         if intent == "GET_CUSTOMERS":
-            return self._handle_customers(customer, limit)
-        
-        # Stock levels
-        if intent == "GET_STOCK_LEVELS":
-            return self._handle_stock_levels(item, limit)
-        
-        # Warehouses
-        if intent == "GET_WAREHOUSES":
-            return self._handle_warehouses(warehouse, limit)
-        
-        # Low stock alerts
-        if intent == "GET_LOW_STOCK_ALERTS":
-            return self._handle_low_stock_alerts(warehouse, item, limit)
-        
-        # Outstanding deliveries
+            return self._get_customers(customer, limit)
+
+        if intent == "GET_CUSTOMER_DETAILS":
+            return self._get_customer_details(customer)
+
+        if intent == "GET_CUSTOMER_ORDERS":
+            return self._get_customer_orders(customer, limit)
+
+        if intent == "GET_CUSTOMER_INVOICES":
+            return self._get_customer_invoices(customer, limit)
+
+        if intent == "GET_OUTSTANDING_INVOICES":
+            return self._get_customer_invoices(customer, limit, only_outstanding=True)
+
+        if intent == "GET_CUSTOMER_HEALTH":
+            return self._get_customer_health(customer)
+
+        # =========================================================
+        # Delivery Intents
+        # =========================================================
         if intent == "GET_OUTSTANDING_DELIVERIES":
-            return self._handle_outstanding_deliveries(customer, limit)
-        
+            return self._get_outstanding_deliveries(customer, limit)
+
+        if intent == "TRACK_DELIVERY":
+            return self._track_delivery(item)
+
+        if intent == "GET_DELIVERY_HISTORY":
+            return self._get_delivery_history(customer, limit)
+
+        # =========================================================
+        # Item/Stock Intents
+        # =========================================================
+        if intent == "GET_ITEMS":
+            return self._get_items(item, limit)
+
+        if intent == "GET_SELLABLE_ITEMS":
+            return self._get_sellable_items(item, limit)
+
+        if intent == "GET_PURCHASABLE_ITEMS":
+            return self._get_purchasable_items(item, limit)
+
+        if intent == "GET_INVENTORY_ITEMS":
+            return self._get_inventory_items(item, limit)
+
+        if intent == "GET_ITEM_DETAILS":
+            return self._get_item_details(item)
+
+        if intent == "GET_STOCK_LEVELS":
+            return self._get_stock_levels(item, limit)
+
+        if intent == "GET_WAREHOUSES":
+            return self._get_warehouses()
+
+        if intent == "GET_WAREHOUSE_STOCK":
+            return self._get_warehouse_stock(warehouse, limit)
+
+        if intent == "GET_LOW_STOCK_ALERTS":
+            return self._get_low_stock_alerts(warehouse, limit)
+
+        # =========================================================
+        # Price Intents
+        # =========================================================
+        if intent == "GET_ITEM_PRICE":
+            return self._get_item_price(item)
+
+        if intent == "GET_CUSTOMER_PRICE":
+            return self._get_customer_price(item, customer)
+
+        # =========================================================
+        # Unknown
+        # =========================================================
         logger.warning(f"No optimized dispatch for intent: {intent}")
-        return []
-    
-    # ------------------------------------------------------------------
-    # INTENT HANDLERS
-    # ------------------------------------------------------------------
+        return None
 
-    def _handle_warehouse_stock(self, warehouse: str, item: str, limit: int) -> List[Dict]:
-        """Handle warehouse stock intent - get stock for a specific warehouse"""
-        logger.info(f"Getting stock for warehouse: {warehouse or 'all'}, item: {item or 'all'}")
-        
-        # Clean warehouse name - remove common prefixes like "stock of"
-        clean_warehouse = warehouse
-        if clean_warehouse:
-            prefixes_to_remove = [
-                r'^stock\s+of\s+',
-                r'^inventory\s+at\s+',
-                r'^items\s+in\s+',
-                r'^available\s+in\s+',
-                r'^stock\s+in\s+',
-            ]
-            for prefix in prefixes_to_remove:
-                clean_warehouse = re.sub(prefix, '', clean_warehouse, flags=re.IGNORECASE)
-            clean_warehouse = clean_warehouse.strip()
-        
-        # Resolve warehouse name to code
-        resolved_whscode = self._resolve_warehouse_code(clean_warehouse) if clean_warehouse else None
-        
-        if clean_warehouse and not resolved_whscode:
-            # Try searching by the original warehouse parameter
-            resolved_whscode = self._resolve_warehouse_code(warehouse) if warehouse else None
-        
-        if clean_warehouse and not resolved_whscode:
-            logger.warning(f"Could not resolve warehouse: '{clean_warehouse}' (original: '{warehouse}')")
-        else:
-            logger.info(f"Resolved warehouse: '{clean_warehouse}' → '{resolved_whscode}'")
-        
-        # Fetch inventory
+    # =========================================================
+    # Invoice Handlers
+    # FIX: replaced self.service.api.get(...) with direct session
+    # calls matching the pattern used throughout OrdersHandler.
+    # LeyscoAPIService has no generic .get() method — all HTTP
+    # requests must go through self.service.api.session directly.
+    # =========================================================
+
+    def _get_ar_invoices(self, customer_code: str = None, limit: int = 50) -> List[Dict]:
+        """Get A/R invoices (SAP doc type 13)"""
         try:
-            # If specific item requested, search by item
-            search_term = item if item else ""
-            inventory = self.parent._safe_api_call(
-                self.api.get_inventory_report, 
-                search=search_term, 
-                limit=min(limit, 100) if limit > 0 else 100
-            )
-            
-            if not inventory:
-                logger.info(f"No inventory found for warehouse: {resolved_whscode or 'all'}")
+            if not self.service.api.auth_handler.ensure_auth():
                 return []
-            
-            # Filter by warehouse if specific warehouse was requested
-            if resolved_whscode:
-                filtered = [
-                    inv for inv in inventory 
-                    if inv.get("WhsCode", "").upper() == resolved_whscode.upper()
-                ]
-                logger.info(f"Filtered {len(filtered)}/{len(inventory)} items for warehouse {resolved_whscode}")
-            else:
-                filtered = inventory
-            
-            # Transform to clean format
-            if filtered:
-                return ItemTransformer.transform(filtered, max_items=min(limit, 50) if limit > 0 else 50)
-            else:
-                logger.info(f"No items found in warehouse: {resolved_whscode or 'all'}")
+
+            url = f"{self.service.api.base_url}/marketing/docs/13"
+            params = {"page": 1, "per_page": limit}
+            if customer_code:
+                params["CardCode"] = customer_code
+
+            self.service.api._record_api_call()
+            resp = self.service.api.session.get(url, params=params, timeout=30)
+
+            if resp.status_code != 200:
+                logger.error(f"AR invoices API error: {resp.status_code}")
                 return []
-            
-        except Exception as e:
-            logger.error(f"Error getting warehouse stock: {e}")
+
+            data = resp.json()
+            result = data.get("ResponseData", {})
+            if isinstance(result, dict):
+                return result.get("data", [])
+            if isinstance(result, list):
+                return result
             return []
 
-    def _handle_customer_details(self, customer: str, limit: int) -> List[Dict]:
-        """Handle customer details intent - fetch specific customer by name"""
-        logger.info(f"Getting customer details for: {customer}")
-        
-        if not customer:
-            logger.warning("No customer name provided for GET_CUSTOMER_DETAILS")
+        except Exception as e:
+            logger.error(f"Failed to get AR invoices: {e}")
             return []
-        
-        # Clean customer name - remove common prefixes
-        clean_customer = customer.strip()
-        prefixes_to_remove = [
-            r'^customer\s+details?\s+(?:for|of|about)\s+',
-            r'^details?\s+of\s+customer\s+',
-            r'^show\s+me\s+customer\s+details?\s+(?:for|of)\s+',
-            r'^get\s+customer\s+details?\s+(?:for|of)\s+',
-            r'^check\s+customer\s+details?\s+(?:for|of)\s+',
-        ]
-        for prefix in prefixes_to_remove:
-            clean_customer = re.sub(prefix, '', clean_customer, flags=re.IGNORECASE)
-        clean_customer = clean_customer.strip()
-        
-        logger.info(f"Cleaned customer name: '{clean_customer}'")
-        
-        # Try to find customer by name or code
-        customer_data = None
-        
-        # First, try direct customer code match
-        if re.match(r'^[A-Z]{2,3}\d{4,8}$', clean_customer.upper()):
-            logger.info(f"Looking up customer by code: {clean_customer.upper()}")
-            customers = self.parent._safe_api_call(self.api.get_customers, search=clean_customer, limit=5)
-            if customers:
-                # Find exact code match
-                for cust in customers:
-                    if cust.get("CardCode", "").upper() == clean_customer.upper():
-                        customer_data = cust
-                        break
-                if not customer_data and customers:
-                    customer_data = customers[0]
-        
-        # If not found by code, search by name
-        if not customer_data:
-            logger.info(f"Searching for customer by name: {clean_customer}")
-            customers = self.parent._safe_api_call(self.api.get_customers, search=clean_customer, limit=10)
-            
-            if customers:
-                # Try exact match first (case-insensitive)
-                exact_match = None
-                for cust in customers:
-                    cust_name = cust.get("CardName", "")
-                    # Remove common suffixes for better matching
-                    name_for_compare = re.sub(r'\s+(?:Ltd|Limited|Inc|Corp|LLC|Co|Supplies|Supply|Agrovet|Agri|Traders|Enterprises)$', '', cust_name, flags=re.IGNORECASE).strip()
-                    search_for_compare = re.sub(r'\s+(?:Ltd|Limited|Inc|Corp|LLC|Co|Supplies|Supply|Agrovet|Agri|Traders|Enterprises)$', '', clean_customer, flags=re.IGNORECASE).strip()
-                    
-                    if name_for_compare.lower() == search_for_compare.lower():
-                        exact_match = cust
-                        break
-                
-                if exact_match:
-                    customer_data = exact_match
-                    logger.info(f"Exact customer name match found: {customer_data.get('CardName')}")
-                else:
-                    # Use the first (closest) match
-                    customer_data = customers[0]
-                    logger.info(f"Using closest match: {customer_data.get('CardName')} (searched for: {clean_customer})")
-        
-        if customer_data:
-            logger.info(f"Found customer: {customer_data.get('CardName')} ({customer_data.get('CardCode')})")
-            # Add additional customer details for better response
-            result = CustomerTransformer.transform([customer_data], max_items=1)
-            
-            # Enhance with additional fields if available
-            if result:
-                result[0]["card_code"] = customer_data.get("CardCode")
-                result[0]["balance"] = customer_data.get("CurrentAccountBalance") or customer_data.get("Balance")
-                result[0]["credit_limit"] = customer_data.get("CreditLimit")
-                result[0]["phone"] = customer_data.get("Phone1") or customer_data.get("Phone2")
-                result[0]["email"] = customer_data.get("EmailAddress")
-                result[0]["city"] = customer_data.get("City")
-                result[0]["country"] = customer_data.get("Country")
-            
-            return result
-        
-        logger.warning(f"No customer found matching: '{customer}'")
-        return []
-    
-    def _handle_sales_analytics(self, item: str, customer: str, limit: int) -> List[Dict]:
-        """Handle sales analytics intent"""
-        logger.info(f"Getting sales analytics for period: {item or 'last_30_days'}")
-        
-        # Determine period
-        period = "last_30_days"
-        if item:
-            item_lower = item.lower()
-            if "week" in item_lower or "7 days" in item_lower:
-                period = "last_7_days"
-            elif "month" in item_lower or "30 days" in item_lower:
-                period = "last_30_days"
-            elif "quarter" in item_lower or "90 days" in item_lower:
-                period = "last_90_days"
-            elif "year" in item_lower or "365 days" in item_lower:
-                period = "last_365_days"
-        
-        # Resolve customer code
-        customer_code = None
-        if customer:
-            customers = self.parent._safe_api_call(self.api.get_customers, search=customer, limit=1)
-            if customers:
-                customer_code = customers[0].get("CardCode")
-                logger.info(f"Filtering sales by customer: {customer} ({customer_code})")
-        
-        # Extract item filter
-        item_filter = None
-        if item and not any(x in item.lower() for x in ["week", "month", "quarter", "year", "day", "days"]):
-            item_filter = item
-            logger.info(f"Filtering sales by item: {item_filter}")
-        
-        try:
-            raw_data = self.parent._safe_api_call(
-                self.api.get_sales_analytics,
-                period=period,
-                limit=limit,
-                customer_code=customer_code,
-                item_code=item_filter
-            )
-            
-            if raw_data:
-                logger.info(f"Found sales analytics data from API")
-                return AnalyticsTransformer.transform(raw_data, period)
-            else:
-                logger.info("No sales data found from API, using fallback")
-                return get_fallback_sales_analytics()
-                
-        except Exception as e:
-            logger.error(f"Error getting sales analytics: {e}")
-            return get_fallback_sales_analytics()
-    
-    def _handle_items(self, item: str, limit: int) -> List[Dict]:
-        """Handle items intent with stock data enrichment"""
-        logger.info(f"Fetching items matching: '{item}'")
-        
-        raw = self.parent._safe_api_call(self.api.get_items, search=item, limit=min(limit, 50))
-        
-        if raw:
-            # Enhance with stock data
-            inventory = self.parent._safe_api_call(self.api.get_inventory_report, search=item, limit=min(limit, 50))
-            inventory_dict = {inv.get("ItemCode"): inv for inv in inventory}
-            logger.info(f"Loaded {len(raw)} items, {len(inventory_dict)} inventory records")
-            
-            for r in raw:
-                item_code = r.get("ItemCode")
-                if item_code and item_code in inventory_dict:
-                    inv_data = inventory_dict[item_code]
-                    r["CurrentOnHand"] = inv_data.get("CurrentOnHand", 0)
-                    r["CurrentIsCommited"] = inv_data.get("CurrentIsCommited", 0)
-                    r["LastTransactionDate"] = inv_data.get("LastTransactionDate", "")
-                    r["WhsCode"] = inv_data.get("WhsCode", "")
-            
-            return ItemTransformer.transform(raw, max_items=15)
-        
-        logger.warning(f"No items found matching '{item}'")
-        return []
-    
-    def _handle_customers(self, customer: str, limit: int) -> List[Dict]:
-        """Handle customers intent - list customers"""
-        raw = self.parent._safe_api_call(self.api.get_customers, search=customer, limit=min(limit, 30))
-        return CustomerTransformer.transform(raw, max_items=15)
-    
-    def _handle_stock_levels(self, item: str, limit: int) -> List[Dict]:
-        """Handle stock levels intent"""
-        logger.info(f"Getting stock levels for: {item or 'all items'}")
-        raw = self.parent._safe_api_call(self.api.get_inventory_report, search=item, limit=min(limit, 50))
-        
-        if raw:
-            logger.info(f"Found {len(raw)} stock records")
-            return ItemTransformer.transform(raw, max_items=15)
-        
-        logger.warning(f"No stock data found for: {item}")
-        return []
-    
-    def _handle_warehouses(self, warehouse: str, limit: int) -> List[Dict]:
-        """Handle warehouses intent"""
-        logger.info(f"Fetching warehouses...")
-        
-        try:
-            warehouses_summary = self.warehouse_service.get_all_warehouses_summary()
-            
-            if warehouses_summary and len(warehouses_summary) > 0:
-                logger.info(f"Found {len(warehouses_summary)} warehouses from WarehouseService")
-                return WarehouseTransformer.transform_from_summary(warehouses_summary, max_items=12)
-            else:
-                warehouses = self.warehouse_service.search_warehouses(query=warehouse if warehouse else "")
-                if warehouses:
-                    logger.info(f"Found {len(warehouses)} warehouses from search")
-                    return WarehouseTransformer.transform(warehouses, max_items=12)
-                else:
-                    logger.warning("No warehouse data from API, using fallback")
-                    return WarehouseTransformer.transform(get_fallback_warehouses(), max_items=12)
-                    
-        except Exception as e:
-            logger.error(f"Error fetching warehouses: {e}")
-            raw = self.parent._safe_api_call(self.api.get_warehouses, search=warehouse)
-            if raw:
-                return WarehouseTransformer.transform(raw, max_items=12)
-            else:
-                return WarehouseTransformer.transform(get_fallback_warehouses(), max_items=12)
-    
-    def _handle_low_stock_alerts(self, warehouse: str, item: str, limit: int) -> List[Dict]:
-        """
-        Handle low stock alerts intent.
 
-        When a warehouse filter is provided by the user (e.g. "dispatch"),
-        we first resolve it to a SAP WhsCode (e.g. "KDISPAT1") dynamically
-        before querying WarehouseService — avoiding hardcoded alias maps.
-        """
-        # Resolve human name → SAP WhsCode
-        resolved_whscode = self._resolve_warehouse_code(warehouse) if warehouse else None
-
-        logger.info(
-            f"Getting low stock alerts for warehouse: {resolved_whscode or 'all'}"
-            + (f" (resolved from: '{warehouse}')" if warehouse and resolved_whscode != warehouse else "")
-        )
-        
+    def _get_ap_invoices(self, vendor_code: str = None, limit: int = 50) -> List[Dict]:
+        """Get A/P invoices (SAP doc type 18)"""
         try:
-            if resolved_whscode:
-                alerts = self.warehouse_service.get_low_stock_alerts(
-                    whscode=resolved_whscode, threshold_pct=0.1, min_available=100
-                )
-            else:
-                alerts = self.warehouse_service.get_low_stock_alerts(threshold_pct=0.1, min_available=100)
-            
-            if alerts:
-                logger.info(f"Found {len(alerts)} low stock alerts from WarehouseService")
-                formatted_alerts = []
-                for alert in alerts:
-                    formatted_alerts.append({
-                        "ItemCode": alert.get("ItemCode"),
-                        "ItemName": alert.get("ItemName"),
-                        "CurrentOnHand": alert.get("OnHand", 0),
-                        "CurrentIsCommited": alert.get("Committed", 0),
-                        "Available": alert.get("Available", 0),
-                        "AlertLevel": alert.get("Severity", "LOW"),
-                        "WhsCode": alert.get("WhsCode"),
-                    })
-                return ItemTransformer.transform_low_stock(formatted_alerts, max_items=20)
-            else:
-                logger.info("No low stock alerts found")
+            if not self.service.api.auth_handler.ensure_auth():
                 return []
-                
-        except Exception as e:
-            logger.error(f"Error getting low stock alerts: {e}")
-            # Fallback: query inventory directly and compute alerts in-place
-            raw = self.parent._safe_api_call(self.api.get_inventory_report, search=item, limit=200)
-            
-            if not raw:
-                return []
-            
-            # Apply warehouse filter on raw data if we have a resolved code
-            if resolved_whscode:
-                raw = [
-                    itm for itm in raw
-                    if (itm.get("WhsCode") or "").upper() == resolved_whscode.upper()
-                ]
 
-            low_stock_items = []
-            for inv_item in raw:
-                on_hand = self.parent._safe_float(inv_item.get("CurrentOnHand", 0))
-                committed = self.parent._safe_float(inv_item.get("CurrentIsCommited", 0))
-                available = on_hand - committed
-                
-                if available <= 0 or available < 10:
-                    alert_level = "CRITICAL"
-                elif available < 50:
-                    alert_level = "LOW"
-                elif available < 100:
-                    alert_level = "MEDIUM"
-                else:
-                    continue
-                
-                low_stock_items.append({
-                    "ItemCode": inv_item.get("ItemCode"),
-                    "ItemName": inv_item.get("ItemName"),
-                    "CurrentOnHand": on_hand,
-                    "CurrentIsCommited": committed,
-                    "Available": available,
-                    "AlertLevel": alert_level,
-                    "WhsCode": inv_item.get("WhsCode"),
+            url = f"{self.service.api.base_url}/purchase/invoices/18"
+            params = {"page": 1, "per_page": limit}
+            if vendor_code:
+                params["CardCode"] = vendor_code
+
+            self.service.api._record_api_call()
+            resp = self.service.api.session.get(url, params=params, timeout=30)
+
+            if resp.status_code != 200:
+                logger.error(f"AP invoices API error: {resp.status_code}")
+                return []
+
+            data = resp.json()
+            result = data.get("ResponseData", {})
+            if isinstance(result, dict):
+                return result.get("data", [])
+            if isinstance(result, list):
+                return result
+            return []
+
+        except Exception as e:
+            logger.error(f"Failed to get AP invoices: {e}")
+            return []
+
+    def _get_overdue_invoices(self, customer_code: str = None, limit: int = 50) -> List[Dict]:
+        """Get overdue A/R invoices by filtering on due date"""
+        from datetime import datetime
+
+        invoices = self._get_ar_invoices(customer_code, limit)
+        overdue = []
+        today = datetime.now().date()
+
+        for inv in invoices:
+            due_date_str = inv.get("DocDueDate", "")
+            if due_date_str:
+                try:
+                    due_date = datetime.strptime(due_date_str[:10], "%Y-%m-%d").date()
+                    if due_date < today:
+                        inv["days_overdue"] = (today - due_date).days
+                        overdue.append(inv)
+                except Exception:
+                    pass
+
+        return sorted(overdue, key=lambda x: x.get("days_overdue", 0), reverse=True)
+
+    def _get_customer_balance(self, customer_code: str) -> List[Dict]:
+        """Get customer outstanding balance from open A/R invoices"""
+        invoices = self._get_ar_invoices(customer_code)
+        open_invoices = [inv for inv in invoices if inv.get("DocStatus") != "C"]
+        total_balance = sum(float(inv.get("DocTotal", 0)) for inv in open_invoices)
+
+        return [{
+            "customer_code": customer_code,
+            "open_invoice_count": len(open_invoices),
+            "total_balance": total_balance,
+            "currency": "KES",
+            "invoices": open_invoices,
+        }]
+
+    # =========================================================
+    # Purchase Handlers
+    # FIX: same pattern — direct session calls, no .get() on api.
+    # =========================================================
+
+    def _get_purchase_orders(self, vendor_code: str = None, limit: int = 50) -> List[Dict]:
+        """Get purchase orders (SAP doc type 22)"""
+        try:
+            if not self.service.api.auth_handler.ensure_auth():
+                return []
+
+            url = f"{self.service.api.base_url}/purchase/orders/22"
+            params = {"page": 1, "per_page": limit}
+            if vendor_code:
+                params["CardCode"] = vendor_code
+
+            self.service.api._record_api_call()
+            resp = self.service.api.session.get(url, params=params, timeout=30)
+
+            if resp.status_code != 200:
+                logger.error(f"Purchase orders API error: {resp.status_code}")
+                return []
+
+            data = resp.json()
+            result = data.get("ResponseData", {})
+            if isinstance(result, dict):
+                return result.get("data", [])
+            if isinstance(result, list):
+                return result
+            return []
+
+        except Exception as e:
+            logger.error(f"Failed to get purchase orders: {e}")
+            return []
+
+    def _get_purchase_requests(self, limit: int = 50) -> List[Dict]:
+        """Get purchase requests"""
+        try:
+            if not self.service.api.auth_handler.ensure_auth():
+                return []
+
+            url = f"{self.service.api.base_url}/purchase/requests"
+            params = {"page": 1, "per_page": limit}
+
+            self.service.api._record_api_call()
+            resp = self.service.api.session.get(url, params=params, timeout=30)
+
+            if resp.status_code != 200:
+                logger.error(f"Purchase requests API error: {resp.status_code}")
+                return []
+
+            data = resp.json()
+            result = data.get("ResponseData", {})
+            if isinstance(result, dict):
+                return result.get("data", [])
+            if isinstance(result, list):
+                return result
+            return []
+
+        except Exception as e:
+            logger.error(f"Failed to get purchase requests: {e}")
+            return []
+
+    def _get_goods_receipt(self, po_num: str = None, limit: int = 50) -> List[Dict]:
+        """Get goods receipt POs (SAP doc type 20)"""
+        try:
+            if not self.service.api.auth_handler.ensure_auth():
+                return []
+
+            url = f"{self.service.api.base_url}/purchase/goods-receipt/20"
+            params = {"page": 1, "per_page": limit}
+            if po_num:
+                params["po_num"] = po_num
+
+            self.service.api._record_api_call()
+            resp = self.service.api.session.get(url, params=params, timeout=30)
+
+            if resp.status_code != 200:
+                logger.error(f"Goods receipt API error: {resp.status_code}")
+                return []
+
+            data = resp.json()
+            result = data.get("ResponseData", {})
+            if isinstance(result, dict):
+                return result.get("data", [])
+            if isinstance(result, list):
+                return result
+            return []
+
+        except Exception as e:
+            logger.error(f"Failed to get goods receipts: {e}")
+            return []
+
+    # =========================================================
+    # Inventory Valuation & Reorder
+    # =========================================================
+
+    def _get_inventory_valuation(self) -> List[Dict]:
+        """Get inventory valuation report"""
+        try:
+            inventory = self.service._safe_api_call(self.service.api.get_inventory_report, limit=200)
+
+            total_value = 0
+            items = []
+            for item in inventory:
+                on_hand = float(item.get("CurrentOnHand", 0))
+                price = float(item.get("AvgPrice", 0)) or float(item.get("LastPrice", 0))
+                value = on_hand * price
+                total_value += value
+                items.append({
+                    "ItemCode": item.get("ItemCode"),
+                    "ItemName": item.get("ItemName"),
+                    "OnHand": on_hand,
+                    "AvgPrice": price,
+                    "Value": value,
                 })
-            
-            logger.info(f"Found {len(low_stock_items)} items with low stock alerts (fallback path)")
-            return ItemTransformer.transform_low_stock(low_stock_items, max_items=20)
-    
-    def _handle_outstanding_deliveries(self, customer: str, limit: int) -> List[Dict]:
-        """Handle outstanding deliveries intent"""
-        logger.info(f"Getting outstanding deliveries for customer: {customer or 'all'}")
-        
-        # Clean customer name
-        clean_customer = customer
-        if clean_customer:
-            prefixes_to_remove = [
-                r'^outstanding\s+deliveries?\s+for\s+',
-                r'^deliveries?\s+for\s+',
-                r'^show\s+me\s+deliveries?\s+for\s+',
-            ]
-            for prefix in prefixes_to_remove:
-                clean_customer = re.sub(prefix, '', clean_customer, flags=re.IGNORECASE)
-            clean_customer = clean_customer.strip()
-        
-        # Resolve customer code
-        customer_code = None
-        if clean_customer:
-            customers = self.parent._safe_api_call(self.api.get_customers, search=clean_customer, limit=5)
-            if customers:
-                customer_code = customers[0].get("CardCode")
-                logger.info(f"Resolved customer '{clean_customer}' to code: {customer_code}")
-            else:
-                logger.warning(f"Customer '{clean_customer}' not found")
-        
-        try:
-            raw = self.parent._safe_api_call(
-                self.api.get_outstanding_deliveries,
-                customer_code=customer_code,
-                limit=limit
-            )
-            
-            if raw:
-                logger.info(f"Found {len(raw)} outstanding deliveries")
-                return DeliveryTransformer.transform(raw, max_items=15)
-            else:
-                logger.info("No outstanding deliveries found")
-                return get_fallback_deliveries()
-                
+
+            return [{
+                "total_value": total_value,
+                "item_count": len(items),
+                "items": sorted(items, key=lambda x: x["Value"], reverse=True)[:50],
+            }]
+
         except Exception as e:
-            logger.error(f"Error getting outstanding deliveries: {e}")
-            return get_fallback_deliveries()
+            logger.error(f"Failed to get inventory valuation: {e}")
+            return []
+
+    def _get_reorder_report(self, limit: int = 50) -> List[Dict]:
+        """Get items that need reordering"""
+        try:
+            inventory = self.service._safe_api_call(self.service.api.get_inventory_report, limit=200)
+
+            reorder_items = []
+            for item in inventory:
+                on_hand = float(item.get("CurrentOnHand", 0))
+                min_stock = float(item.get("MinStock", 0)) or 10
+
+                if 0 < on_hand <= min_stock:
+                    reorder_items.append({
+                        "ItemCode": item.get("ItemCode"),
+                        "ItemName": item.get("ItemName"),
+                        "OnHand": on_hand,
+                        "ReorderPoint": min_stock,
+                        "Shortfall": min_stock - on_hand,
+                        "Warehouse": item.get("WhsCode"),
+                    })
+
+            return sorted(reorder_items, key=lambda x: x["Shortfall"], reverse=True)[:limit]
+
+        except Exception as e:
+            logger.error(f"Failed to get reorder report: {e}")
+            return []
+
+    # =========================================================
+    # Customer Handlers
+    # =========================================================
+
+    def _get_customers(self, search: str, limit: int) -> List[Dict]:
+        return self.service.api.get_customers(search=search, limit=limit)
+
+    def _get_customer_details(self, customer_name: str) -> List[Dict]:
+        customer = self.service.api.resolve_customer(customer_name)
+        return [customer] if customer else []
+
+    def _get_customer_orders(self, customer_name: str, limit: int) -> List[Dict]:
+        customer = self.service.api.resolve_customer(customer_name)
+        if not customer:
+            return []
+        return self.service.api.get_customer_orders(
+            customer_code=customer.get("CardCode"), limit=limit
+        )
+
+    def _get_customer_invoices(
+        self, customer_name: str, limit: int, only_outstanding: bool = False
+    ) -> List[Dict]:
+        customer = self.service.api.resolve_customer(customer_name)
+        if not customer:
+            return []
+
+        invoices = self._get_ar_invoices(customer.get("CardCode"), limit)
+
+        if only_outstanding:
+            invoices = [inv for inv in invoices if inv.get("DocStatus") != "C"]
+
+        return invoices
+
+    def _get_customer_health(self, customer_name: str) -> List[Dict]:
+        from app.services.customer_health_service import create_customer_health_service
+
+        health_service = create_customer_health_service(
+            user_token=self.service.user_token,
+            company_code=self.service.company_code,
+        )
+        result = health_service.score(customer_name=customer_name)
+        return [result] if not result.get("error") else []
+
+    # =========================================================
+    # Delivery Handlers
+    # =========================================================
+
+    def _get_outstanding_deliveries(self, customer_name: str, limit: int) -> List[Dict]:
+        if customer_name:
+            customer = self.service.api.resolve_customer(customer_name)
+            if customer:
+                return self.service.api.get_outstanding_deliveries(
+                    customer_code=customer.get("CardCode"), limit=limit
+                )
+        return self.service.api.get_outstanding_deliveries(limit=limit)
+
+    def _track_delivery(self, delivery_num: str) -> List[Dict]:
+        if not delivery_num:
+            return []
+        return self.service.api.get_delivery_details(delivery_num) or []
+
+    def _get_delivery_history(self, customer_name: str, limit: int) -> List[Dict]:
+        if customer_name:
+            customer = self.service.api.resolve_customer(customer_name)
+            if customer:
+                return self.service.api.get_delivery_history(
+                    customer_code=customer.get("CardCode"), limit=limit
+                )
+        return []
+
+    # =========================================================
+    # Item/Stock Handlers
+    # =========================================================
+
+    def _get_items(self, search: str, limit: int) -> List[Dict]:
+        return self.service.api.get_items(search=search, limit=limit)
+
+    def _get_sellable_items(self, search: str, limit: int) -> List[Dict]:
+        items = self.service.api.get_items(search=search, limit=limit)
+        return [i for i in items if i.get("SellItem") == "Y"]
+
+    def _get_purchasable_items(self, search: str, limit: int) -> List[Dict]:
+        items = self.service.api.get_items(search=search, limit=limit)
+        return [i for i in items if i.get("PurchaseItem") == "Y"]
+
+    def _get_inventory_items(self, search: str, limit: int) -> List[Dict]:
+        return self.service._safe_api_call(
+            self.service.api.get_inventory_report, search=search, limit=limit
+        )
+
+    def _get_item_details(self, item_code: str) -> List[Dict]:
+        item = self.service.api.get_item_by_code(item_code)
+        return [item] if item else []
+
+    def _get_stock_levels(self, item_name: str, limit: int) -> List[Dict]:
+        return self.service._safe_api_call(
+            self.service.api.get_inventory_report, search=item_name, limit=limit
+        )
+
+    def _get_warehouses(self) -> List[Dict]:
+        return self.service.warehouse_service.get_warehouses()
+
+    def _get_warehouse_stock(self, warehouse_name: str, limit: int) -> List[Dict]:
+        return self.service.warehouse_service.get_warehouse_stock(warehouse_name)
+
+    def _get_low_stock_alerts(self, warehouse_name: str, limit: int) -> List[Dict]:
+        return self.service.warehouse_service.get_low_stock_alerts(warehouse_name)
+
+    # =========================================================
+    # Price Handlers
+    # =========================================================
+
+    def _get_item_price(self, item_name: str) -> List[Dict]:
+        result = self.service.resolve_and_price(item_name=item_name)
+        return result if isinstance(result, list) else []
+
+    def _get_customer_price(self, item_name: str, customer_name: str) -> List[Dict]:
+        result = self.service.resolve_and_price(
+            item_name=item_name, customer_name=customer_name
+        )
+        return result if isinstance(result, list) else []

@@ -33,13 +33,28 @@ class InventoryHandler:
     
     @cache_api_result(ttl_seconds=ITEM_CACHE_TTL)
     def get_items(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
-        """Get items from item masterdata"""
+        """
+        Get items from item masterdata.
+        Uses the correct endpoint: /api/v1/item_masterdata
+        """
         try:
             if not self.auth_handler.ensure_auth():
                 return []
-                
-            url = f"{self.base_url}/item_masterdata"
-            params = {"page": 1, "per_page": 50, "search": search}
+            
+            # FIXED: Use correct endpoint with /api/v1 prefix
+            # Remove trailing /api/v1 from base_url if present to avoid double slash
+            base = self.base_url.rstrip('/')
+            # If base_url already contains /api/v1, don't add it again
+            if base.endswith('/api/v1'):
+                url = f"{base}/item_masterdata"
+            else:
+                url = f"{base}/api/v1/item_masterdata"
+            
+            params = {"page": 1, "per_page": min(limit, 100) if limit else 50}
+            if search:
+                params["search"] = search
+            
+            logger.info(f"📦 Fetching items from: {url}")
             self.parent._record_api_call()
             resp = self.session.get(url, params=params, timeout=15)
             
@@ -47,12 +62,81 @@ class InventoryHandler:
                 return []
             
             self.parent._debug_response("ITEMS", resp)
+            
             if resp.status_code == 200:
-                return apply_limit(normalize_response(resp.json()), limit)
-            return []
+                data = resp.json()
+                items = self._parse_items_response(data)
+                logger.info(f"✅ Retrieved {len(items)} items")
+                return apply_limit(items, limit)
+            else:
+                logger.warning(f"Items API returned {resp.status_code}")
+                return []
+                
         except Exception as e:
             self.parent._record_error()
             logger.error(f"Failed to fetch items: {e}")
+            return []
+    
+    def _parse_items_response(self, data: dict) -> List[Dict]:
+        """
+        Parse items response from /api/v1/item_masterdata.
+        
+        Response format:
+        {
+            "ResultState": true,
+            "ResultCode": 1200,
+            "ResultDesc": "Operation Was Successful",
+            "ResponseData": {
+                "current_page": 1,
+                "data": [
+                    {
+                        "id": 36847,
+                        "ItemName": "CRR F PAN HD TAP SCREW ST",
+                        "ItemCode": "SZN3200340",
+                        ...
+                    }
+                ]
+            }
+        }
+        """
+        try:
+            items = []
+            
+            # Check for the Leysco API response wrapper
+            if data.get("ResultState") and data.get("ResponseData"):
+                response_data = data["ResponseData"]
+                if isinstance(response_data, dict):
+                    # Extract data array from ResponseData
+                    items = response_data.get("data", [])
+                elif isinstance(response_data, list):
+                    items = response_data
+            else:
+                # Fallback for other response formats
+                if isinstance(data, dict):
+                    items = data.get("data", [])
+                elif isinstance(data, list):
+                    items = data
+            
+            # Normalize each item to consistent format
+            normalized = []
+            for item in items:
+                if isinstance(item, dict):
+                    normalized.append({
+                        "ItemCode": item.get("ItemCode", ""),
+                        "ItemName": item.get("ItemName", ""),
+                        "SellItem": item.get("SellItem", "Y"),
+                        "PurchaseItem": item.get("PurchaseItem", "Y"),
+                        "ItemGroup": item.get("ItemGroup", ""),
+                        "UnitPrice": safe_float(item.get("UnitPrice")),
+                        "CurrentOnHand": safe_float(item.get("CurrentOnHand", 0)),
+                        "id": item.get("id"),
+                    })
+            
+            logger.debug(f"Parsed {len(normalized)} items from response")
+            return normalized
+            
+        except Exception as e:
+            logger.error(f"Error parsing items response: {e}")
             return []
     
     def get_item_by_name(self, name: str) -> Optional[Dict]:
@@ -96,60 +180,60 @@ class InventoryHandler:
             page = 1
             per_page = min(limit, 500) if limit else 100
             
-            while True:
-                params = {"page": page, "per_page": per_page}
-                if search:
-                    params["search"] = search
-                    
-                url = f"{self.base_url}/inventory/report"
-                self.parent._record_api_call()
-                resp = self.session.get(url, params=params, timeout=15)
-                
-                if not self.auth_handler.check_auth(resp):
-                    logger.warning("Authentication failed during inventory fetch")
-                    break
-                
-                self.parent._debug_response("INVENTORY REPORT", resp)
-                
-                if resp.status_code != 200:
-                    logger.error(f"Inventory report API error: {resp.status_code}")
-                    break
-                
-                try:
-                    data = resp.json()
-                except Exception as e:
-                    logger.error(f"Failed to parse inventory report JSON: {e}")
-                    break
-                
-                items = self._parse_inventory_response(data)
-                
-                if not items:
-                    break
-                
-                for item in items:
-                    processed_item = {
-                        "ItemCode": item.get("ItemCode") or item.get("item_code", ""),
-                        "ItemName": item.get("ItemName") or item.get("item_name", ""),
-                        "WhsCode": item.get("WhsCode") or item.get("whs_code", ""),
-                        "CurrentOnHand": safe_float(item.get("CurrentOnHand") or item.get("OnHand")),
-                        "CurrentIsCommited": safe_float(item.get("CurrentIsCommited") or item.get("IsCommited")),
-                        "LastTransactionDate": item.get("LastTransactionDate", ""),
-                        "PeriodOutQty": safe_float(item.get("PeriodOutQty")),
-                        "Available": safe_float(item.get("CurrentOnHand") or item.get("OnHand")) - 
-                                     safe_float(item.get("CurrentIsCommited") or item.get("IsCommited"))
-                    }
-                    all_items.append(processed_item)
-                
-                if len(items) < per_page:
-                    break
-                page += 1
-                
-                if limit and len(all_items) >= limit:
-                    all_items = all_items[:limit]
-                    break
+            # Try multiple possible inventory endpoints
+            inventory_endpoints = [
+                "/api/v1/inventory/report",
+                "/inventory/report",
+                "/api/v1/InventoryPostings",
+            ]
             
-            logger.info(f"✅ Retrieved {len(all_items)} inventory items")
-            return all_items
+            for inv_endpoint in inventory_endpoints:
+                try:
+                    # Construct URL properly
+                    base = self.base_url.rstrip('/')
+                    if base.endswith('/api/v1') and inv_endpoint.startswith('/api/v1'):
+                        url = f"{base}{inv_endpoint[6:]}"  # Remove duplicate /api/v1
+                    else:
+                        url = f"{base}{inv_endpoint}"
+                    
+                    params = {"page": page, "per_page": per_page}
+                    if search:
+                        params["search"] = search
+                    
+                    logger.info(f"📊 Fetching inventory from: {url}")
+                    self.parent._record_api_call()
+                    resp = self.session.get(url, params=params, timeout=15)
+                    
+                    if not self.auth_handler.check_auth(resp):
+                        continue
+                    
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        items = self._parse_inventory_response(data)
+                        
+                        if items:
+                            for item in items:
+                                processed_item = {
+                                    "ItemCode": item.get("ItemCode") or item.get("item_code", ""),
+                                    "ItemName": item.get("ItemName") or item.get("item_name", ""),
+                                    "WhsCode": item.get("WhsCode") or item.get("whs_code", ""),
+                                    "CurrentOnHand": safe_float(item.get("CurrentOnHand") or item.get("OnHand")),
+                                    "CurrentIsCommited": safe_float(item.get("CurrentIsCommited") or item.get("IsCommited")),
+                                    "LastTransactionDate": item.get("LastTransactionDate", ""),
+                                    "PeriodOutQty": safe_float(item.get("PeriodOutQty")),
+                                    "Available": safe_float(item.get("CurrentOnHand") or item.get("OnHand")) - 
+                                                 safe_float(item.get("CurrentIsCommited") or item.get("IsCommited"))
+                                }
+                                all_items.append(processed_item)
+                            
+                            logger.info(f"✅ Retrieved {len(all_items)} inventory items from {inv_endpoint}")
+                            break
+                    
+                except Exception as e:
+                    logger.debug(f"Failed to fetch inventory from {inv_endpoint}: {e}")
+                    continue
+            
+            return all_items[:limit] if limit else all_items
             
         except Exception as e:
             self.parent._record_error()
@@ -180,34 +264,52 @@ class InventoryHandler:
             return []
     
     def get_warehouses(self, search: str = "", limit: Optional[int] = None) -> List[Dict]:
-        """Get warehouses from the correct API endpoint: /warehouse"""
+        """Get warehouses from the correct API endpoint"""
         try:
             if not self.auth_handler.ensure_auth():
                 logger.warning("Not authenticated, cannot fetch warehouses")
                 return []
             
-            url = f"{self.base_url}/warehouse"
-            params = {"page": 1, "per_page": 100}
-            if search:
-                params["search"] = search
+            # Try multiple possible warehouse endpoints
+            warehouse_endpoints = [
+                "/warehouse",
+                "/api/v1/warehouse",
+                "/warehouses",
+                "/api/v1/warehouses",
+            ]
             
-            logger.info(f"🏭 Fetching warehouses from: {url}")
-            self.parent._record_api_call()
-            resp = self.session.get(url, params=params, timeout=15)
+            for wh_endpoint in warehouse_endpoints:
+                try:
+                    base = self.base_url.rstrip('/')
+                    if base.endswith('/api/v1') and wh_endpoint.startswith('/api/v1'):
+                        url = f"{base}{wh_endpoint[6:]}"
+                    else:
+                        url = f"{base}{wh_endpoint}"
+                    
+                    params = {"page": 1, "per_page": 100}
+                    if search:
+                        params["search"] = search
+                    
+                    logger.info(f"🏭 Fetching warehouses from: {url}")
+                    self.parent._record_api_call()
+                    resp = self.session.get(url, params=params, timeout=15)
+                    
+                    if not self.auth_handler.check_auth(resp):
+                        continue
+                    
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        warehouses = normalize_warehouse_response(data)
+                        if warehouses:
+                            logger.info(f"✅ Retrieved {len(warehouses)} warehouses from {wh_endpoint}")
+                            return apply_limit(warehouses, limit)
+                            
+                except Exception as e:
+                    logger.debug(f"Failed to fetch warehouses from {wh_endpoint}: {e}")
+                    continue
             
-            if not self.auth_handler.check_auth(resp):
-                logger.warning("Authentication failed during warehouse fetch")
-                return []
-            
-            self.parent._debug_response("WAREHOUSES", resp)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                warehouses = normalize_warehouse_response(data)
-                return apply_limit(warehouses, limit)
-            else:
-                logger.error(f"Warehouse API error: {resp.status_code}")
-                return []
+            logger.warning("No warehouse endpoints returned data")
+            return []
             
         except Exception as e:
             self.parent._record_error()

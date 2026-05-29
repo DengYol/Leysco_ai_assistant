@@ -217,15 +217,34 @@ class EntityExtractor:
                 "", item_name, flags=re.IGNORECASE
             ).strip()
 
-            # If item looks like a company, move to customer
-            if CustomerRules.looks_like_company(item_name) and not ItemRules.is_product_name(item_name):
-                logger.info(f"Item '{item_name}' looks like company — moving to customer_name")
-                if not customer_name:
-                    customer_name = item_name
-                item_name = None
+            # ============================================================================
+            # FIX: DO NOT move item_name to customer_name
+            # ============================================================================
+            # REMOVED the problematic logic that was moving items to customer_name:
+            #
+            # OLD CODE (BUGGY):
+            #   if CustomerRules.looks_like_company(item_name) and not ItemRules.is_product_name(item_name):
+            #       logger.info(f"Item '{item_name}' looks like company — moving to customer_name")
+            #       if not customer_name:
+            #           customer_name = item_name
+            #       item_name = None
+            #
+            # REASON: This logic was causing items extracted from price queries to be
+            # reclassified as customer names, breaking the intent flow. Example:
+            #   Query: "what is the price of punched washer?"
+            #   - Item "PUNCHED WASHER" was correctly extracted from API
+            #   - But then reclassified as customer_name because it "looks like company"
+            #   - This triggered intent override to GET_CUSTOMER_PRICE
+            #   - Customer lookup failed → "Customer not found" response
+            #
+            # SOLUTION: If an item was extracted from product source (API), trust it.
+            # Only if it has no supporting data should we consider reclassification.
+            # For now, we simply trust the item extraction logic and keep item_name.
+            # ============================================================================
+            logger.info(f"✅ Item name retained: '{item_name}' (no reclassification to customer)")
 
-        # Extract from "for [company]" patterns (fallback)
-        if not customer_name and not is_listing and not is_competitor_pricing:
+        # Extract from "for [company]" patterns (fallback) - only if no item exists
+        if not customer_name and not item_name and not is_listing and not is_competitor_pricing:
             for_company_match = re.search(r'(?:for|kwa)\s+([A-Z][a-zA-Z0-9\s&\-.]+)$', original_text)
             if for_company_match:
                 potential_customer = for_company_match.group(1).strip()

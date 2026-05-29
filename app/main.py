@@ -3,12 +3,15 @@ app/main.py
 ===========
 Leysco AI Sales Assistant - Main Application Entry Point
 
+UPDATED: Phase 1 - Added database persistence and background scheduler
+UPDATED: Chat Persistence - Added conversation storage and history
 FIXED: Background scanner no longer uses TEST_USER_TOKEN or hardcoded users.
        It authenticates per-tenant using service account credentials and only
        scans users who have active sessions (real logged-in users).
 FIXED: CORS locked to configured origins instead of allow_origins=["*"].
 FIXED: Debug routes gated on APP_ENV, not a mutable DEBUG string.
 FIXED: Frontend no longer generates fake Bearer tokens in localStorage.
+ADDED: Authentication routes (/api/auth/login, /api/auth/logout, /api/auth/verify)
 """
 
 from fastapi import FastAPI, Request
@@ -19,6 +22,7 @@ from dotenv import load_dotenv
 from app.api.ai_routes import router as ai_router
 from app.api.tenant_routes import router as tenant_router
 from app.api.debug_routes import router as debug_router
+from app.api.auth_routes import router as auth_router  # ADDED: Import auth routes
 import logging
 import os
 import asyncio
@@ -26,6 +30,38 @@ from datetime import datetime
 
 # Load environment variables FIRST
 load_dotenv()
+
+# NEW: Phase 1 - Database and Scheduler imports
+try:
+    from app.models.notification_models import init_db
+    from app.services.notification_scheduler import init_scheduler, shutdown_scheduler
+    PHASE1_AVAILABLE = True
+except ImportError:
+    PHASE1_AVAILABLE = False
+    init_db = None
+    init_scheduler = None
+    shutdown_scheduler = None
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning(
+        "⚠️ Phase 1 modules not found. Notification database features disabled. "
+        "Copy Phase 1 files (notification_models.py, notification_scheduler.py) to app/"
+    )
+
+# NEW: Chat Persistence imports
+try:
+    from app.models.chat_models import ConversationSession, ChatMessage
+    from app.services.chat_persistence_service import get_chat_persistence_service
+    CHAT_PERSISTENCE_AVAILABLE = True
+except ImportError:
+    CHAT_PERSISTENCE_AVAILABLE = False
+    ConversationSession = None
+    ChatMessage = None
+    get_chat_persistence_service = None
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning(
+        "⚠️ Chat persistence modules not found. Chat history will not be saved. "
+        "Copy chat_models.py and chat_persistence_service.py to app/"
+    )
 
 # -----------------------------
 # Logging Setup
@@ -84,6 +120,7 @@ async def preserve_swagger_requests(request: Request, call_next):
 # -----------------------------
 # Include Routers
 # -----------------------------
+app.include_router(auth_router)                     # ADDED: Authentication routes (no prefix needed as it's in the router)
 app.include_router(ai_router, prefix="/api/ai", tags=["AI Assistant"])
 app.include_router(tenant_router, tags=["Tenant API"])
 
@@ -252,7 +289,10 @@ async def background_notification_scanner():
                         user_token=token,
                         assigned_customers=[],
                     )
-                    await notification_service.save_notifications(user_id, notifications)
+                    # NEW: Phase 1 - Save to database
+                    if PHASE1_AVAILABLE:
+                        await notification_service.save_notifications(user_id, notifications)
+                    
                     last_scan_times[user_id] = datetime.now()
                     logger.info(
                         f"Generated {len(notifications)} notifications "
@@ -270,9 +310,66 @@ async def background_notification_scanner():
         await asyncio.sleep(scan_interval_seconds)
 
 
-# -----------------------------
-# Startup Event
-# -----------------------------
+# ============================================================================
+# PHASE 1: DATABASE & SCHEDULER INITIALIZATION
+# ============================================================================
+
+async def _init_phase1():
+    """Initialize Phase 1 features (database, scheduler, etc.)"""
+    if not PHASE1_AVAILABLE:
+        logger.warning("⚠️ Phase 1 modules not available — skipping database/scheduler init")
+        return
+    
+    try:
+        # Initialize database
+        database_url = os.getenv(
+            "DATABASE_URL",
+            "postgresql://leysco_user:password@localhost:5432/leysco_ai"
+        )
+        logger.info(f"Initializing database: {database_url[:50]}...")
+        init_db(database_url)
+        logger.info("✅ Database initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize database: {e}", exc_info=True)
+        logger.warning("Continuing without database — notifications will be lost on restart")
+        return
+    
+    try:
+        # Initialize background scheduler (cleanup, escalation, etc.)
+        logger.info("Initializing background scheduler...")
+        init_scheduler()
+        logger.info("✅ Background scheduler initialized successfully")
+        logger.info("   - Cleanup job: Daily at 2:00 AM")
+        logger.info("   - Escalation job: Every hour")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize scheduler: {e}", exc_info=True)
+        logger.warning("Continuing without scheduler — cleanup and escalation disabled")
+
+
+# ============================================================================
+# CHAT PERSISTENCE INITIALIZATION
+# ============================================================================
+
+async def _init_chat_persistence():
+    """Initialize chat persistence service"""
+    if not CHAT_PERSISTENCE_AVAILABLE:
+        logger.warning("⚠️ Chat persistence modules not available — chat history will not be saved")
+        return
+    
+    try:
+        service = get_chat_persistence_service()
+        logger.info("✅ ChatPersistenceService initialized")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize chat persistence: {e}", exc_info=True)
+        logger.warning("Continuing without chat persistence — conversations will not be saved")
+
+
+# ============================================================================
+# STARTUP & SHUTDOWN EVENTS
+# ============================================================================
+
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 60)
@@ -284,6 +381,14 @@ async def startup_event():
         if hasattr(route, "path"):
             methods = getattr(route, "methods", ["ANY"])
             logger.info(f"   {methods} {route.path}")
+
+    # NEW: Phase 1 - Initialize database and scheduler
+    logger.info("\n📦 Initializing Phase 1 (Database & Scheduler)...")
+    await _init_phase1()
+
+    # NEW: Chat Persistence - Initialize conversation storage
+    logger.info("\n💬 Initializing Chat Persistence...")
+    await _init_chat_persistence()
 
     # Test LLM connection
     try:
@@ -307,23 +412,41 @@ async def startup_event():
     logger.info(f"🌐 Server running at: http://localhost:8000")
     logger.info(f"🔒 CORS origins: {_allowed_origins}")
     logger.info(f"🏢 Environment: {_app_env}")
-    logger.info("📚 API Documentation: http://localhost:8000/docs")
+    logger.info(f"🔐 Authentication endpoints:")
+    logger.info(f"   POST   /api/auth/login")
+    logger.info(f"   POST   /api/auth/logout")
+    logger.info(f"   POST   /api/auth/verify")
+    logger.info(f"📚 API Documentation: http://localhost:8000/docs")
     logger.info("=" * 60)
 
 
-# -----------------------------
-# Shutdown Event
-# -----------------------------
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("=" * 60)
     logger.info("🛑 Leysco AI Assistant Shutting Down...")
     logger.info("=" * 60)
+    
+    # NEW: Phase 1 - Shutdown scheduler
+    if PHASE1_AVAILABLE and shutdown_scheduler:
+        try:
+            shutdown_scheduler()
+            logger.info("✅ Background scheduler shut down")
+        except Exception as e:
+            logger.error(f"Error shutting down scheduler: {e}")
+    
+    # NEW: Chat Persistence - Graceful shutdown
+    if CHAT_PERSISTENCE_AVAILABLE and get_chat_persistence_service:
+        try:
+            # Service is stateless, but ensure any pending operations are complete
+            logger.info("✅ Chat persistence service shut down")
+        except Exception as e:
+            logger.error(f"Error during chat persistence shutdown: {e}")
 
 
-# -----------------------------
-# Frontend
-# -----------------------------
+# ============================================================================
+# FRONTEND & INFO ENDPOINTS
+# ============================================================================
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def serve_frontend():
     html_path = os.path.join(STATIC_DIR, "index.html")
@@ -417,15 +540,19 @@ async function sendTest() {
 </body></html>""")
 
 
-# -----------------------------
-# Health / Info Endpoints
-# -----------------------------
+# ============================================================================
+# HEALTH & INFO ENDPOINTS
+# ============================================================================
+
 @app.get("/health", include_in_schema=False)
 def health_check():
     return {
         "status": "ok",
         "service": "Leysco AI Sales Assistant",
         "environment": _app_env,
+        "phase1_enabled": PHASE1_AVAILABLE,
+        "chat_persistence_enabled": CHAT_PERSISTENCE_AVAILABLE,
+        "auth_enabled": True,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -436,7 +563,9 @@ def api_info():
         "name": "Leysco AI Sales Assistant",
         "version": "1.0.0",
         "endpoints": {
-            "login":            "/api/v1/login",
+            "login":            "/api/auth/login",
+            "logout":           "/api/auth/logout",
+            "verify_token":     "/api/auth/verify",
             "items":            "/api/v1/{tenant_id}/items",
             "inventory":        "/api/v1/{tenant_id}/inventory/",
             "orders":           "/api/v1/{tenant_id}/orders",
@@ -455,6 +584,9 @@ def api_info():
             "conversation_memory":    True,
             "proactive_notifications": True,
             "role_based_access":      True,
+            "persistent_notifications": PHASE1_AVAILABLE,
+            "chat_persistence":       CHAT_PERSISTENCE_AVAILABLE,
+            "auth_endpoints":         True,
         },
     }
 

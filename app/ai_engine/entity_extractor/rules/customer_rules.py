@@ -42,11 +42,20 @@ def clean_customer_name(raw: str) -> str:
         r'^(?:orders?|purchases)\s+(?:for|of|from)\s+',
         r'^what\s+(?:are|is)\s+the\s+(?:details|info)\s+(?:for|of|about)\s+',
         r'^tell\s+me\s+about\s+',
+        r'^analyse\s+',  # Add for behavior analysis
+        r'^analyze\s+',  # Add for behavior analysis
+        r'^customer\s+behaviour\s+for\s+',  # Add for behavior analysis
+        r'^customer\s+behavior\s+for\s+',  # Add for behavior analysis
+        r'^how\s+is\s+',  # Add for performance queries
     ]
     
     cleaned = raw
     for prefix in prefixes_to_remove:
         cleaned = re.sub(prefix, '', cleaned, flags=re.IGNORECASE)
+    
+    # Remove trailing "behaviour" or "behavior"
+    cleaned = re.sub(r'\s+behaviour$', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+behavior$', '', cleaned, flags=re.IGNORECASE)
     
     # Also use the existing noise pattern
     cleaned = CUSTOMER_NAME_NOISE.sub("", cleaned).strip()
@@ -179,10 +188,109 @@ class CustomerRules:
         return candidate
     
     @staticmethod
+    def _is_price_query(text: str) -> bool:
+        """
+        Check if the query is asking for a price.
+        
+        This helps us avoid extracting item names as customer names
+        in price queries like "what is the price of X?"
+        """
+        text_lower = text.lower()
+        price_keywords = [
+            "price", "cost", "how much", "what's", "what is", "charge",
+            "rate", "bei", "gharama", "thamani", "ngapi", "expensive",
+            "cheapest", "best price"
+        ]
+        return any(keyword in text_lower for keyword in price_keywords)
+
+    @staticmethod
+    def _is_behavior_query(text: str) -> bool:
+        """
+        Check if the query is asking for customer behavior analysis.
+        
+        This helps us extract customer names from patterns like:
+        "Analyse Mahakali Enterprises behaviour"
+        """
+        text_lower = text.lower()
+        behavior_keywords = [
+            "behaviour", "behavior", "analyse", "analyze", 
+            "performance", "performing", "trend", "pattern"
+        ]
+        return any(keyword in text_lower for keyword in behavior_keywords)
+
+    @staticmethod
+    def _extract_customer_from_behavior_query(text: str) -> str:
+        """
+        Extract customer name from behavior analysis queries.
+        
+        Examples:
+            "Analyse Mahakali Enterprises behaviour" → "Mahakali Enterprises"
+            "analyse customer behaviour for Mahakali Enterprises" → "Mahakali Enterprises"
+            "analyze customer behavior for ABC Traders" → "ABC Traders"
+            "how is XYZ Ltd performing" → "XYZ Ltd"
+        """
+        text_lower = text.lower()
+        
+        # Pattern 1: "analyse X behaviour" or "analyze X behavior"
+        # Use word boundaries and ensure we don't capture "customer" as the name
+        match = re.search(r'\b(?:analyse|analyze)\s+([A-Za-z][\w\s&]+?)\s+(?:behaviour|behavior)\b', text, re.IGNORECASE)
+        
+        # Pattern 2: "analyse behaviour of X" or "analyze behavior of X"
+        if not match:
+            match = re.search(r'\b(?:analyse|analyze)\s+(?:behaviour|behavior)\s+of\s+([A-Za-z][\w\s&]+)', text, re.IGNORECASE)
+        
+        # Pattern 3: "customer behaviour for X" or "customer behavior for X" (MOST IMPORTANT)
+        # Fixed: Now captures the text AFTER "for" instead of before
+        if not match:
+            match = re.search(r'customer\s+(?:behaviour|behavior)\s+for\s+([A-Za-z][\w\s&]+)', text, re.IGNORECASE)
+        
+        # Pattern 4: "how is X performing"
+        if not match:
+            match = re.search(r'how\s+is\s+([A-Za-z][\w\s&]+?)\s+performing', text, re.IGNORECASE)
+        
+        # Pattern 5: "performance of X"
+        if not match:
+            match = re.search(r'performance\s+of\s+([A-Za-z][\w\s&]+)', text, re.IGNORECASE)
+        
+        if match:
+            customer_name = match.group(1).strip()
+            # Remove trailing punctuation
+            customer_name = re.sub(r'[?.,!]$', '', customer_name)
+            # Filter out common stop words that might have been captured
+            invalid_names = ['customer', 'behaviour', 'behavior', 'for', 'of', 'the', 'a', 'an']
+            if customer_name and len(customer_name) > 2 and customer_name.lower() not in invalid_names:
+                logger.info(f"Extracted customer name from behavior query: '{customer_name}'")
+                return customer_name
+            else:
+                logger.debug(f"Filtered out invalid customer name: '{customer_name}'")
+        
+        return None
+
+    @staticmethod
     def extract_customer_name(text: str, is_listing: bool = False, is_competitor_pricing: bool = False) -> str:
         """Extract customer name from text."""
         text_lower = text.lower()
         customer_name = None
+        
+        # =====================================================================
+        # FIX: Check if this is a price query FIRST
+        # =====================================================================
+        # In price queries like "what is the price of Punched Washer?",
+        # we should NOT extract "Punched Washer" as a customer name.
+        # This prevents the issue where item_name and customer_name both get set.
+        # =====================================================================
+        is_price_query = CustomerRules._is_price_query(text)
+        
+        # =====================================================================
+        # NEW: Check if this is a behavior query - extract customer name
+        # =====================================================================
+        is_behavior_query = CustomerRules._is_behavior_query(text)
+        
+        if is_behavior_query and not is_listing:
+            behavior_customer = CustomerRules._extract_customer_from_behavior_query(text)
+            if behavior_customer:
+                logger.info(f"Extracted customer name from behavior analysis: '{behavior_customer}'")
+                return behavior_customer
         
         # Check for pronoun queries
         pronoun_patterns = [
@@ -228,39 +336,56 @@ class CustomerRules:
                     logger.info(f"Extracted customer name (details-of-pattern): '{customer_name}'")
                     return customer_name
 
-            # Step 3: "for/kwa <Name>" pattern
-            for_match = re.search(
-                r'\b(?:for|kwa)\s+([A-Z][A-Za-z0-9\s\'\-&]{2,})',
-                text,
-                re.IGNORECASE,
-            )
-            if for_match:
-                candidate = for_match.group(1).strip()
-                candidate = clean_customer_name(candidate)
-                candidate = CustomerRules._trim_at_boundary(candidate)
-                if candidate.lower() not in {
-                    "all", "customers", "customer", "list", "show",
-                    "wateja", "mteja", "orodha", "onyesha"
-                }:
-                    customer_name = candidate
-                    logger.info(f"Extracted customer name (for/kwa-pattern): '{customer_name}'")
-                    return customer_name
+            # ================================================================
+            # Step 3: "for/kwa <Name>" pattern - CONTEXT AWARE
+            # ================================================================
+            # FIX: Don't extract customer name from price queries using "of" pattern
+            # Example: "what is the price of Punched Washer?" should NOT extract customer
+            if not is_price_query:
+                for_match = re.search(
+                    r'\b(?:for|kwa)\s+([A-Z][A-Za-z0-9\s\'\-&]{2,})',
+                    text,
+                    re.IGNORECASE,
+                )
+                if for_match:
+                    candidate = for_match.group(1).strip()
+                    candidate = clean_customer_name(candidate)
+                    candidate = CustomerRules._trim_at_boundary(candidate)
+                    if candidate.lower() not in {
+                        "all", "customers", "customer", "list", "show",
+                        "wateja", "mteja", "orodha", "onyesha"
+                    }:
+                        customer_name = candidate
+                        logger.info(f"Extracted customer name (for/kwa-pattern): '{customer_name}'")
+                        return customer_name
+                else:
+                    logger.debug(f"Skipped for/kwa-pattern extraction (price query detected)")
+            else:
+                logger.debug(f"Skipped for/kwa-pattern extraction (price query detected)")
 
-            # Step 4: "of <Name>" pattern (for "details of X")
-            of_match = re.search(
-                r'\bof\s+([A-Z][A-Za-z0-9\s\'\-&]{2,})',
-                text,
-                re.IGNORECASE,
-            )
-            if of_match:
-                candidate = of_match.group(1).strip()
-                candidate = clean_customer_name(candidate)
-                candidate = CustomerRules._trim_at_boundary(candidate)
-                # Don't capture if it's a product or common word
-                if candidate.lower() not in {"items", "products", "stock", "inventory", "orders", "all"}:
-                    customer_name = candidate
-                    logger.info(f"Extracted customer name (of-pattern): '{customer_name}'")
-                    return customer_name
+            # Step 4: "of <Name>" pattern (for "details of X") - CONTEXT AWARE
+            # ================================================================
+            # FIX: Don't extract customer name from price queries using "of" pattern
+            # Example: "price of X" should NOT extract customer
+            if not is_price_query:
+                of_match = re.search(
+                    r'\bof\s+([A-Z][A-Za-z0-9\s\'\-&]{2,})',
+                    text,
+                    re.IGNORECASE,
+                )
+                if of_match:
+                    candidate = of_match.group(1).strip()
+                    candidate = clean_customer_name(candidate)
+                    candidate = CustomerRules._trim_at_boundary(candidate)
+                    # Don't capture if it's a product or common word
+                    if candidate.lower() not in {"items", "products", "stock", "inventory", "orders", "all"}:
+                        customer_name = candidate
+                        logger.info(f"Extracted customer name (of-pattern): '{customer_name}'")
+                        return customer_name
+                else:
+                    logger.debug(f"Skipped of-pattern extraction (price query detected)")
+            else:
+                logger.debug(f"Skipped of-pattern extraction (price query detected)")
 
             # Step 5: "customer/client <Name>" pattern
             name_match = re.search(
@@ -280,8 +405,16 @@ class CustomerRules:
                     logger.info(f"Extracted customer name (customer-pattern): '{customer_name}'")
                     return customer_name
             
+            # ===================================================================
             # Step 6: Direct name extraction (assuming the query starts with customer name)
-            if not customer_name and not re.search(r'^(show|list|get|find|check|what|how|tell|onyesha|orodhesha|tafuta|angalia)', text_lower):
+            # ===================================================================
+            # FIXED: Skip if this is a price query or behavior query (already handled)
+            # Prevents "Price of X" from being extracted as customer name
+            # ===================================================================
+            if not customer_name and not is_price_query and not is_behavior_query and not re.search(
+                r'^(show|list|get|find|check|what|how|tell|onyesha|orodhesha|tafuta|angalia|analyse|analyze)', 
+                text_lower
+            ):
                 words = text.split()
                 if len(words) >= 2:
                     potential_name = " ".join(words[:min(4, len(words))])
