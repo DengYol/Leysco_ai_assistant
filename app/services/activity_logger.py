@@ -1,8 +1,15 @@
 """
 app/services/activity_logger.py
 ================================
-Activity Logger & Analytics Service
+Activity Logger & Analytics Service - FIXED P1.2
 Tracks all AI interactions for audit, analytics, and improvement.
+
+FIXED: Database persistence now fully implemented with:
+- PostgreSQL async batch inserts
+- Connection pooling via asyncpg
+- Non-blocking async operations
+- Automatic retry on failure
+- Periodic batch flush (every 5 seconds)
 
 FEATURES:
 - Log all user queries and AI responses
@@ -22,6 +29,7 @@ from dataclasses import dataclass, asdict
 import uuid
 
 from app.services.cache_service import get_cache_service
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -51,21 +59,110 @@ class ActivityLogger:
     """
     Logs all AI interactions for analytics and audit.
     Uses dual storage: Redis for recent (fast queries), Database for archive.
+    
+    FIXED: Now persists to PostgreSQL with async batch inserts.
     """
     
     # Cache TTL for recent logs (24 hours)
     RECENT_TTL = 86400  # 24 hours
     
-    # Batch insert size
-    BATCH_SIZE = 100
+    # Batch insert parameters
+    BATCH_SIZE = 50  # Flush when buffer reaches 50 records
+    BATCH_FLUSH_INTERVAL = 5  # Flush every 5 seconds
     
     def __init__(self):
         self.cache = get_cache_service()
         self._batch_buffer = []
         self._batch_lock = asyncio.Lock()
+        self._db_pool = None  # PostgreSQL connection pool
+        self._pool_initialized = False
         
         # Start background batch processor
+        asyncio.create_task(self._initialize_pool())
         asyncio.create_task(self._batch_processor())
+    
+    # =========================================================
+    # DATABASE POOL INITIALIZATION
+    # =========================================================
+    
+    async def _initialize_pool(self) -> None:
+        """
+        Initialize PostgreSQL connection pool on startup.
+        
+        This is async so it doesn't block the app initialization.
+        """
+        try:
+            import asyncpg
+            
+            db_url = settings.DATABASE_URL
+            if not db_url:
+                logger.warning("DATABASE_URL not set - activity logs will not persist to database")
+                return
+            
+            # Parse connection string
+            # Expected format: postgresql://user:password@host:port/database
+            self._db_pool = await asyncpg.create_pool(
+                db_url,
+                min_size=2,
+                max_size=10,
+                command_timeout=60,
+            )
+            
+            self._pool_initialized = True
+            logger.info("✅ PostgreSQL connection pool initialized for activity logging")
+            
+            # Create table if not exists
+            await self._create_table()
+            
+        except ImportError:
+            logger.error("asyncpg not installed - activity logs will not persist to database")
+            logger.info("Install with: pip install asyncpg")
+        except Exception as e:
+            logger.error(f"Failed to initialize PostgreSQL pool: {e}")
+            logger.warning("Activity logs will be cached in Redis only")
+    
+    async def _create_table(self) -> None:
+        """
+        Create ai_activity_log table if it doesn't exist.
+        
+        This is safe to call repeatedly - it only creates if missing.
+        """
+        if not self._db_pool:
+            return
+        
+        try:
+            async with self._db_pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ai_activity_log (
+                        id UUID PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        user_role VARCHAR(50) NOT NULL,
+                        tenant_code VARCHAR(50) NOT NULL,
+                        session_id VARCHAR(100) NOT NULL,
+                        intent VARCHAR(100) NOT NULL,
+                        query TEXT,
+                        response_preview TEXT,
+                        response_length INTEGER,
+                        processing_time_ms INTEGER,
+                        suggestions_shown JSONB DEFAULT '[]',
+                        suggestion_accepted VARCHAR(255),
+                        context_used BOOLEAN DEFAULT FALSE,
+                        success BOOLEAN DEFAULT TRUE,
+                        error_message TEXT,
+                        created_at TIMESTAMP NOT NULL,
+                        
+                        -- Indexes for common queries
+                        INDEX idx_tenant_created (tenant_code, created_at DESC),
+                        INDEX idx_user_created (user_id, created_at DESC),
+                        INDEX idx_intent (intent, created_at DESC),
+                        INDEX idx_created (created_at DESC)
+                    );
+                """)
+            logger.debug("✅ ai_activity_log table ready")
+        except Exception as e:
+            # Table might already exist - that's OK
+            if "already exists" not in str(e).lower():
+                logger.warning(f"Could not create table: {e}")
     
     # =========================================================
     # MAIN LOGGING METHOD
@@ -147,14 +244,13 @@ class ActivityLogger:
             logger.error(f"Failed to log activity: {e}", exc_info=True)
     
     async def _store_recent(self, log_entry: ActivityLog) -> None:
-        """Store log entry in Redis for recent queries."""
+        """Store log entry in Redis for recent queries (fast access)."""
         try:
             # Add to sorted set with timestamp as score
             key = f"activity:recent:{log_entry.tenant_code}"
             score = datetime.now().timestamp()
             
-            # Use zadd (not zadd_async) - the cache service has this method
-            # The cache service's zadd method handles both Redis and memory cache
+            # Store entry ID with timestamp
             await self.cache.zadd_async(key, {log_entry.id: score})
             
             # Store the full entry as a hash
@@ -170,7 +266,12 @@ class ActivityLogger:
             logger.warning(f"Failed to store recent activity in Redis: {e}")
     
     async def _flush_batch(self) -> None:
-        """Flush batch buffer to database."""
+        """
+        Flush batch buffer to database.
+        
+        This removes items from buffer and attempts insert.
+        If insert fails, items are re-added for retry.
+        """
         async with self._batch_lock:
             if not self._batch_buffer:
                 return
@@ -187,44 +288,86 @@ class ActivityLogger:
             async with self._batch_lock:
                 self._batch_buffer.extend(batch)
     
+    # =========================================================
+    # DATABASE INSERTION - FIXED P1.2
+    # =========================================================
+    
     async def _insert_to_database(self, batch: List[Dict]) -> None:
         """
-        Insert batch to database.
-        This is a placeholder - implement with your actual database.
+        Insert batch to PostgreSQL database.
+        
+        FIXED: Now properly implements database persistence with:
+        - Async PostgreSQL insert via asyncpg
+        - Proper error handling
+        - Conversion of special types (list, dict) to JSONB
+        
+        Args:
+            batch: List of activity log dictionaries to insert
+        
+        Raises:
+            Exception: If database insert fails
         """
-        # TODO: Implement with your database (PostgreSQL, MySQL, etc.)
-        # Example with asyncpg:
-        # async with db_pool.acquire() as conn:
-        #     await conn.executemany("""
-        #         INSERT INTO ai_activity_log 
-        #         (id, user_id, user_role, tenant_code, session_id, intent, 
-        #          query, response_preview, response_length, processing_time_ms,
-        #          suggestions_shown, suggestion_accepted, context_used, 
-        #          success, error_message, created_at)
-        #         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-        #     """, batch)
+        if not self._db_pool:
+            logger.warning(f"Database pool not ready - dropping {len(batch)} log entries")
+            return
         
-        # For now, log to file
-        logger.info(f"📊 BATCH INSERT: {len(batch)} records ready for database")
-        
-        # Also write to JSON file for backup
         try:
-            import aiofiles
-            import os
-            # Create logs directory if it doesn't exist
-            os.makedirs("logs", exist_ok=True)
-            filename = f"logs/activity_{datetime.now().strftime('%Y%m%d')}.json"
-            async with aiofiles.open(filename, 'a') as f:
+            async with self._db_pool.acquire() as conn:
+                # Prepare data for insertion
+                # Convert UUIDs and special types to proper formats
+                prepared_batch = []
                 for record in batch:
-                    await f.write(json.dumps(record) + "\n")
+                    prepared_batch.append((
+                        uuid.UUID(record['id']),  # Convert string to UUID
+                        record['user_id'],
+                        record['user_role'],
+                        record['tenant_code'],
+                        record['session_id'],
+                        record['intent'],
+                        record['query'],
+                        record['response_preview'],
+                        record['response_length'],
+                        record['processing_time_ms'],
+                        json.dumps(record['suggestions_shown']),  # Convert list to JSON
+                        record['suggestion_accepted'],
+                        record['context_used'],
+                        record['success'],
+                        record['error_message'],
+                        record['created_at']
+                    ))
+                
+                # Batch insert all records
+                await conn.executemany("""
+                    INSERT INTO ai_activity_log 
+                    (id, user_id, user_role, tenant_code, session_id, intent, 
+                     query, response_preview, response_length, processing_time_ms,
+                     suggestions_shown, suggestion_accepted, context_used, 
+                     success, error_message, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                """, prepared_batch)
+                
+                logger.debug(f"✅ Inserted {len(batch)} activity logs into PostgreSQL")
+        
         except Exception as e:
-            logger.warning(f"Failed to write to JSON backup: {e}")
+            logger.error(f"Database insertion failed: {e}", exc_info=True)
+            # Re-raise so caller knows to retry
+            raise
     
     async def _batch_processor(self) -> None:
-        """Background task to flush batch periodically."""
+        """
+        Background task to flush batch periodically.
+        
+        Flushes every BATCH_FLUSH_INTERVAL seconds (default 5 seconds)
+        to ensure logs don't sit in buffer for too long.
+        """
+        await asyncio.sleep(1)  # Wait for pool to initialize
+        
         while True:
-            await asyncio.sleep(60)  # Every minute
-            await self._flush_batch()
+            try:
+                await asyncio.sleep(self.BATCH_FLUSH_INTERVAL)
+                await self._flush_batch()
+            except Exception as e:
+                logger.error(f"Error in batch processor: {e}")
     
     # =========================================================
     # QUERY METHODS FOR ANALYTICS
@@ -236,7 +379,7 @@ class ActivityLogger:
         limit: int = 100,
         hours: int = 24
     ) -> List[Dict]:
-        """Get recent activity for a tenant."""
+        """Get recent activity for a tenant from Redis cache."""
         try:
             key = f"activity:recent:{tenant_code}"
             
@@ -290,7 +433,7 @@ class ActivityLogger:
         else:
             start_date = end_date - timedelta(days=1)
         
-        # Get activity from recent cache first, then database
+        # Get activity from recent cache first
         recent = await self.get_recent_activity(tenant_code, limit=1000)
         
         # Filter by date range
@@ -369,10 +512,8 @@ class ActivityLogger:
         days: int = 30
     ) -> Dict[str, Any]:
         """Get detailed intent analytics."""
-        # Get activity
         recent = await self.get_recent_activity(tenant_code, limit=5000)
         
-        # Filter by days
         cutoff = datetime.now() - timedelta(days=days)
         filtered = []
         for entry in recent:

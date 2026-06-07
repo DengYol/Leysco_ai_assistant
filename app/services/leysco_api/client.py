@@ -359,3 +359,15 @@ def _UserSessionManager_get(token):
 
 # patch the reference above
 UserSessionManager_get = _UserSessionManager_get
+
+_api_client_instance = None
+
+
+async def get_leysco_api_client():
+    """Get or create LeyscoAPIService instance."""
+    global _api_client_instance
+    if _api_client_instance is None:
+        _api_client_instance = LeyscoAPIService()
+        # Note: No initialize() method on LeyscoAPIService - 
+        # initialization happens in __init__
+    return _api_client_instance

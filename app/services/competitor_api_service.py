@@ -1,7 +1,13 @@
 """
-app/services/competitor_api_service.py
-========================================
-Competitor API Integration for Market Pricing - Optimized with caching and async support
+app/services/competitor_api_service.py (P1.4 - Gated Sample Data)
+==================================================================
+Competitor API Integration with feature-gated sample pricing.
+
+CHANGE:
+- ALLOW_SAMPLE_DATA flag controls fallback to sample prices
+- Production: Returns error if no real API data (no sample fallback)
+- Testing: Can use sample prices with ALLOW_SAMPLE_DATA=true
+- Data source always marked in responses
 """
 
 import logging
@@ -10,6 +16,7 @@ import requests
 import math
 import random
 import hashlib
+import os
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 from functools import lru_cache, wraps
@@ -17,11 +24,21 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# FEATURE GATE: Allow sample data (default: false for production)
+# ============================================================================
+
+ALLOW_SAMPLE_DATA = os.getenv("ALLOW_SAMPLE_DATA", "false").lower() == "true"
+
+if not ALLOW_SAMPLE_DATA:
+    logger.warning("⚠️ ALLOW_SAMPLE_DATA is disabled. Sample pricing will NOT be used.")
+else:
+    logger.info("✅ ALLOW_SAMPLE_DATA is enabled. Sample pricing will be used as fallback.")
+
 # Safe import with fallback for settings
 try:
     from app.core.config import settings
 except ImportError:
-    # Fallback for when config is not available (testing/standalone)
     from types import SimpleNamespace
     settings = SimpleNamespace()
     settings.ENABLED_COMPETITORS = ""
@@ -41,7 +58,6 @@ except ImportError:
 try:
     from app.services.cache_service import get_cache_service
 except ImportError:
-    # Fallback mock cache
     class MockCache:
         def get_simple(self, key):
             return None
@@ -89,7 +105,6 @@ def cache_competitor(ttl_seconds: int = COMPETITOR_CACHE_TTL):
                 return result
             except Exception as e:
                 logger.warning(f"Cache error in competitor service: {e}")
-                # Fall through to execute function without caching
                 return func(self, *args, **kwargs)
         return wrapper
     return decorator
@@ -97,17 +112,23 @@ def cache_competitor(ttl_seconds: int = COMPETITOR_CACHE_TTL):
 
 class CompetitorAPIService:
     """
-    Service to fetch competitor pricing from various market APIs
-    Optimized with caching and async support.
+    Service to fetch competitor pricing from market APIs.
+    
+    PRODUCTION (ALLOW_SAMPLE_DATA=false):
+    - Returns error if no real competitor data available
+    - No fallback to sample/generated prices
+    
+    TESTING (ALLOW_SAMPLE_DATA=true):
+    - Falls back to sample prices if APIs unavailable
+    - Clearly marks sample data source
     """
     
     def __init__(self):
-        # Parse enabled competitors from settings
         enabled_list = []
         if hasattr(settings, 'ENABLED_COMPETITORS') and settings.ENABLED_COMPETITORS:
             enabled_list = [c.strip() for c in settings.ENABLED_COMPETITORS.split(",") if c.strip()]
         
-        # Configuration for different competitor APIs
+        # Competitor API configuration
         self.competitors = {
             "twiga": {
                 "name": "Twiga Foods",
@@ -130,45 +151,25 @@ class CompetitorAPIService:
                 "enabled": "farmcrowdy" in enabled_list,
                 "timeout": getattr(settings, 'COMPETITOR_API_TIMEOUT_SECONDS', 10),
             },
-            "market": {
-                "name": "Open Market Survey",
-                "base_url": None,
-                "api_key": None,
-                "enabled": "market" in enabled_list or True,
-                "timeout": 5,
-            },
-            "worldbank": {
-                "name": "World Bank - Kenya Price Trends",
-                "base_url": getattr(settings, 'WORLD_BANK_API_URL', 'https://api.worldbank.org/v2'),
-                "api_key": None,
-                "enabled": "worldbank" in enabled_list and getattr(settings, 'WORLD_BANK_ENABLED', False),
-                "timeout": 10,
-                "country_code": "KE",
-                "indicators": {
-                    "cpi": "FP.CPI.TOTL",
-                    "food_inflation": "FP.CPI.TOTL.ZG",
-                    "producer_prices": "AG.PRD.CROP.XD",
-                }
-            }
         }
         
-        # Cache for competitor prices (legacy - will be replaced by Redis)
+        # Cache
         self._price_cache = {}
         self._cache_timestamp = {}
         cache_ttl_hours = getattr(settings, 'COMPETITOR_CACHE_TTL_HOURS', 1)
         self.cache_duration = timedelta(hours=cache_ttl_hours)
         
-        # Session for API calls with connection pooling
+        # Session
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
             "User-Agent": "Leysco-AI/1.0"
         })
         
-        # Thread pool for concurrent API calls
+        # Thread pool
         self._executor = ThreadPoolExecutor(max_workers=5)
         
-        # Stats tracking
+        # Stats
         self._stats = {
             "cache_hits": 0,
             "cache_misses": 0,
@@ -176,37 +177,24 @@ class CompetitorAPIService:
             "errors": 0
         }
         
-        logger.info(f"CompetitorAPIService initialized with enabled competitors: {enabled_list}")
+        logger.info(f"CompetitorAPIService initialized with {len([c for c in self.competitors.values() if c.get('enabled')])} enabled competitors")
 
     # ------------------------------------------------------------------
-    # STATS HELPERS
+    # MAIN PUBLIC METHODS
     # ------------------------------------------------------------------
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get service statistics."""
-        return self._stats.copy()
-    
-    def _record_cache_hit(self):
-        self._stats["cache_hits"] += 1
-    
-    def _record_cache_miss(self):
-        self._stats["cache_misses"] += 1
-    
-    def _record_api_call(self):
-        self._stats["api_calls"] += 1
-    
-    def _record_error(self):
-        self._stats["errors"] += 1
-
-    # -------------------------------------------------
-    # MAIN PUBLIC METHODS (Optimized with caching)
-    # -------------------------------------------------
 
     @cache_competitor(ttl_seconds=COMPETITOR_CACHE_TTL)
     def get_competitor_prices(self, item_name: str, item_code: str = None) -> List[Dict]:
         """
-        Get competitor prices for an item from all enabled sources
-        Optimized with Redis caching.
+        Get competitor prices for an item from all enabled sources.
+        
+        PRODUCTION (ALLOW_SAMPLE_DATA=false):
+        - Returns empty list if no real data available
+        - Caller must handle and return error
+        
+        TESTING (ALLOW_SAMPLE_DATA=true):
+        - Falls back to generated sample prices
+        - Marks as 'sample' in source field
         """
         if not item_name:
             logger.warning("get_competitor_prices called with empty item_name")
@@ -216,23 +204,23 @@ class CompetitorAPIService:
         
         all_prices = []
         
-        # Fetch from each enabled competitor
+        # Fetch from enabled competitors (if any configured)
         for comp_id, config in self.competitors.items():
-            if config.get("enabled", False):
-                if comp_id == "worldbank":
-                    prices = self._fetch_from_worldbank(item_name, item_code)
-                elif comp_id == "market":
-                    prices = self._get_market_survey_prices(item_name, item_code)
-                elif config.get("base_url"):
-                    prices = self._fetch_from_competitor(comp_id, config, item_name, item_code)
-                else:
-                    continue
-                
+            if config.get("enabled", False) and config.get("base_url"):
+                prices = self._fetch_from_competitor(comp_id, config, item_name, item_code)
                 if prices:
                     all_prices.extend(prices)
         
-        # Add sample/estimated data if we have nothing
+        # ===== HANDLE NO REAL DATA =====
         if not all_prices:
+            logger.warning(f"⚠️ No real competitor data for {item_name}")
+            
+            if not ALLOW_SAMPLE_DATA:
+                logger.error(f"🚫 Sample data disabled (ALLOW_SAMPLE_DATA=false). Returning empty list.")
+                return []
+            
+            # Fallback to sample/estimated data (TESTING ONLY)
+            logger.warning(f"📊 Generating SAMPLE prices for {item_name} (ALLOW_SAMPLE_DATA=true)")
             all_prices = self._generate_sample_prices(item_name, item_code)
         
         return all_prices
@@ -245,7 +233,12 @@ class CompetitorAPIService:
     def compare_with_leysco(self, leysco_price: float, item_name: str, item_code: str = None) -> Dict:
         """
         Compare Leysco price with competitor prices.
-        Optimized with caching.
+        
+        PRODUCTION (ALLOW_SAMPLE_DATA=false):
+        - Returns error if no real competitor data
+        
+        TESTING (ALLOW_SAMPLE_DATA=true):
+        - Uses sample data if needed
         """
         # Handle None or invalid leysco_price
         if leysco_price is None:
@@ -260,15 +253,21 @@ class CompetitorAPIService:
         
         competitor_prices = self.get_competitor_prices(item_name, item_code)
         
+        # ===== NO COMPETITOR DATA AVAILABLE =====
         if not competitor_prices:
             return {
                 "leysco_price": leysco_price,
                 "competitor_count": 0,
-                "message": "No competitor data available",
-                "competitive_position": "UNKNOWN"
+                "error": "NO_COMPETITOR_DATA",
+                "message": (
+                    "No competitor pricing data available. "
+                    "Configure ALLOW_SAMPLE_DATA=true to use sample data."
+                ),
+                "competitive_position": "UNKNOWN",
+                "data_source": "none"
             }
         
-        # Calculate statistics - filter out None values
+        # Calculate statistics
         prices = []
         for p in competitor_prices:
             price = p.get("price")
@@ -280,7 +279,8 @@ class CompetitorAPIService:
                 "leysco_price": leysco_price,
                 "competitor_count": len(competitor_prices),
                 "message": "No valid price data",
-                "competitive_position": "UNKNOWN"
+                "competitive_position": "UNKNOWN",
+                "data_source": "invalid"
             }
         
         avg_price = sum(prices) / len(prices)
@@ -307,11 +307,14 @@ class CompetitorAPIService:
             position = "HIGH"
             message = "Your price is significantly higher than competitors"
         
-        # Calculate potential savings
+        # Calculate savings
         savings_vs_avg = round(avg_price - leysco_price, 2) if leysco_price > 0 and leysco_price < avg_price else 0
         savings_vs_min = round(min_price - leysco_price, 2) if leysco_price > 0 and leysco_price < min_price else 0
         
-        return {
+        # ===== DETERMINE DATA SOURCE FOR AUDIT =====
+        is_sample = any(p.get("source") == "sample" for p in competitor_prices)
+        
+        result = {
             "leysco_price": leysco_price,
             "competitor_count": len(prices),
             "market_stats": {
@@ -328,16 +331,22 @@ class CompetitorAPIService:
                 "potential_capture": round((avg_price - leysco_price) * 100 / avg_price, 1) if avg_price > 0 and leysco_price > 0 else 0,
             },
             "recommendation": self._generate_recommendation(position, leysco_price, avg_price, min_price),
+            "data_source": "sample" if is_sample else "real",
             "competitors": competitor_prices[:10]
         }
+        
+        if is_sample:
+            result["warning"] = "⚠️ Comparison uses SAMPLE data for testing purposes"
+        
+        return result
 
     @cache_competitor(ttl_seconds=MARKET_INTEL_TTL)
     def get_market_intelligence(self, category: str = None) -> Dict:
         """
-        Get market intelligence and trends including World Bank data
-        Optimized with caching (2 hour TTL).
+        Get market intelligence and trends.
+        
+        This returns curated market insights (not sample data).
         """
-        # Base market intelligence
         market_data = {
             "category": category or "All Products",
             "timestamp": datetime.now().isoformat(),
@@ -366,7 +375,8 @@ class CompetitorAPIService:
                 "Review vegetable pricing strategy",
                 "Lock in grain prices with suppliers",
                 "Monitor currency rates for imports",
-            ]
+            ],
+            "data_source": "market_intelligence"
         }
         
         return market_data
@@ -381,12 +391,13 @@ class CompetitorAPIService:
     
     def _fetch_from_competitor(self, comp_id: str, config: Dict, item_name: str, item_code: str = None) -> List[Dict]:
         """
-        Fetch prices from a specific competitor API
+        Fetch prices from a specific competitor API.
+        Returns empty list if API unavailable (no fallback to sample here).
         """
         try:
-            self._record_api_call()
+            self._stats["api_calls"] += 1
             
-            # For now, return empty list since APIs are not configured
+            # For now, return empty list since APIs not fully configured
             # In production, implement actual API calls here
             logger.debug(f"Competitor API {comp_id} not fully configured yet")
             return []
@@ -395,67 +406,18 @@ class CompetitorAPIService:
             logger.debug(f"Timeout fetching from {config['name']}")
             return []
         except Exception as e:
-            self._record_error()
+            self._stats["errors"] += 1
             logger.debug(f"Error fetching from {config['name']}: {e}")
             return []
 
-    def _fetch_from_worldbank(self, item_name: str, item_code: str = None) -> List[Dict]:
-        """
-        Fetch economic indicators from World Bank API
-        """
-        # World Bank integration - simplified for now
-        return []
-
-    def _get_market_survey_prices(self, item_name: str, item_code: str = None) -> List[Dict]:
-        """
-        Get market survey/estimated prices based on item category
-        """
-        category = self._guess_category(item_name)
-        
-        market_ranges = {
-            "vegetables": {"min": 50, "max": 200, "avg": 120},
-            "fruits": {"min": 80, "max": 300, "avg": 180},
-            "grains": {"min": 40, "max": 150, "avg": 90},
-            "dairy": {"min": 60, "max": 250, "avg": 150},
-            "meat": {"min": 300, "max": 800, "avg": 500},
-            "default": {"min": 100, "max": 500, "avg": 250},
-        }
-        
-        ranges = market_ranges.get(category, market_ranges["default"])
-        
-        markets = [
-            "Kariokor Market",
-            "Wakulima Market",
-            "Gikomba Market",
-            "City Market",
-        ]
-        
-        prices = []
-        for market in markets[:3]:
-            try:
-                price = {
-                    "competitor_id": "market",
-                    "competitor_name": market,
-                    "item_name": item_name,
-                    "item_code": item_code,
-                    "price": round(random.uniform(ranges["min"], ranges["avg"]), 2),
-                    "currency": "KES",
-                    "in_stock": True,
-                    "unit": "kg",
-                    "price_date": datetime.now().isoformat(),
-                    "source": "market_survey",
-                }
-                prices.append(price)
-            except Exception as e:
-                logger.debug(f"Error generating market price: {e}")
-                continue
-        
-        return prices
-
     def _generate_sample_prices(self, item_name: str, item_code: str = None) -> List[Dict]:
         """
-        Generate sample competitor prices when no real data is available
+        Generate SAMPLE competitor prices for TESTING ONLY.
+        
+        ⚠️ Only called when ALLOW_SAMPLE_DATA=true and no real data available.
         """
+        logger.warning(f"⚠️ Generating SAMPLE prices for {item_name} (for testing only)")
+        
         category = self._guess_category(item_name)
         
         base_prices = {
@@ -489,7 +451,7 @@ class CompetitorAPIService:
                     "in_stock": True,
                     "unit": "kg",
                     "price_date": datetime.now().isoformat(),
-                    "source": "sample",
+                    "source": "sample",  # ===== MARK AS SAMPLE =====
                 }
                 prices.append(price)
             except Exception as e:
@@ -497,13 +459,12 @@ class CompetitorAPIService:
                 continue
         
         prices.sort(key=lambda x: x["price"])
+        logger.warning(f"⚠️ Generated {len(prices)} SAMPLE prices")
         return prices
 
     @lru_cache(maxsize=256)
     def _guess_category(self, item_name: str) -> str:
-        """
-        Guess item category from name - Cached for performance.
-        """
+        """Guess item category from name."""
         if not item_name:
             return "default"
             
@@ -529,9 +490,7 @@ class CompetitorAPIService:
         return "default"
 
     def _generate_recommendation(self, position: str, leysco_price: float, avg_price: float, min_price: float) -> str:
-        """
-        Generate pricing recommendation based on competitive position
-        """
+        """Generate pricing recommendation."""
         recommendations = {
             "VERY_COMPETITIVE": "Your price is very competitive! Consider maintaining margins while increasing marketing.",
             "COMPETITIVE": "Good pricing position. Monitor competitors and consider loyalty programs.",
@@ -544,18 +503,15 @@ class CompetitorAPIService:
         
         return recommendations.get(position, "Review pricing strategy based on market conditions.")
 
-    # ------------------------------------------------------------------
-    # Cache Management
-    # ------------------------------------------------------------------
+    def get_stats(self) -> Dict[str, Any]:
+        """Get service statistics."""
+        return self._stats.copy()
 
     def clear_cache(self):
         """Clear the price cache."""
         self._price_cache = {}
         self._cache_timestamp = {}
-        
-        # Clear LRU caches
         self._guess_category.cache_clear()
-        
         logger.info("Competitor price cache cleared")
         self._stats["cache_hits"] = 0
         self._stats["cache_misses"] = 0
@@ -566,9 +522,7 @@ _competitor_pricing_service: Optional[CompetitorAPIService] = None
 
 
 def get_competitor_pricing_service() -> CompetitorAPIService:
-    """
-    Get or create the singleton instance of CompetitorAPIService
-    """
+    """Get or create the singleton instance of CompetitorAPIService."""
     global _competitor_pricing_service
     if _competitor_pricing_service is None:
         try:
@@ -576,9 +530,5 @@ def get_competitor_pricing_service() -> CompetitorAPIService:
             logger.info("Created new CompetitorAPIService singleton instance")
         except Exception as e:
             logger.error(f"Failed to create CompetitorAPIService: {e}")
-            # Create a minimal instance
             _competitor_pricing_service = CompetitorAPIService()
     return _competitor_pricing_service
-
-
-# End of file
