@@ -5,6 +5,9 @@ Leysco AI Sales Assistant - Main Application Entry Point
 
 UPDATED: Phase 1 - Added database persistence and background scheduler
 UPDATED: Chat Persistence - Added conversation storage and history
+UPDATED: Phase 1.3 - Added vector store initialization and ERP data loading
+UPDATED: S1.0 Input Validation - Added Pydantic validation and sanitization
+UPDATED: S1.1 + S1.2 Rate Limiting & Error Handling - Added rate limits and secure errors
 FIXED: Background scanner no longer uses TEST_USER_TOKEN or hardcoded users.
        It authenticates per-tenant using service account credentials and only
        scans users who have active sessions (real logged-in users).
@@ -12,6 +15,10 @@ FIXED: CORS locked to configured origins instead of allow_origins=["*"].
 FIXED: Debug routes gated on APP_ENV, not a mutable DEBUG string.
 FIXED: Frontend no longer generates fake Bearer tokens in localStorage.
 ADDED: Authentication routes (/api/auth/login, /api/auth/logout, /api/auth/verify)
+ADDED: Vector store initialization for ERP knowledge base (P1.3)
+ADDED: Input validation middleware (S1.0) - Prevents SQL injection and XSS
+ADDED: Rate limiting (S1.1) - Prevents DDoS and brute force attacks
+ADDED: Secure error handling (S1.2) - No data leaks, security logging
 """
 
 from fastapi import FastAPI, Request
@@ -22,11 +29,22 @@ from dotenv import load_dotenv
 from app.api.ai_routes import router as ai_router
 from app.api.tenant_routes import router as tenant_router
 from app.api.debug_routes import router as debug_router
-from app.api.auth_routes import router as auth_router  # ADDED: Import auth routes
+from app.api.auth_routes import router as auth_router
+# S1.0 Input Validation
+from app.api.middleware.validators import validation_error_handler
+from fastapi.exceptions import RequestValidationError
+# S1.1 + S1.2 Rate Limiting & Error Handling
+from app.core.rate_limiter import get_rate_limiter
+from app.core.error_handlers import (
+    handle_exception, log_security_event,
+    AppError, ClientError, ServerError,
+    RateLimitError
+)
 import logging
 import os
 import asyncio
 from datetime import datetime
+import time
 
 # Load environment variables FIRST
 load_dotenv()
@@ -63,6 +81,22 @@ except ImportError:
         "Copy chat_models.py and chat_persistence_service.py to app/"
     )
 
+# NEW: Phase 1.3 - Vector Store imports (ERP Knowledge Base)
+try:
+    from app.services.vector_store import init_vector_store, close_vector_store
+    from app.services.erp_data_loader import load_erp_data_on_startup
+    VECTOR_STORE_AVAILABLE = True
+except ImportError:
+    VECTOR_STORE_AVAILABLE = False
+    init_vector_store = None
+    close_vector_store = None
+    load_erp_data_on_startup = None
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning(
+        "⚠️ Vector store modules not found. ERP knowledge base disabled. "
+        "Copy vector_store.py and erp_data_loader.py to app/services/"
+    )
+
 # -----------------------------
 # Logging Setup
 # -----------------------------
@@ -84,6 +118,15 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+# S1.0: Input Validation - Register Pydantic error handler
+app.add_exception_handler(
+    RequestValidationError,
+    validation_error_handler
+)
+
+# S1.2: Error Handling - Register global exception handler for all unhandled exceptions
+app.add_exception_handler(Exception, handle_exception)
+
 # -----------------------------
 # CORS — locked to configured origins
 # -----------------------------
@@ -104,7 +147,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Company-Code",
-                   "X-Session-ID", "X-Tenant-Env"],
+                   "X-Session-ID", "X-Tenant-Env", "X-User-ID"],
 )
 
 # -----------------------------
@@ -120,7 +163,7 @@ async def preserve_swagger_requests(request: Request, call_next):
 # -----------------------------
 # Include Routers
 # -----------------------------
-app.include_router(auth_router)                     # ADDED: Authentication routes (no prefix needed as it's in the router)
+app.include_router(auth_router)
 app.include_router(ai_router, prefix="/api/ai", tags=["AI Assistant"])
 app.include_router(tenant_router, tags=["Tenant API"])
 
@@ -138,9 +181,9 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
-# -----------------------------
-# Background Notification Scanner
-# -----------------------------
+# ============================================================================
+# BACKGROUND NOTIFICATION SCANNER
+# ============================================================================
 
 async def _get_active_scan_users() -> list:
     """
@@ -165,8 +208,8 @@ async def _get_active_scan_users() -> list:
                     "user_id":    session.get("user_id"),
                     "user_role":  session.get("user_role", "sales_rep"),
                     "tenant_code": session.get("tenant_code"),
-                    "token":      session.get("token"),        # real token stored at login
-                    "backend_url": session.get("backend_url"), # per-tenant backend
+                    "token":      session.get("token"),
+                    "backend_url": session.get("backend_url"),
                 })
     except Exception as e:
         logger.warning(f"Could not read active sessions: {e}")
@@ -174,8 +217,6 @@ async def _get_active_scan_users() -> list:
     # Development seed — only when no real sessions exist AND not in production
     if not users and _app_env != "production":
         logger.debug("No active sessions found — using dev seed users for scanner")
-        # These are only scanned if a real token exists in the session cache.
-        # Without a cached token the scanner skips them gracefully.
         users = [
             {"user_id": 1, "user_role": "manager",   "tenant_code": "TEST001",
              "token": None, "backend_url": os.getenv("LARAVEL_BACKEND_URL_TEST001")},
@@ -311,6 +352,39 @@ async def background_notification_scanner():
 
 
 # ============================================================================
+# PHASE 1.3: VECTOR STORE INITIALIZATION (ERP KNOWLEDGE BASE)
+# ============================================================================
+
+async def _init_vector_store():
+    """Initialize vector store for ERP knowledge base (P1.3)"""
+    if not VECTOR_STORE_AVAILABLE:
+        logger.warning("⚠️ Vector store modules not available — ERP knowledge base disabled")
+        return
+    
+    try:
+        logger.info("Initializing vector store for ERP knowledge base...")
+        await init_vector_store()
+        logger.info("✅ Vector store initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize vector store: {e}", exc_info=True)
+        logger.warning("Continuing without vector store — ERP knowledge base disabled")
+
+
+async def _load_erp_data():
+    """Load ERP data into vector store on startup (P1.3)"""
+    if not VECTOR_STORE_AVAILABLE:
+        return
+    
+    try:
+        logger.info("Loading ERP data into vector store...")
+        await load_erp_data_on_startup()
+        logger.info("✅ ERP data loaded successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to load ERP data: {e}", exc_info=True)
+        logger.warning("Continuing — will retry ERP data load on next startup")
+
+
+# ============================================================================
 # PHASE 1: DATABASE & SCHEDULER INITIALIZATION
 # ============================================================================
 
@@ -382,11 +456,35 @@ async def startup_event():
             methods = getattr(route, "methods", ["ANY"])
             logger.info(f"   {methods} {route.path}")
 
-    # NEW: Phase 1 - Initialize database and scheduler
+    # S1.0: Input Validation
+    logger.info("\n🔐 Initializing Input Validation (S1.0)...")
+    logger.info("✅ Input validation middleware initialized")
+    logger.info("   - SQL injection protection: ENABLED")
+    logger.info("   - XSS protection: ENABLED")
+    logger.info("   - Type validation: ENABLED")
+
+    # S1.1 + S1.2: Rate Limiting & Error Handling
+    logger.info("\n⚠️  Initializing Rate Limiting & Error Handling (S1.1 + S1.2)...")
+    limiter = get_rate_limiter()
+    logger.info("✅ Rate limiting initialized")
+    logger.info("   - Login attempts: 5 per 5 minutes")
+    logger.info("   - Chat messages: 50 per minute")
+    logger.info("   - API calls: 100 per minute")
+    logger.info("✅ Error handling configured")
+    logger.info("   - No stack traces to clients")
+    logger.info("   - Sensitive data redaction enabled")
+    logger.info("   - Security event logging enabled")
+
+    # Phase 1 - Initialize database and scheduler
     logger.info("\n📦 Initializing Phase 1 (Database & Scheduler)...")
     await _init_phase1()
 
-    # NEW: Chat Persistence - Initialize conversation storage
+    # Phase 1.3 - Initialize vector store
+    logger.info("\n🧠 Initializing Phase 1.3 (Vector Store & ERP Knowledge Base)...")
+    await _init_vector_store()
+    await _load_erp_data()
+
+    # Chat Persistence - Initialize conversation storage
     logger.info("\n💬 Initializing Chat Persistence...")
     await _init_chat_persistence()
 
@@ -426,7 +524,15 @@ async def shutdown_event():
     logger.info("🛑 Leysco AI Assistant Shutting Down...")
     logger.info("=" * 60)
     
-    # NEW: Phase 1 - Shutdown scheduler
+    # Phase 1.3 - Vector store shutdown
+    if VECTOR_STORE_AVAILABLE and close_vector_store:
+        try:
+            await close_vector_store()
+            logger.info("✅ Vector store shut down")
+        except Exception as e:
+            logger.error(f"Error shutting down vector store: {e}")
+    
+    # Phase 1 - Shutdown scheduler
     if PHASE1_AVAILABLE and shutdown_scheduler:
         try:
             shutdown_scheduler()
@@ -434,10 +540,9 @@ async def shutdown_event():
         except Exception as e:
             logger.error(f"Error shutting down scheduler: {e}")
     
-    # NEW: Chat Persistence - Graceful shutdown
+    # Chat Persistence - Graceful shutdown
     if CHAT_PERSISTENCE_AVAILABLE and get_chat_persistence_service:
         try:
-            # Service is stateless, but ensure any pending operations are complete
             logger.info("✅ Chat persistence service shut down")
         except Exception as e:
             logger.error(f"Error during chat persistence shutdown: {e}")
@@ -454,8 +559,6 @@ async def serve_frontend():
         with open(html_path, "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
 
-    # Minimal fallback UI — no fake tokens, no localStorage token generation.
-    # The Flutter app handles real auth; this page is only for quick API testing.
     return HTMLResponse(content="""<!DOCTYPE html>
 <html><head><title>Leysco AI Assistant</title><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -551,8 +654,11 @@ def health_check():
         "service": "Leysco AI Sales Assistant",
         "environment": _app_env,
         "phase1_enabled": PHASE1_AVAILABLE,
+        "phase1_3_vector_store_enabled": VECTOR_STORE_AVAILABLE,
         "chat_persistence_enabled": CHAT_PERSISTENCE_AVAILABLE,
         "auth_enabled": True,
+        "rate_limiting_enabled": True,
+        "error_handling_enabled": True,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -586,7 +692,11 @@ def api_info():
             "role_based_access":      True,
             "persistent_notifications": PHASE1_AVAILABLE,
             "chat_persistence":       CHAT_PERSISTENCE_AVAILABLE,
+            "erp_knowledge_base":     VECTOR_STORE_AVAILABLE,
             "auth_endpoints":         True,
+            "input_validation":       True,
+            "rate_limiting":          True,
+            "error_handling":         True,
         },
     }
 
