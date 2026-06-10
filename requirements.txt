@@ -16,6 +16,15 @@ aiohttp>=3.8.0
 python-multipart>=0.0.6
 
 # =========================================================
+# SECURITY & CRYPTOGRAPHY (NEW)
+# =========================================================
+PyJWT>=2.8.0                     # JWT token management
+bcrypt>=4.1.0                    # Password hashing with bcrypt
+cryptography>=41.0.0             # Encryption (AES-256-GCM)
+python-jose[cryptography]>=3.3.0 # Additional JWT support
+slowapi>=0.1.8                   # Rate limiting
+
+# =========================================================
 # DATA PROCESSING & ML (FULLY INSTALLED)
 # =========================================================
 numpy>=1.24.0
@@ -43,7 +52,7 @@ google-genai>=0.2.0              # REPLACED: New Gemini SDK (was google-generati
 # =========================================================
 sentence-transformers>=2.2.0    # Local embeddings (free, works offline)
 pgvector>=0.2.0                 # PostgreSQL vector extension support
-psycopg2-binary>=2.9.0          # PostgreSQL adapter
+psycopg2-binary>=2.9.0          # PostgreSQL adapter (sync)
 
 # Optional: Better embeddings (requires API keys)
 # openai>=1.0.0                  # OpenAI embeddings (more accurate, costs money)
@@ -53,6 +62,13 @@ psycopg2-binary>=2.9.0          # PostgreSQL adapter
 # =========================================================
 networkx>=3.0.0                 # Graph operations (fallback, no external DB needed)
 neo4j>=5.14.0                   # Neo4j driver (optional - for production graph database)
+
+# =========================================================
+# DATABASE (PostgreSQL - Both sync and async drivers)
+# =========================================================
+asyncpg>=0.29.0                 # PostgreSQL (async) - ENABLED FOR P1.2 Activity Logging
+sqlalchemy>=2.0.0               # ORM
+psycopg2-binary>=2.9.0          # PostgreSQL adapter (sync fallback)
 
 # =========================================================
 # UTILITIES
@@ -72,14 +88,6 @@ seaborn>=0.12.0
 plotly>=5.0.0                   # UNCOMMENTED - fixes plotly import error
 
 # =========================================================
-# DATABASE (PostgreSQL with pgvector for RAG)
-# =========================================================
-# asyncpg>=0.29.0      # PostgreSQL (async)
-# aiomysql>=0.2.0      # MySQL
-sqlalchemy>=2.0.0               # ORM
-psycopg2-binary>=2.9.0          # PostgreSQL adapter (already above, keeping for clarity)
-
-# =========================================================
 # SCHEDULING & TASKS (NEW)
 # =========================================================
 APScheduler>=3.10.0              # Advanced Python Scheduler for background jobs
@@ -90,6 +98,11 @@ APScheduler>=3.10.0              # Advanced Python Scheduler for background jobs
 openpyxl>=3.1.0                  # Excel file support
 xlrd>=2.0.0                      # Excel reading (legacy format)
 xlsxwriter>=3.1.0                # Excel writing
+
+# =========================================================
+# FILE I/O (For activity logger backups)
+# =========================================================
+aiofiles>=23.1.0                # Async file operations
 
 # =========================================================
 # ADDITIONAL UTILITIES (NEW)
