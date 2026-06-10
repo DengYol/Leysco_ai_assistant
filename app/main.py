@@ -8,6 +8,7 @@ UPDATED: Chat Persistence - Added conversation storage and history
 UPDATED: Phase 1.3 - Added vector store initialization and ERP data loading
 UPDATED: S1.0 Input Validation - Added Pydantic validation and sanitization
 UPDATED: S1.1 + S1.2 Rate Limiting & Error Handling - Added rate limits and secure errors
+UPDATED: S1.3 + S2.0 Audit Trail & RBAC - Added audit logging and role-based access control
 FIXED: Background scanner no longer uses TEST_USER_TOKEN or hardcoded users.
        It authenticates per-tenant using service account credentials and only
        scans users who have active sessions (real logged-in users).
@@ -19,6 +20,8 @@ ADDED: Vector store initialization for ERP knowledge base (P1.3)
 ADDED: Input validation middleware (S1.0) - Prevents SQL injection and XSS
 ADDED: Rate limiting (S1.1) - Prevents DDoS and brute force attacks
 ADDED: Secure error handling (S1.2) - No data leaks, security logging
+ADDED: Audit trail (S1.3) - Track all user actions for compliance
+ADDED: RBAC (S2.0) - Role-based access control with granular permissions
 """
 
 from fastapi import FastAPI, Request
@@ -30,6 +33,8 @@ from app.api.ai_routes import router as ai_router
 from app.api.tenant_routes import router as tenant_router
 from app.api.debug_routes import router as debug_router
 from app.api.auth_routes import router as auth_router
+from app.core.audit_trail import get_audit_trail, AuditAction
+from app.core.rbac import get_rbac, require_permission, require_role
 # S1.0 Input Validation
 from app.api.middleware.validators import validation_error_handler
 from fastapi.exceptions import RequestValidationError
@@ -475,6 +480,27 @@ async def startup_event():
     logger.info("   - Sensitive data redaction enabled")
     logger.info("   - Security event logging enabled")
 
+    # S1.3: Audit Trail
+    logger.info("\n📋 Initializing Audit Trail (S1.3)...")
+    audit = get_audit_trail()
+    database_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql://leysco_user:Laat%4020@localhost:5432/leysco_ai"
+    )
+    audit.init_db(database_url)
+    logger.info("✅ Audit trail initialized")
+    logger.info("   - All user actions logged")
+    logger.info("   - GDPR compliance ready")
+    logger.info("   - Resource history tracking enabled")
+
+    # S2.0: Authentication & RBAC
+    logger.info("\n🔐 Initializing Authentication & RBAC (S2.0)...")
+    rbac = get_rbac()
+    logger.info("✅ Role-Based Access Control initialized")
+    logger.info("   - Roles: admin, manager, sales_rep, customer, viewer")
+    logger.info("   - Permission-based access control")
+    logger.info("   - Resource-level security enabled")
+
     # Phase 1 - Initialize database and scheduler
     logger.info("\n📦 Initializing Phase 1 (Database & Scheduler)...")
     await _init_phase1()
@@ -659,6 +685,8 @@ def health_check():
         "auth_enabled": True,
         "rate_limiting_enabled": True,
         "error_handling_enabled": True,
+        "audit_trail_enabled": True,
+        "rbac_enabled": True,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -697,6 +725,8 @@ def api_info():
             "input_validation":       True,
             "rate_limiting":          True,
             "error_handling":         True,
+            "audit_trail":            True,
+            "rbac":                   True,
         },
     }
 
