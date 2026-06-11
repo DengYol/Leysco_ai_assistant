@@ -42,6 +42,7 @@ from app.core.rbac import get_rbac, require_permission, require_role
 from app.core.token_manager import get_token_manager
 from app.core.request_signing import get_request_signer
 from app.core.encryption import get_encryption_manager
+from app.core.security_headers import security_headers_middleware, SECURITY_HEADERS
 # S1.0 Input Validation
 from app.api.middleware.validators import validation_error_handler
 from fastapi.exceptions import RequestValidationError
@@ -129,6 +130,9 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
 )
+
+# S2.4: Security Headers - Register early
+app.middleware("http")(security_headers_middleware)
 
 # S1.0: Input Validation - Register Pydantic error handler
 app.add_exception_handler(
@@ -532,6 +536,17 @@ async def startup_event():
     logger.info("   - Bcrypt password hashing")
     logger.info("   - Authenticated encryption enabled")
 
+    # S2.4: Security Headers
+    logger.info("\n🛡️  Initializing Security Headers (S2.4)...")
+    logger.info("✅ Security headers initialized")
+    logger.info("   - HSTS (HTTP Strict Transport Security)")
+    logger.info("   - Clickjacking protection (X-Frame-Options)")
+    logger.info("   - MIME-type sniffing protection")
+    logger.info("   - XSS protection headers")
+    logger.info("   - Content Security Policy")
+    logger.info("   - Referrer Policy")
+    logger.info("   - Permissions Policy")
+
     # Phase 1 - Initialize database and scheduler
     logger.info("\n📦 Initializing Phase 1 (Database & Scheduler)...")
     await _init_phase1()
@@ -721,6 +736,7 @@ def health_check():
         "token_management_enabled": True,
         "request_signing_enabled": True,
         "encryption_enabled": True,
+        "security_headers_enabled": True,  # ADD THIS LINE
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -764,6 +780,7 @@ def api_info():
             "token_management":       True,
             "request_signing":        True,
             "encryption":             True,
+            "security_headers":       True,  # ADD THIS LINE
         },
     }
 
