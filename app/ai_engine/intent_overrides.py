@@ -8,10 +8,41 @@ that are more reliable than the small LLM's intent predictions.
 """
 
 import logging
-from typing import Dict
+from typing import Dict, Any, Optional, Union, Tuple
 import re
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_string_value(value: Any) -> Optional[str]:
+    """
+    Extract string value from entity, handling tuples from entity extractor.
+    
+    Entity extractor may return:
+    - String: "item name"
+    - Tuple: ("item name", confidence_flag)
+    - None: None
+    
+    Args:
+        value: Value to extract from (string, tuple, or None)
+    
+    Returns:
+        Extracted string or None
+    """
+    if value is None:
+        return None
+    
+    # If it's a tuple, extract the first element (the actual value)
+    if isinstance(value, tuple):
+        extracted = value[0] if value else None
+        return str(extracted).strip() if extracted else None
+    
+    # If it's already a string, return it
+    if isinstance(value, str):
+        return value.strip() if value else None
+    
+    # Otherwise convert to string
+    return str(value).strip() if value else None
 
 
 def apply_intent_overrides(intent: str, entities: dict) -> str:
@@ -30,9 +61,11 @@ def apply_intent_overrides(intent: str, entities: dict) -> str:
         The corrected intent string
     """
     original_intent = intent
-    item_name = (entities.get("item_name") or "").strip()
-    customer_name = (entities.get("customer_name") or "").strip()
-    warehouse_name = (entities.get("warehouse") or "").strip()
+    
+    # Extract string values from entities, handling tuples from entity extractor
+    item_name = _extract_string_value(entities.get("item_name")) or ""
+    customer_name = _extract_string_value(entities.get("customer_name")) or ""
+    warehouse_name = _extract_string_value(entities.get("warehouse")) or ""
     detail_mode = entities.get("detail_mode", False)
     
     # Get original query if available (from entity extractor)

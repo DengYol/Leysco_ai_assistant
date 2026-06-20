@@ -263,6 +263,160 @@ class DBQueryService:
         """Async version of query."""
         return await asyncio.to_thread(self.query, intent, entities, language)
     
+    # ========================================================================
+    # FIX: ADD get_items METHOD WITH SORTING SUPPORT
+    # ========================================================================
+    
+    def get_items(
+        self, 
+        limit: int = 20, 
+        sort_by: str = None, 
+        sort_order: str = "DESC",
+        search: str = None,
+        **kwargs
+    ) -> List[Dict]:
+        """
+        Get items with optional sorting.
+        
+        Args:
+            limit: Maximum number of items to return
+            sort_by: Field to sort by (e.g., "OnHand", "ItemName")
+            sort_order: "ASC" or "DESC"
+            search: Optional search term to filter items
+            **kwargs: Additional filters
+            
+        Returns:
+            List of item dictionaries with full data including OnHand
+        """
+        logger.info(f"📦 get_items: limit={limit}, sort_by={sort_by}, sort_order={sort_order}, search={search}")
+        
+        try:
+            # Fetch items from API with search if provided
+            if search:
+                items = self._safe_api_call(self.api.get_items, search=search, limit=limit)
+            else:
+                items = self._safe_api_call(self.api.get_items, limit=limit)
+            
+            if not items:
+                logger.warning("No items returned from API")
+                return []
+            
+            logger.info(f"✅ Retrieved {len(items)} raw items from API")
+            
+            # Normalize item data
+            normalized_items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                
+                # Ensure OnHand field exists
+                if "OnHand" not in item:
+                    # Try alternative field names
+                    if "CurrentOnHand" in item:
+                        item["OnHand"] = item["CurrentOnHand"]
+                    elif "OnHandQty" in item:
+                        item["OnHand"] = item["OnHandQty"]
+                    elif "Quantity" in item:
+                        item["OnHand"] = item["Quantity"]
+                    elif "Stock" in item:
+                        item["OnHand"] = item["Stock"]
+                    else:
+                        item["OnHand"] = 0
+                
+                # Ensure OnHand is a number
+                if isinstance(item["OnHand"], str):
+                    try:
+                        item["OnHand"] = float(item["OnHand"].replace(',', ''))
+                    except (ValueError, TypeError):
+                        item["OnHand"] = 0
+                
+                # Ensure item_group exists
+                if "item_group" not in item:
+                    item["item_group"] = {}
+                
+                # Ensure full_name exists
+                if "full_name" not in item:
+                    item["full_name"] = f"{item.get('ItemCode', '')} -- {item.get('ItemName', '')}"
+                
+                normalized_items.append(item)
+            
+            # Apply sorting if specified
+            if sort_by and normalized_items:
+                if sort_by == "OnHand":
+                    normalized_items.sort(
+                        key=lambda x: float(x.get('OnHand', 0)) if x.get('OnHand') is not None else float('inf'),
+                        reverse=(sort_order.upper() == "DESC")
+                    )
+                elif sort_by == "ItemName":
+                    normalized_items.sort(
+                        key=lambda x: x.get('ItemName', '').lower(),
+                        reverse=(sort_order.upper() == "DESC")
+                    )
+                elif sort_by == "ItemCode":
+                    normalized_items.sort(
+                        key=lambda x: x.get('ItemCode', '').lower(),
+                        reverse=(sort_order.upper() == "DESC")
+                    )
+                logger.info(f"✅ Sorted items by {sort_by} ({sort_order})")
+            
+            # Apply limit
+            if limit and len(normalized_items) > limit:
+                normalized_items = normalized_items[:limit]
+            
+            logger.info(f"✅ Returning {len(normalized_items)} items")
+            return normalized_items
+            
+        except Exception as e:
+            logger.error(f"Error in get_items: {e}", exc_info=True)
+            return []
+    
+    # ========================================================================
+    # FIX: ADD get_low_stock_items METHOD
+    # ========================================================================
+    
+    def get_low_stock_items(self, threshold: int = 100, limit: int = 50) -> List[Dict]:
+        """
+        Get items with low stock (below threshold).
+        
+        Args:
+            threshold: Stock threshold (items with stock below this are considered low)
+            limit: Maximum number of items to return
+            
+        Returns:
+            List of low stock items sorted by stock (lowest first)
+        """
+        logger.info(f"🔍 get_low_stock_items: threshold={threshold}, limit={limit}")
+        
+        try:
+            # Fetch items with higher limit to filter
+            items = self.get_items(limit=limit * 2, sort_by="OnHand", sort_order="ASC")
+            
+            if not items:
+                logger.warning("No items returned from get_items")
+                return []
+            
+            # Filter items with stock below threshold
+            low_stock = []
+            for item in items:
+                on_hand = item.get('OnHand', 0)
+                if isinstance(on_hand, (int, float)) and on_hand < threshold:
+                    low_stock.append(item)
+            
+            # If no items below threshold, return the lowest stock items
+            if not low_stock and items:
+                # Take the lowest stock items (already sorted by OnHand ASC)
+                low_stock = items[:min(20, len(items))]
+                if low_stock:
+                    max_stock = max([item.get('OnHand', 0) for item in low_stock])
+                    logger.info(f"⚠️ No items below {threshold}, returning {len(low_stock)} lowest stock items (max: {max_stock})")
+            
+            logger.info(f"✅ Found {len(low_stock)} low stock items")
+            return low_stock
+            
+        except Exception as e:
+            logger.error(f"Error in get_low_stock_items: {e}", exc_info=True)
+            return []
+    
     # -----------------------------------------------------------------------
     # OPTIMIZED: resolve_and_price with intelligent item prioritization
     # -----------------------------------------------------------------------

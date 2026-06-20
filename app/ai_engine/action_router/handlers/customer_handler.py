@@ -29,7 +29,14 @@ class CustomerHandler:
                 getattr(self.api, "user_token", None)
                 or (getattr(self.router, "user_token", None) if self.router else None)
             )
-            self._health_service = create_customer_health_service(user_token=token)
+            company_code = (
+                getattr(self.api, "company_code", None)
+                or (getattr(self.router, "company_code", None) if self.router else None)
+            )
+            self._health_service = create_customer_health_service(
+                user_token=token,
+                company_code=company_code,
+            )
         return self._health_service
 
     # ------------------------------------------------------------------
@@ -109,9 +116,47 @@ class CustomerHandler:
                     f"Customer {i + 1}: {customer.get('CardCode')} - {customer.get('CardName')}"
                 )
 
-            # Analyse up to 50 customers (was 20 — too low when most score Low/Healthy)
+            # ====================================================================
+            # FIX: Determine how many customers we need to analyze
+            # ====================================================================
+            # Get limit from entities with proper default
+            limit = entities.get("quantity")
+            
+            # Ensure limit is an integer with default
+            if limit is None:
+                limit = 10
+                logger.info("No limit provided, using default: 10")
+            else:
+                try:
+                    limit = int(limit)
+                    logger.info(f"Using provided limit: {limit}")
+                except (ValueError, TypeError):
+                    limit = 10
+                    logger.info(f"Invalid limit value, using default: 10")
+            
+            # Check if this is a risk/churn query
+            is_risk_query = any(keyword in message.lower() for keyword in [
+                "risk", "churn", "at risk", "churning", "leaving", 
+                "unhealthy", "health", "danger", "warning"
+            ])
+            
+            # Determine how many customers to analyze
+            # For risk queries, analyze more to find at-risk ones
+            if is_risk_query:
+                analyze_count = min(len(customers), max(30, limit * 3))
+            else:
+                analyze_count = min(len(customers), limit)
+            
+            # Hard safety cap to prevent timeout
+            analyze_count = min(analyze_count, 50)
+            
+            logger.info(
+                f"Analyzing {analyze_count} of {len(customers)} customers "
+                f"(limit={limit}, risk_query={is_risk_query})"
+            )
+
             customer_health = []
-            for customer in customers[:50]:
+            for customer in customers[:analyze_count]:
                 card_code = customer.get("CardCode")
                 card_name = customer.get("CardName", "Unknown")
 
@@ -177,29 +222,42 @@ class CustomerHandler:
                         self._calculate_customer_health_fallback(customer, {})
                     )
 
+            # ====================================================================
             # Filter to at-risk customers when query is about churn / risk
-            if "churn" in message.lower() or "risk" in message.lower():
+            # ====================================================================
+            if is_risk_query:
                 customer_health = [
                     c for c in customer_health
                     if c["risk_level"] in ("Critical", "High", "Medium")
                 ]
-
-            customer_health.sort(key=lambda x: x["risk_score"], reverse=True)
-
-            limit = entities.get("quantity", 10)
-            customer_health = customer_health[:limit]
+                
+                # Sort by risk score (highest risk first)
+                customer_health.sort(key=lambda x: x["risk_score"], reverse=True)
+                
+                # Limit results
+                customer_health = customer_health[:limit]
 
             logger.info(f"Found {len(customer_health)} at-risk customers")
 
             if not customer_health:
-                return {
-                    "message": (
-                        "No customers at risk found."
-                        if language == "en"
-                        else "Hakuna wateja walio katika hatari waliopatikana."
-                    ),
-                    "data": [],
-                }
+                if is_risk_query:
+                    return {
+                        "message": (
+                            "✅ No customers are currently at risk of churning. All customers are in good health!"
+                            if language == "en"
+                            else "✅ Hakuna wateja walio katika hatari ya kuondoka. Wateja wote wako katika hali nzuri!"
+                        ),
+                        "data": [],
+                    }
+                else:
+                    return {
+                        "message": (
+                            "No customers at risk found."
+                            if language == "en"
+                            else "Hakuna wateja walio katika hatari waliopatikana."
+                        ),
+                        "data": [],
+                    }
 
             formatted_message = self._format_customer_health_response(customer_health, language)
 

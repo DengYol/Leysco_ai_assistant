@@ -14,7 +14,8 @@ from app.ai_engine.response_formatter import ResponseFormatter
 from app.services.db_query import create_db_query_service
 from app.services.pricing_service import create_pricing_service
 from app.services.conversation_memory import get_conversation_memory
-from app.services.llm_service import get_llm_service
+# The LLM package lives at app/services/llm/ (folder named 'llm', not 'llm_service')
+from app.services.llm import get_llm_service
 from .constants import (
     KNOWLEDGE_BASE_INTENTS,
     ACTION_ROUTER_INTENTS,
@@ -29,8 +30,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Global formatter and LLM instances
+# FIX: Use "groq" explicitly — "auto" was accepted by the old monolith but the
+# new package normalises "auto" → "groq" anyway; be explicit to avoid confusion.
 formatter = ResponseFormatter()
-llm = get_llm_service(provider="auto")
+llm = get_llm_service(provider="groq")
 
 
 async def generate_streaming_response(
@@ -42,20 +45,7 @@ async def generate_streaming_response(
     user_token: str,
     context: Dict = None,
 ) -> AsyncGenerator[str, None]:
-    """Generate streaming response with progressive updates and context awareness.
-    
-    Args:
-        message: The user's message
-        intent: Classified intent
-        entities: Extracted entities
-        language: Language code ('en' or 'sw')
-        session_id: Session identifier
-        user_token: User authentication token
-        context: Conversation context
-    
-    Yields:
-        SSE formatted strings with progressive updates
-    """
+    """Generate streaming response with progressive updates and context awareness."""
     # Create per-request services with user token
     action_router = create_action_router(user_token=user_token)
     pricing_service = create_pricing_service(user_token=user_token)
@@ -70,19 +60,16 @@ async def generate_streaming_response(
     
     memory = get_conversation_memory()
     
-    # Variables to store results for memory
     rows = None
     response_text = ""
     
     try:
-        # Send initial metadata
         yield f"data: {json.dumps({'type': 'intent', 'content': intent, 'data': None}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'entities', 'content': '', 'data': entities}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'status', 'content': 'Processing your request...', 'data': None}, ensure_ascii=False)}\n\n"
         
         start_time = asyncio.get_event_loop().time()
         
-        # Handle different intent types
         if intent in KNOWLEDGE_BASE_INTENTS:
             response_text = await _handle_knowledge_base_streaming(
                 message, intent, language
@@ -97,7 +84,6 @@ async def generate_streaming_response(
             async for chunk in _stream_text(response_text, delay=0.01):
                 yield chunk
             
-            # Send data if available
             if isinstance(api_result, dict) and api_result.get("data"):
                 yield f"data: {json.dumps({'type': 'data', 'content': '', 'data': api_result.get('data', [])[:10]}, ensure_ascii=False)}\n\n"
         
@@ -115,22 +101,19 @@ async def generate_streaming_response(
             async for chunk in _stream_text(response_text, delay=0.015):
                 yield chunk
         
-        # Store assistant response in memory
         memory.add_message(session_id, "assistant", response_text, rows)
         
         processing_time = int((asyncio.get_event_loop().time() - start_time) * 1000)
         
-        # Get suggestions with feedback
         suggestions = await get_suggestions_with_feedback(
             intent=intent,
             entities=entities,
             language=language,
             context=context,
-            tenant_code=None,  # Will be set in chat endpoint
+            tenant_code=None,
             user_id=None
         )
         
-        # Send suggestions and completion
         yield f"data: {json.dumps({'type': 'suggestions', 'content': '', 'data': suggestions}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'done', 'content': '', 'data': {'processing_time_ms': processing_time}}, ensure_ascii=False)}\n\n"
         
@@ -145,34 +128,24 @@ async def _handle_knowledge_base_streaming(
     intent: str,
     language: str
 ) -> str:
-    """Handle knowledge base intents with RAG enhancement.
-    
-    Returns:
-        Response text as string
-    """
-    # Try RAG enhancement for knowledge base queries
     rag_context = await enhance_with_rag(message, None)
     
     if rag_context:
-        prompt = f"""You are the Leysco AI Assistant. Use the following information to answer the user's question.
-        
-RELEVANT INFORMATION:
-{rag_context}
-
-USER QUESTION: {message}
-
-Answer based on the information above. If the information doesn't contain the answer, say so politely.
-"""
+        prompt = (
+            f"You are the Leysco AI Assistant. Use the following information to answer the user's question.\n\n"
+            f"RELEVANT INFORMATION:\n{rag_context}\n\n"
+            f"USER QUESTION: {message}\n\n"
+            f"Answer based on the information above. If the information doesn't contain the answer, say so politely."
+        )
     else:
         prompt = f"User asked: {message}"
     
-    response_text = await llm.generate_async(
+    return await llm.generate_async(
         prompt,
         intent=intent,
         language=language,
         max_tokens=400,
     )
-    return response_text
 
 
 async def _handle_action_router_streaming(
@@ -182,13 +155,6 @@ async def _handle_action_router_streaming(
     message: str,
     language: str
 ) -> Tuple[Any, str]:
-    """Handle action router intents with streaming.
-    
-    Returns:
-        Tuple of (api_result, response_text)
-    """
-    # This function doesn't yield directly - it returns results
-    # The caller will handle streaming the text
     api_result = action_router.route(intent, entities, message, language=language)
     
     if isinstance(api_result, dict) and "message" in api_result:
@@ -206,56 +172,33 @@ async def _handle_decision_support_streaming(
     entities: dict,
     language: str
 ) -> str:
-    """Handle decision support intents with streaming.
-    
-    Returns:
-        Response text as string
-    """
     result_data = await decision_support.analyze(intent, entities)
     
     if result_data and isinstance(result_data, dict):
-        # Use formatter for top selling and slow moving items
         if intent == "GET_TOP_SELLING_ITEMS":
             items = result_data.get("items", [])
-            days = entities.get("days")
-            if days is None or not isinstance(days, int):
-                days = 30
-            limit = entities.get("quantity")
-            if limit is None or not isinstance(limit, int):
-                limit = 10
+            days = entities.get("days") if isinstance(entities.get("days"), int) else 30
+            limit = entities.get("quantity") if isinstance(entities.get("quantity"), int) else 10
             limit = min(limit, len(items)) if items else limit
-            formatted = formatter.format_top_selling_items(
-                items=items,
-                limit=limit,
-                days=days,
-                language=language
-            )
-            response_text = formatted.get("message", "")
+            formatted = formatter.format_top_selling_items(items=items, limit=limit, days=days, language=language)
+            return formatted.get("message", "")
+        
         elif intent == "GET_SLOW_MOVING_ITEMS":
             items = result_data.get("items", [])
-            days = entities.get("days")
-            if days is None or not isinstance(days, int):
-                days = 90
-            limit = entities.get("quantity")
-            if limit is None or not isinstance(limit, int):
-                limit = 10
+            days = entities.get("days") if isinstance(entities.get("days"), int) else 90
+            limit = entities.get("quantity") if isinstance(entities.get("quantity"), int) else 10
             limit = min(limit, len(items)) if items else limit
-            formatted = formatter.format_slow_moving_items(
-                items=items,
-                limit=limit,
-                days=days,
-                language=language
-            )
-            response_text = formatted.get("message", "")
+            formatted = formatter.format_slow_moving_items(items=items, limit=limit, days=days, language=language)
+            return formatted.get("message", "")
+        
         elif intent == "GET_SALES_ANALYTICS":
             formatted = formatter.format_sales_analytics(result_data, language)
-            response_text = formatted.get("message", "")
+            return formatted.get("message", "")
+        
         else:
-            response_text = create_summary_from_analysis(intent, result_data)
-    else:
-        response_text = "Analysis complete. No significant findings."
+            return create_summary_from_analysis(intent, result_data)
     
-    return response_text
+    return "Analysis complete. No significant findings."
 
 
 async def _handle_db_query_streaming(
@@ -265,11 +208,6 @@ async def _handle_db_query_streaming(
     message: str,
     language: str
 ) -> Tuple[Any, str]:
-    """Handle database query intents with streaming.
-    
-    Returns:
-        Tuple of (rows, response_text)
-    """
     if intent in PRICE_INTENTS:
         rows = db.resolve_and_price(
             item_name=entities.get("item_name") or "",
@@ -278,40 +216,22 @@ async def _handle_db_query_streaming(
     else:
         rows = db.query(intent=intent, entities=entities, language=language)
     
-    # Use formatter for outstanding deliveries
     if intent == "GET_OUTSTANDING_DELIVERIES" and rows:
         formatted = formatter.format_outstanding_deliveries(rows, language)
-        response_text = formatted.get("message", "")
-    elif rows:
-        response_text = await llm.narrate_async(
-            question=message,
-            db_rows=rows[:20] if isinstance(rows, list) else rows,
-            intent=intent,
-            language=language,
-            max_tokens=500,
-        )
-    else:
-        response_text = await llm.narrate_async(
-            question=message,
-            db_rows=[],
-            intent=intent,
-            language=language,
-            max_tokens=300,
-        )
+        return rows, formatted.get("message", "")
     
+    response_text = await llm.narrate_async(
+        question=message,
+        db_rows=rows[:20] if isinstance(rows, list) and rows else (rows or []),
+        intent=intent,
+        language=language,
+        max_tokens=500 if rows else 300,
+    )
     return rows, response_text
 
 
 async def _stream_text(text: str, delay: float = 0.02) -> AsyncGenerator[str, None]:
-    """Helper to stream text word by word.
-    
-    Args:
-        text: The text to stream
-        delay: Delay in seconds between words
-    
-    Yields:
-        SSE formatted chunks with individual words
-    """
+    """Stream text word by word as SSE chunks."""
     for word in text.split():
         yield f"data: {json.dumps({'type': 'text', 'content': word + ' ', 'data': None}, ensure_ascii=False)}\n\n"
         await asyncio.sleep(delay)
@@ -326,20 +246,7 @@ def create_streaming_response(
     user_token: str,
     context: Dict = None,
 ) -> StreamingResponse:
-    """Create a streaming response for the chat endpoint.
-    
-    Args:
-        message: The user's message
-        intent: Classified intent
-        entities: Extracted entities
-        language: Language code ('en' or 'sw')
-        session_id: Session identifier
-        user_token: User authentication token
-        context: Conversation context
-    
-    Returns:
-        StreamingResponse configured for SSE
-    """
+    """Create a streaming response for the chat endpoint."""
     return StreamingResponse(
         generate_streaming_response(
             message=message,

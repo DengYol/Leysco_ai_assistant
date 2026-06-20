@@ -102,6 +102,16 @@ class CustomerHealthService:
         self._batch_cache = {}
         self._batch_cache_time = {}
         self._batch_cache_ttl = 1800  # 30 minutes
+
+        # Per-call request cache: avoids re-fetching the same customer's
+        # orders/quotations multiple times within a single score() call.
+        # _recency, _frequency, and _conversion previously each called
+        # _get_customer_orders independently (3x duplicate fetches of the
+        # same 365-day order list, just filtered differently afterwards),
+        # and _conversion also called _get_customer_quotations. This cache
+        # is cleared at the start of every score() call.
+        self._orders_cache: Dict[str, List[Dict]] = {}
+        self._quotations_cache: Dict[str, List[Dict]] = {}
         
         # Stats tracking
         self._stats = {
@@ -146,68 +156,86 @@ class CustomerHealthService:
     # ------------------------------------------------------------------
     # Get customer orders (using actual API methods)
     # ------------------------------------------------------------------
-    
-    def _get_customer_orders(self, customer_code: str, days_back: int = 90) -> List[Dict]:
-        """Get customer orders from the last N days."""
+
+    def _get_all_orders_raw(self, customer_code: str) -> List[Dict]:
+        """
+        Fetch the customer's full order list ONCE per score() call and
+        cache it. _recency/_frequency/_conversion all filter this same
+        underlying list by different date windows — previously each
+        called the API independently, tripling the network cost.
+        """
+        if customer_code in self._orders_cache:
+            self._record_cache_hit()
+            return self._orders_cache[customer_code]
+
+        self._record_cache_miss()
         try:
-            # Use get_customer_orders method from LeyscoAPIService
             orders = self.api.get_customer_orders(customer_code=customer_code, limit=100)
-            if not orders:
-                return []
-            
-            # Filter by date if needed
-            if days_back:
-                cutoff_date = datetime.now() - timedelta(days=days_back)
-                filtered = []
-                for order in orders:
-                    doc_date_str = order.get("DocDate", "")
-                    if doc_date_str:
-                        try:
-                            doc_date = datetime.strptime(doc_date_str[:10], "%Y-%m-%d")
-                            if doc_date >= cutoff_date:
-                                filtered.append(order)
-                        except:
-                            filtered.append(order)
-                    else:
-                        filtered.append(order)
-                return filtered
-            
-            return orders
+            orders = orders or []
         except Exception as e:
             logger.error(f"Error getting customer orders for {customer_code}: {e}")
-            return []
-    
-    def _get_customer_quotations(self, customer_code: str, days_back: int = 180) -> List[Dict]:
-        """Get customer quotations from the last N days."""
+            orders = []
+
+        self._orders_cache[customer_code] = orders
+        return orders
+
+    def _get_all_quotations_raw(self, customer_code: str) -> List[Dict]:
+        """Fetch the customer's full quotation list ONCE per score() call."""
+        if customer_code in self._quotations_cache:
+            self._record_cache_hit()
+            return self._quotations_cache[customer_code]
+
+        self._record_cache_miss()
         try:
-            # Use get_quotations method from LeyscoAPIService (if available)
             if hasattr(self.api, 'get_quotations'):
                 quotations = self.api.get_quotations(customer_code=customer_code, limit=100)
             else:
-                # Fallback: use get_customer_orders with doc_type parameter
-                quotations = self.api.get_customer_orders(customer_code=customer_code, limit=100)
-            
-            if not quotations:
-                return []
-            
-            # Filter by date if needed
-            if days_back:
-                cutoff_date = datetime.now() - timedelta(days=days_back)
-                filtered = []
-                for quote in quotations:
-                    doc_date_str = quote.get("DocDate", "")
-                    if doc_date_str:
-                        try:
-                            doc_date = datetime.strptime(doc_date_str[:10], "%Y-%m-%d")
-                            if doc_date >= cutoff_date:
-                                filtered.append(quote)
-                        except:
-                            filtered.append(quote)
-                    else:
-                        filtered.append(quote)
-                return filtered
-            
-            return quotations
+                # Fallback: reuse the already-cached orders list rather than
+                # making another identical API call.
+                quotations = self._get_all_orders_raw(customer_code)
+            quotations = quotations or []
+        except Exception as e:
+            logger.error(f"Error getting customer quotations for {customer_code}: {e}")
+            quotations = []
+
+        self._quotations_cache[customer_code] = quotations
+        return quotations
+
+    @staticmethod
+    def _filter_by_days_back(docs: List[Dict], days_back: int) -> List[Dict]:
+        """Filter a list of docs to those with DocDate within the last N days."""
+        if not days_back:
+            return docs
+
+        cutoff_date = datetime.now() - timedelta(days=days_back)
+        filtered = []
+        for doc in docs:
+            doc_date_str = doc.get("DocDate", "")
+            if doc_date_str:
+                try:
+                    doc_date = datetime.strptime(doc_date_str[:10], "%Y-%m-%d")
+                    if doc_date >= cutoff_date:
+                        filtered.append(doc)
+                except Exception:
+                    filtered.append(doc)
+            else:
+                filtered.append(doc)
+        return filtered
+
+    def _get_customer_orders(self, customer_code: str, days_back: int = 90) -> List[Dict]:
+        """Get customer orders from the last N days (uses per-call cache)."""
+        try:
+            orders = self._get_all_orders_raw(customer_code)
+            return self._filter_by_days_back(orders, days_back)
+        except Exception as e:
+            logger.error(f"Error getting customer orders for {customer_code}: {e}")
+            return []
+
+    def _get_customer_quotations(self, customer_code: str, days_back: int = 180) -> List[Dict]:
+        """Get customer quotations from the last N days (uses per-call cache)."""
+        try:
+            quotations = self._get_all_quotations_raw(customer_code)
+            return self._filter_by_days_back(quotations, days_back)
         except Exception as e:
             logger.error(f"Error getting customer quotations for {customer_code}: {e}")
             return []
@@ -226,6 +254,12 @@ class CustomerHealthService:
         Compute the health score for a single customer.
         Optimized with caching.
         """
+        # Reset the per-call order/quotation cache. Each score() call is
+        # for a single customer, so this keeps memory bounded while still
+        # de-duplicating the recency/frequency/conversion fetches below.
+        self._orders_cache.clear()
+        self._quotations_cache.clear()
+
         # ── Resolve customer ──────────────────────────────────────────────────
         if not customer_code:
             if not customer_name:
@@ -552,6 +586,8 @@ class CustomerHealthService:
         """Clear all caches."""
         self._batch_cache.clear()
         self._batch_cache_time.clear()
+        self._orders_cache.clear()
+        self._quotations_cache.clear()
         
         # Clear Redis cache
         cache = get_cache_service()

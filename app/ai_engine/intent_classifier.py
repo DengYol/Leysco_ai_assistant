@@ -10,7 +10,7 @@ import re
 import asyncio
 from typing import Optional, Dict, Any, Tuple
 from functools import lru_cache
-from app.services.llm_service import LLMService
+from app.services.llm import LLMService
 from app.ai_engine.prompt_manager import PromptManager, VALID_INTENTS
 from app.ai_engine.swahili_support import SwahiliSupport
 from app.services.cache_service import cache_service
@@ -50,6 +50,59 @@ _FAREWELL_WORDS = {
     "bye", "goodbye", "see you", "see ya", "later", "talk later",
     "good night", "take care", "ttyl", "cya",
 }
+
+# ---------------------------------------------------------------------------
+# CASUAL / OFF-TOPIC PHRASES
+# Messages that are clearly conversational, social, or off-topic for the ERP.
+# These short-circuit directly to GENERAL_AI — no LLM disambiguation needed.
+# ---------------------------------------------------------------------------
+_CASUAL_PHRASES = {
+    "what's up", "whats up", "sup", "wassup", "wazzup",
+    "what's good", "whats good", "what's happening", "what's poppin",
+    "how are you", "how r u", "how are u", "how you doing", "how ya doing",
+    "how's it going", "hows it going", "how's everything",
+    "what's new", "anything new",
+    "lol", "lmao", "rofl", "haha", "hehe",
+    "wow", "omg", "oh my", "no way",
+    "thanks", "thank you", "thx", "ty", "cheers",
+    "bye", "goodbye", "see you", "later", "take care",
+    "tell me a joke", "say something funny",
+    "who are you", "what are you",
+}
+
+_CASUAL_PATTERNS = [
+    r"^(?:what'?s?\s+up|wassup|wazzup|sup)(?:\s+.*)?$",
+    r"^(?:how\s+are\s+(?:you|u)|how\s+(?:r|ya)\s+(?:you|u)|how'?s?\s+(?:it|everything)\s+going)$",
+    r"^(?:lol|haha|hehe|lmao|rofl|omg|wow|oh\s+my|no\s+way)(?:\s.*)?$",
+    r"^(?:who|what)\s+are\s+you\??$",
+]
+
+# ---------------------------------------------------------------------------
+# CONVERSATIONAL / GREETING PATTERNS
+# Must be checked at the very beginning to prevent "Tell me about yourself"
+# from being treated as a price query.
+# ---------------------------------------------------------------------------
+_CONVERSATIONAL_PATTERNS = [
+    r"^(?:tell me about yourself|who are you|what are you)$",
+    r"^(?:introduce yourself|about you|what is your name|who made you|who created you)$",
+    r"^(?:what do you do|how can you help me|what are your capabilities|your features|about yourself)$",
+    r"^(?:tell me more about yourself|explain yourself|what is your purpose)$",
+    r"^(?:how do you work|what can you do|help me understand you)$",
+]
+
+# ---------------------------------------------------------------------------
+# CONVERSATIONAL VARIATIONS - exact phrases
+# ---------------------------------------------------------------------------
+_CONVERSATIONAL_VARIATIONS = [
+    "tell me about yourself", "who are you", "what are you",
+    "introduce yourself", "about you", "what is your name",
+    "who made you", "who created you", "what do you do",
+    "how can you help me", "what are your capabilities",
+    "your features", "about yourself", "tell me more about yourself",
+    "explain yourself", "what is your purpose", "how do you work",
+    "what can you do", "help me understand you", "tell me about you",
+    "what's your name", "whats your name", "who are you?"
+]
 
 _SWAHILI_GREETINGS = {
     "mambo", "habari", "sasa", "vipi", "jambo", "hujambo", "sijambo",
@@ -119,6 +172,39 @@ SLOW_MOVING_PHRASES = {
     "zinazosonga polepole", "hazijauzwa", "haziuZiki", "zimelala"
 }
 
+# ---------------------------------------------------------------------------
+# LOW STOCK PHRASES
+# RULES for membership:
+#   ✅ Include: phrases that ONLY make sense in a "show me what's low" context
+#   ❌ Exclude: single generic words that appear in other query types
+#      - "reorder" alone → could mean "I want to reorder item X" (purchase intent)
+#      - "stock level"  → user might be asking "show stock level of vegimax" (GET_STOCK_LEVELS)
+#      - "what is low"  → too vague, matches unrelated queries
+# ---------------------------------------------------------------------------
+LOW_STOCK_PHRASES = {
+    # Clear low-stock intent phrases
+    "low stock", "low inventory", "out of stock",
+    "stock alert", "stock alerts",
+    "stock warning", "stock shortage", "stock deficit",
+    "inventory low", "running low", "almost out",
+    "critical stock", "danger stock",
+    "minimum stock", "below reorder",
+    "low supply", "insufficient stock", "stock depletion",
+    # What-is-low variants (specific enough)
+    "what items are low", "what products are low",
+    "show low stock", "view low stock", "list low stock",
+    "get low stock", "check low stock", "low stock items",
+    "low stock report", "low stock list",
+    # Reorder-specific (not bare "reorder" — that belongs to purchase intent)
+    "reorder report", "reorder alert", "reorder alerts",
+    "what needs reordering", "needs reordering",
+    "reorder point", "reorder level",
+    # Swahili
+    "hisa chini", "hisa ndogo", "hisa pungufu", "hisa kidogo",
+    "arifa ya hisa", "onyo la hisa", "hisa ya hatari",
+    "bidhaa zilizokwisha", "hisa inaisha", "hisa imepungua",
+}
+
 SALES_ANALYTICS_PHRASES = {
     "sales analytics", "sales analysis", "sales report", "sales data",
     "sales overview", "sales summary", "sales performance", "sales metrics",
@@ -151,8 +237,7 @@ _PURCHASE_PHRASES = {
     "approve po", "authorize purchase", "po approval",
     "agizo la ununuzi", "mapokezi ya bidhaa", "invoice ya muuzaji"
 }
-# NOTE: bare "po" removed from _PURCHASE_PHRASES — too short, causes false matches
-# on phrases like "customer details for..." when Groq sees "po" in its context.
+# NOTE: bare "po" removed — too short, causes false matches.
 
 _INVENTORY_MOVEMENT_PHRASES = {
     "goods issue", "issue stock", "stock out", "dispatch goods",
@@ -191,9 +276,6 @@ _COMMON_PRODUCTS = [
 
 # ---------------------------------------------------------------------------
 # CUSTOMER DETAIL PATTERNS
-# Used by _check_direct_intents as the very first guard so queries like
-# "customer details for Mahakali Enterprises" are never misrouted to
-# GET_PURCHASE_ORDERS by the LLM.
 # ---------------------------------------------------------------------------
 _CUSTOMER_DETAIL_PATTERNS = [
     r'customer\s+details?\s+for\s+',
@@ -203,11 +285,36 @@ _CUSTOMER_DETAIL_PATTERNS = [
     r'info(?:rmation)?\s+(?:on|about|for)\s+(?:the\s+)?customer\s+',
     r'get\s+(?:me\s+)?(?:the\s+)?customer\s+details?\s+(?:for|of)\s+',
     r'customer\s+info(?:rmation)?\s+(?:for|on|about)\s+',
-    r'maelezo\s+ya\s+mteja\s+',          # Swahili: "details of customer"
-    r'taarifa\s+ya\s+mteja\s+',           # Swahili: "info of customer"
+    r'maelezo\s+ya\s+mteja\s+',
+    r'taarifa\s+ya\s+mteja\s+',
 ]
 
+# ---------------------------------------------------------------------------
+# FAST PATH PATTERNS
+# FIX (naming): All low-stock intents use "GET_LOW_STOCK_ALERTS" to match
+# query_rewriter.py and chat.py's _REWRITER_PROTECTED_INTENTS.
+# ---------------------------------------------------------------------------
 FAST_PATH_PATTERNS = [
+    # =========================================================
+    # CONVERSATIONAL / GREETING PATTERNS - HIGHEST PRIORITY
+    # =========================================================
+    (r'^(?:tell me about yourself|who are you|what are you|introduce yourself|about you|what is your name|who made you|who created you|what do you do|how can you help me|what are your capabilities|your features|about yourself|tell me more about yourself|explain yourself|what is your purpose|how do you work|what can you do|help me understand you)(?:\?)?$', "GREETING"),
+
+    # =========================================================
+    # LOW STOCK PATTERNS - SECOND HIGHEST PRIORITY
+    # =========================================================
+    (r'^(?:show|list|display|view|get|check|find|see)\s+(?:low|critical|danger|minimum)\s+(?:stock|inventory|items|products|supply)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:low|critical|danger)\s+(?:stock|inventory|items)\s+(?:alert|alerts?|warning|report)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:what|which)\s+(?:items|products|stock)\s+(?:are|is)\s+(?:low|running\s+low|almost\s+out)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:show|list|view|get)\s+(?:me\s+)?(?:the\s+)?items?\s+(?:that\s+are|with)\s+(?:low|critical)\s+(?:stock|inventory)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:stock|inventory)\s+(?:shortage|deficit|depletion)\s+(?:report|list|alert)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:what\'?s|what is)\s+(?:low|out\s+of|running\s+low)\s+(?:in\s+)?stock\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:need\s+to\s+)?reorder\s+(?:items|products|stock)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:below\s+)?reorder\s+(?:point|level)\s+(?:items|stock)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^hisa\s+(?:chini|ndogo|pungufu|kidogo|inayoisha)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:onyesha|orodhesha|tazama|angalia)\s+hisa\s+(?:chini|ndogo|pungufu)\s*$', "GET_LOW_STOCK_ALERTS"),
+    (r'^(?:arifa|onyo)\s+(?:za|la)\s+hisa\s+(?:chini|ndogo)\s*$', "GET_LOW_STOCK_ALERTS"),
+
     # =========================================================
     # ITEM BROWSING PATTERNS
     # =========================================================
@@ -335,7 +442,7 @@ FAST_PATH_PATTERNS = [
     (r'^(stock|hisa)\s+(level|kiwango)?\s*(for|of|ya)?\s*([a-zA-Z0-9\-\(\)\s]{3,})$', "GET_STOCK_LEVELS"),
     (r'^(show|list|onyesha|orodhesha)\s+(me)?\s*(customers|wateja)$', "GET_CUSTOMERS"),
     (r'^(show|list|onyesha|orodhesha)\s+(me)?\s*(items|bidhaa)$', "GET_ITEMS"),
-    (r'^low\s+stock\s+(alert|arifa)$', "GET_LOW_STOCK_ALERTS"),
+    (r'^low\s+stock\s+(alert|arifa)s?$', "GET_LOW_STOCK_ALERTS"),
 
     # Price query patterns
     (r'^(what|whats|what\'s)\s+is\s+the\s+price\s+of\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_ITEM_PRICE"),
@@ -365,7 +472,7 @@ FAST_PATH_PATTERNS = [
     (r'^(?:what|which).*(?:warehouses?|maghala).*(?:have|has|stock|hisa).*(?:for|of|ya)\s+([a-zA-Z0-9\-\(\)\s]+)$', "GET_WAREHOUSE_STOCK"),
     (r'^(?:onyesha|orodhesha|wapi)\s+(?:maghala|warehouses|ghala)\s*$', "GET_WAREHOUSES"),
 
-    # Low stock alerts
+    # Low stock alerts (backward compatibility)
     (r'^(?:what|which).*(?:low|critical|danger).*(?:stock|inventory|hisa|items|bidhaa).*(?:alert|alerts?|warning|arifa)$', "GET_LOW_STOCK_ALERTS"),
     (r'^(?:what\'?s|what is).*(?:low|running low|almost out)$', "GET_LOW_STOCK_ALERTS"),
     (r'^(?:arifa|onyo)\s+(?:za|la)\s+hisa\s+chini$', "GET_LOW_STOCK_ALERTS"),
@@ -443,18 +550,45 @@ class IntentClassifier:
         message_lower = message.lower().strip()
         language = self._detect_language(message)
 
-        # =====================================================================
-        # FIX: Customer detail queries MUST be checked first.
-        # Without this guard, queries like "customer details for Mahakali
-        # Enterprises" fall through to the purchase phrase check (or the LLM),
-        # which incorrectly returns GET_PURCHASE_ORDERS.
-        # =====================================================================
+        # ================================================================
+        # FIX: Check conversational variations FIRST
+        # This prevents "Tell me about yourself" from being treated as a price query
+        # ================================================================
+        for phrase in _CONVERSATIONAL_VARIATIONS:
+            if phrase in message_lower or phrase == message_lower:
+                logger.info(f"Conversational variation detected: '{message}' → GREETING")
+                return ("GREETING", {}, language)
+
+        for pattern in _CONVERSATIONAL_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                logger.info(f"Conversational pattern detected: '{message}' → GREETING")
+                return ("GREETING", {}, language)
+
+        # ── Casual / off-topic: checked SECOND — no LLM needed, immediate GENERAL_AI ──
+        # Catches "what's up my G", "lol", "how are you" etc. before any
+        # ERP-pattern matching runs. Uses a set lookup + fast regex.
+        if message_lower in _CASUAL_PHRASES:
+            logger.info(f"Casual phrase: '{message}' → GENERAL_AI")
+            return ("GENERAL_AI", {}, language)
+        for _cpat in _CASUAL_PATTERNS:
+            if re.match(_cpat, message_lower, re.IGNORECASE):
+                logger.info(f"Casual pattern: '{message}' → GENERAL_AI")
+                return ("GENERAL_AI", {}, language)
+
+        # ── Low stock: checked first but only on curated, specific phrases ──
+        # LOW_STOCK_PHRASES no longer contains ambiguous single words like
+        # "reorder", "stock level", "what is low" — see set definition above.
+        if any(phrase in message_lower for phrase in LOW_STOCK_PHRASES):
+            logger.info(f"Direct intent match (low stock): '{message}' → GET_LOW_STOCK_ALERTS")
+            return ("GET_LOW_STOCK_ALERTS", {}, language)
+
+        # ── Customer detail queries ──────────────────────────────────────────
         for pattern in _CUSTOMER_DETAIL_PATTERNS:
             if re.search(pattern, message_lower, re.IGNORECASE):
                 logger.info(f"Direct intent match (customer detail): '{message}' → GET_CUSTOMER_DETAILS")
                 return ("GET_CUSTOMER_DETAILS", {}, language)
 
-        # Check for invoice queries
+        # ── Invoice queries ──────────────────────────────────────────────────
         if any(phrase in message_lower for phrase in _INVOICE_PHRASES):
             if "overdue" in message_lower or "past due" in message_lower:
                 return ("GET_OVERDUE_INVOICES", {}, language)
@@ -464,7 +598,7 @@ class IntentClassifier:
                 return ("SEND_PAYMENT_REMINDER", {}, language)
             return ("GET_AR_INVOICES", {}, language)
 
-        # Check for purchase queries
+        # ── Purchase queries ─────────────────────────────────────────────────
         if any(phrase in message_lower for phrase in _PURCHASE_PHRASES):
             if "create" in message_lower or "make" in message_lower or "new" in message_lower:
                 return ("CREATE_PURCHASE_ORDER", {}, language)
@@ -476,7 +610,7 @@ class IntentClassifier:
                 return ("GET_GOODS_RECEIPT_PO", {}, language)
             return ("GET_PURCHASE_ORDERS", {}, language)
 
-        # Check for inventory movement queries
+        # ── Inventory movement ───────────────────────────────────────────────
         if any(phrase in message_lower for phrase in _INVENTORY_MOVEMENT_PHRASES):
             if "transfer" in message_lower or "move" in message_lower:
                 return ("CREATE_STOCK_TRANSFER", {}, language)
@@ -489,7 +623,7 @@ class IntentClassifier:
             if "allocate" in message_lower or "reserve" in message_lower:
                 return ("ALLOCATE_STOCK", {}, language)
 
-        # Check for document transitions
+        # ── Document transitions ─────────────────────────────────────────────
         if any(phrase in message_lower for phrase in _DOCUMENT_TRANSITION_PHRASES):
             if "convert" in message_lower and "quotation" in message_lower:
                 return ("CONVERT_QUOTATION_TO_ORDER", {}, language)
@@ -498,28 +632,31 @@ class IntentClassifier:
             if "approve" in message_lower and "purchase" in message_lower:
                 return ("APPROVE_PURCHASE_ORDER", {}, language)
 
-        # Direct check for item browsing
-        browse_patterns = [
-            r'^(?:show|list|display|view|get|browse|find|fetch|see|check)\s+me\s+(?:all\s+)?(?:items|products|inventory|stock)',
-            r'^(?:show|list|display|view|get|browse|find|fetch|see|check)\s+(?:all\s+)?(?:items|products|inventory|stock|available\s+items)',
-            r'^what\s+items\s+do\s+you\s+have',
-            r'^what\s+products\s+are\s+available',
-            r'^tell\s+me\s+about\s+(?:your\s+)?(?:items|products)',
-            r'^items$',
-            r'^products$',
-            r'^show\s+me\s+(?:the\s+)?(?:items|products)',
-            r'^list\s+items$',
-        ]
+        # ── Item browsing ────────────────────────────────────────────────────
+        # FIX: Pre-check for "detail" so item-detail queries like
+        # "show items details of Cap Measuring" never match as browse/listing.
+        # Regex lookaheads fail here because backtracking matches "item" inside
+        # "items" and bypasses the guard — a simple string check is reliable.
+        if "detail" not in message_lower:
+            browse_patterns = [
+                r'^(?:show|list|display|view|get|browse|find|fetch|see|check)\s+me\s+(?:all\s+)?(?:items|products|inventory|stock)',
+                r'^(?:show|list|display|view|get|browse|find|fetch|see|check)\s+(?:all\s+)?(?:items|products|inventory|stock|available\s+items|sellable\s+items)',
+                r'^what\s+items\s+do\s+you\s+have',
+                r'^what\s+products\s+are\s+available',
+                r'^tell\s+me\s+about\s+(?:your\s+)?(?:items|products)',
+                r'^items$',
+                r'^products$',
+                r'^show\s+me\s+(?:the\s+)?(?:items|products)',
+                r'^list\s+items$',
+            ]
+            for pattern in browse_patterns:
+                if re.search(pattern, message_lower, re.IGNORECASE):
+                    logger.info(f"Direct intent match: '{message}' → GET_ITEMS")
+                    return ("GET_ITEMS", {}, language)
 
-        for pattern in browse_patterns:
-            if re.search(pattern, message_lower, re.IGNORECASE):
-                logger.info(f"Direct intent match: '{message}' → GET_ITEMS")
-                return ("GET_ITEMS", {}, language)
-
-        # Check for greetings
+        # ── Greetings ────────────────────────────────────────────────────────
         if any(w in message_lower for w in _SWAHILI_GREETINGS):
             return ("GREETING", {}, "sw")
-
         if any(w in message_lower for w in ["hi", "hello", "hey", "good morning", "good afternoon"]):
             return ("GREETING", {}, "en")
 
@@ -537,6 +674,31 @@ class IntentClassifier:
             return self._fast_path_cache[cache_key]
 
         detected_language = self._detect_language(message)
+
+        # ================================================================
+        # FIX: Check conversational variations in fast path
+        # ================================================================
+        for phrase in _CONVERSATIONAL_VARIATIONS:
+            if phrase in message_lower or phrase == message_lower:
+                result = ("GREETING", {}, detected_language)
+                self._fast_path_cache[cache_key] = result
+                logger.info(f"Fast path match (conversational): '{message}' → GREETING")
+                return result
+
+        for pattern in _CONVERSATIONAL_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                result = ("GREETING", {}, detected_language)
+                self._fast_path_cache[cache_key] = result
+                logger.info(f"Fast path match (conversational pattern): '{message}' → GREETING")
+                return result
+
+        # Check LOW_STOCK_PHRASES (curated set, no false positives)
+        for phrase in LOW_STOCK_PHRASES:
+            if phrase in message_lower:
+                result = ("GET_LOW_STOCK_ALERTS", {}, detected_language)
+                self._fast_path_cache[cache_key] = result
+                logger.info(f"Fast path match (low stock): '{message}' → GET_LOW_STOCK_ALERTS")
+                return result
 
         for phrase in _STOCK_LEVELS_GENERAL_PHRASES:
             if phrase in message_lower:
@@ -631,12 +793,27 @@ class IntentClassifier:
         """Cached rule-based intent detection."""
         text = text.lower().strip()
 
-        # Customer detail check first (mirrors _check_direct_intents priority)
+        # ================================================================
+        # FIX: Check conversational variations in rule-based engine
+        # ================================================================
+        for phrase in _CONVERSATIONAL_VARIATIONS:
+            if phrase in text or phrase == text:
+                return "GREETING"
+
+        for pattern in _CONVERSATIONAL_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return "GREETING"
+
+        # Low stock (curated phrases only — no false positives)
+        if any(phrase in text for phrase in LOW_STOCK_PHRASES):
+            return "GET_LOW_STOCK_ALERTS"
+
+        # Customer detail
         for pattern in _CUSTOMER_DETAIL_PATTERNS:
             if re.search(pattern, text, re.IGNORECASE):
                 return "GET_CUSTOMER_DETAILS"
 
-        # Invoice intents
+        # Invoice
         if any(phrase in text for phrase in _INVOICE_PHRASES):
             if "overdue" in text:
                 return "GET_OVERDUE_INVOICES"
@@ -644,7 +821,7 @@ class IntentClassifier:
                 return "GET_CUSTOMER_BALANCE"
             return "GET_AR_INVOICES"
 
-        # Purchase intents
+        # Purchase
         if any(phrase in text for phrase in _PURCHASE_PHRASES):
             if "create" in text or "make" in text:
                 return "CREATE_PURCHASE_ORDER"
@@ -656,7 +833,7 @@ class IntentClassifier:
                 return "APPROVE_PURCHASE_ORDER"
             return "GET_PURCHASE_ORDERS"
 
-        # Inventory movement intents
+        # Inventory movement
         if any(phrase in text for phrase in _INVENTORY_MOVEMENT_PHRASES):
             if "transfer" in text:
                 return "CREATE_STOCK_TRANSFER"
@@ -719,7 +896,6 @@ class IntentClassifier:
     # -------------------------------------------------------------------------
     def _clarify_suggestions(self, text: str, language: str = "en") -> list[str]:
         sw = language == "sw"
-
         if sw:
             return ["Angalia bei ya bidhaa", "Angalia hisa", "Unda nukuu", "Onyesha wateja", "Bidhaa zinazouzwa sana"]
         return ["Check item price", "Check stock levels", "Create a quotation", "Show customers", "Top selling items"]
@@ -744,7 +920,7 @@ class IntentClassifier:
         if cached:
             return cached
 
-        # Step 2: Direct intent check (bypass LLM for common phrases)
+        # Step 2: Direct intent check
         direct_result = self._check_direct_intents(user_message)
         if direct_result:
             intent, entities, direct_lang = direct_result
@@ -753,7 +929,7 @@ class IntentClassifier:
             logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {direct_lang})")
             return result
 
-        # Step 3: Try fast-path patterns
+        # Step 3: Fast-path patterns
         fast_path_result = self._try_fast_path(user_message)
         if fast_path_result:
             intent, entities, fp_language = fast_path_result
@@ -771,7 +947,7 @@ class IntentClassifier:
             logger.info(f"🎯 Final intent: {result['intent']} (confidence: {result['confidence']}, lang: {language})")
             return result
 
-        # Step 5: AI classification (only if all rule-based methods failed)
+        # Step 5: AI classification
         try:
             prompt = self.prompt_manager.get_intent_prompt(user_message)
             response = await self.llm.generate_async(prompt)

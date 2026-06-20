@@ -95,7 +95,7 @@ class ActionRouter:
         self._analytics_handler = None
         self._decision_handler = None
         self._training_handler = None
-        
+
         # NEW handlers
         self._invoice_handler = None
         self._purchase_handler = None
@@ -339,11 +339,24 @@ class ActionRouter:
     # ROUTING
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _unwrap_entity(val):
+        """
+        Some entity extractors return (value, is_exact_match) tuples
+        instead of plain strings (e.g. the item/customer fuzzy matcher).
+        Normalize to a plain string here so downstream .strip()/.lower()
+        calls never blow up with AttributeError: 'tuple' object has no
+        attribute 'strip'.
+        """
+        if isinstance(val, tuple):
+            val = val[0] if val else None
+        return val
+
     def route(self, intent: str, entities: dict, message: str = "", language: str = "en") -> dict:
         """Route intent to appropriate handler."""
 
-        item_name = (entities.get("item_name") or "").strip()
-        customer_name = (entities.get("customer_name") or "").strip()
+        item_name = (self._unwrap_entity(entities.get("item_name")) or "").strip()
+        customer_name = (self._unwrap_entity(entities.get("customer_name")) or "").strip()
         quantity = entities.get("quantity") or 10
 
         # Check authentication for data-sensitive intents

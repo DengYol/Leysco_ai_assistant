@@ -3,13 +3,13 @@ app/api/dependencies.py
 ========================
 FastAPI dependencies for token extraction, validation, and session management.
 
-FIXED: Dynamic per-tenant backend URL resolution so any leysco100 tenant works.
-FIXED: Correctly extracts manager role from Laravel SUPERUSER field
-FIXED: Proper role detection for both SUPERUSER flag and role field
-FIXED: Stable session ID derived from user identity to prevent new session
-       on every notification poll (was calling uuid.uuid4() as fallback)
-FIXED: Token validation now correctly uses company_code from header AND from token
-FIXED: Multi-tenant session isolation - different companies have separate sessions
+All tenant-to-backend URL resolution is driven exclusively by environment
+variables — there are NO hardcoded backend URLs in this file.
+
+Per-tenant configuration in .env:
+    LARAVEL_BACKEND_URL_TEST001=https://dev100-be.leysco100.com
+    LARAVEL_BACKEND_URL_TEST002=https://dev109-be.leysco100.com
+    LARAVEL_BACKEND_URL=https://fallback-be.leysco100.com   # global fallback
 """
 
 from fastapi import Header, HTTPException, status, Request, Depends
@@ -21,7 +21,7 @@ import hashlib
 import uuid
 from datetime import datetime, timedelta
 
-from app.core.config import settings
+from app.core.config import settings, get_laravel_backend_url
 from app.services.conversation_memory import get_conversation_memory
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ _user_session_cache: Dict[str, Dict] = {}
 
 
 # =========================================================
-# TENANT → BACKEND URL RESOLUTION
+# TENANT → BACKEND URL RESOLUTION  (no hardcoded URLs)
 # =========================================================
 
 def resolve_backend_url(company_code: Optional[str] = None, request: Optional[Request] = None) -> str:
@@ -39,61 +39,90 @@ def resolve_backend_url(company_code: Optional[str] = None, request: Optional[Re
     Dynamically resolve the Laravel backend URL for a given tenant.
 
     Resolution order:
-      1. Per-tenant env var  e.g. LARAVEL_BACKEND_URL_TEST001=https://dev100-be.leysco100.com
-      2. X-Tenant-Env header     (explicit override for testing)
-      3. Origin-header sniffing  (dev100.leysco100.com  → dev100-be.leysco100.com)
-      4. Company code mapping
-      5. LARAVEL_BACKEND_URL     (global default / single-tenant fallback)
-      6. Hard error              (nothing configured)
+      1. X-Backend-URL request header   (Flutter sends this — highest priority,
+                                         enables fully automatic multi-tenant routing
+                                         with zero .env mapping required)
+      2. Per-tenant env var              LARAVEL_BACKEND_URL_<COMPANY_CODE>
+      3. X-Tenant-Env request header    (Postman / integration tests)
+      4. Origin/Referer header sniffing (dev100.leysco100.com → dev100-be.leysco100.com)
+      5. LARAVEL_BACKEND_URL            (global fallback from settings / .env)
+      6. Hard error — nothing configured
     """
-    
-    # 1. Per-tenant env var (LARAVEL_BACKEND_URL_<COMPANY_CODE>)
+    # 1. X-Backend-URL header — sent by Flutter with every request.
+    #    Contains the exact Laravel backend URL that issued the token,
+    #    e.g. "https://dev109-be.leysco100.com".
+    #    This makes multi-tenant routing fully automatic: no .env entries needed.
+    if request:
+        backend_url_header = (
+            request.headers.get("x-backend-url")
+            or request.headers.get("X-Backend-URL")
+        )
+        if backend_url_header and backend_url_header.startswith("https://"):
+            # Strip any trailing path suffixes the app may include in base_url.
+            # Flutter saves base_url as "https://dev109-be.leysco100.com/api/v1"
+            # but we need just "https://dev109-be.leysco100.com" so that
+            # validate_token_with_backend can append /api/user without doubling.
+            for suffix in ("/api/v1", "/api", "/v1"):
+                if backend_url_header.rstrip("/").endswith(suffix):
+                    backend_url_header = backend_url_header.rstrip("/")[:-len(suffix)]
+                    break
+            backend_url_header = backend_url_header.rstrip("/")
+            logger.info(f"🔀 Backend URL from X-Backend-URL header: {backend_url_header}")
+            return backend_url_header
+
+    # 2. Per-tenant env var (useful for server-to-server or background jobs)
     if company_code:
         env_key = f"LARAVEL_BACKEND_URL_{company_code.upper()}"
-        per_tenant = os.getenv(env_key)
+        per_tenant = os.environ.get(env_key)
         if per_tenant:
             logger.debug(f"🔀 Backend URL from env {env_key}: {per_tenant}")
             return per_tenant.rstrip("/")
-    
+
     # 2. Explicit X-Tenant-Env header (useful for Postman / integration tests)
     if request:
-        tenant_env = request.headers.get("x-tenant-env") or request.headers.get("X-Tenant-Env")
+        tenant_env = (
+            request.headers.get("x-tenant-env")
+            or request.headers.get("X-Tenant-Env")
+        )
         if tenant_env and re.fullmatch(r"[a-zA-Z0-9_-]{3,30}", tenant_env):
-            derived = f"https://{tenant_env}-be.leysco100.com"
+            # Derive backend URL from the slug: "dev100" → "dev100-be.leysco100.com"
+            # The base domain is taken from LEYSCO_BASE_DOMAIN env (default: leysco100.com)
+            base_domain = os.environ.get("LEYSCO_BASE_DOMAIN", "leysco100.com")
+            derived = f"https://{tenant_env}-be.{base_domain}"
             logger.debug(f"🔀 Backend URL from X-Tenant-Env header: {derived}")
             return derived
-    
+
     # 3. Derive from the Origin / Referer header
     if request:
         origin = request.headers.get("origin") or request.headers.get("referer", "")
-        match = re.search(r"https?://(dev\d+)\.leysco100\.com", origin)
-        if match:
-            env_slug = match.group(1)
-            derived = f"https://{env_slug}-be.leysco100.com"
-            logger.debug(f"🔀 Backend URL derived from origin '{origin}': {derived}")
-            return derived
-    
-    # 4. Company code to backend mapping (fallback)
-    if company_code:
-        backend_map = {
-            "TEST001": os.getenv("LARAVEL_BACKEND_URL_TEST001", "https://dev100-be.leysco100.com"),
-            "TEST002": os.getenv("LARAVEL_BACKEND_URL_TEST002", "https://dev109-be.leysco100.com"),
-        }
-        mapped = backend_map.get(company_code.upper())
-        if mapped:
-            logger.debug(f"🔀 Backend URL from company code mapping: {mapped}")
-            return mapped
+        if origin:
+            base_domain = os.environ.get("LEYSCO_BASE_DOMAIN", "leysco100.com")
+            # Match pattern: https://dev<N>.leysco100.com  (or any slug)
+            pattern = rf"https?://([a-zA-Z0-9_-]+)\.{re.escape(base_domain)}"
+            match = re.search(pattern, origin)
+            if match:
+                env_slug = match.group(1)
+                # Only derive if slug doesn't already end in -be (avoid double suffix)
+                if not env_slug.endswith("-be"):
+                    derived = f"https://{env_slug}-be.{base_domain}"
+                    logger.debug(f"🔀 Backend URL derived from origin '{origin}': {derived}")
+                    return derived
 
-    # 5. Global fallback env var
-    global_url = getattr(settings, "LARAVEL_BACKEND_URL", None) or os.getenv("LARAVEL_BACKEND_URL")
-    if global_url:
-        logger.debug(f"🔀 Backend URL from global setting: {global_url}")
-        return global_url.rstrip("/")
+    # 4. Global fallback from settings / .env
+    try:
+        url = get_laravel_backend_url(company_code)
+        logger.debug(f"🔀 Backend URL from global config: {url}")
+        return url
+    except RuntimeError:
+        pass
 
-    # 6. Nothing configured — fail loudly
+    # 5. Nothing configured — fail loudly with a helpful message
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Authentication service is not configured for this tenant.",
+        detail=(
+            "Authentication service is not configured for this tenant. "
+            f"Set LARAVEL_BACKEND_URL_{(company_code or 'DEFAULT').upper()} in .env."
+        ),
     )
 
 
@@ -181,7 +210,7 @@ async def get_company_code(
     if code:
         logger.info(f"✅ Company code from header: {code}")
         return code
-    
+
     # Priority 2: From cached session
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     cached = _user_session_cache.get(token_hash)
@@ -189,11 +218,10 @@ async def get_company_code(
         cached_code = cached["user"]["company_code"]
         logger.info(f"✅ Company code from cached session: {cached_code}")
         return cached_code
-    
-    # Priority 3: Validate token with backend (without company code to detect)
-    # Try to detect from origin first
+
+    # Priority 3: Validate token with backend to detect company code
     backend_url = resolve_backend_url(request=request)
-    
+
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -201,14 +229,14 @@ async def get_company_code(
                 f"{backend_url}/api/user",
                 headers={"Authorization": f"Bearer {token}"}
             )
-        
+
         if response.status_code == 200:
             data = response.json()
             company_code_val = (
-                data.get("company_code") or
-                data.get("tenant_code") or
-                data.get("CompanyID") or
-                data.get("company_id")
+                data.get("company_code")
+                or data.get("tenant_code")
+                or data.get("CompanyID")
+                or data.get("company_id")
             )
             if company_code_val:
                 if str(company_code_val).isdigit():
@@ -233,7 +261,6 @@ class UserSessionManager:
 
     @staticmethod
     def _get_cache_key(token: str, company_code: str = None) -> str:
-        """Create cache key with optional company code for isolation."""
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         if company_code:
             return f"{token_hash}:{company_code}"
@@ -291,23 +318,20 @@ async def validate_token_with_backend(
     Validate opaque Sanctum token against the correct Laravel backend
     for this tenant.
 
-    CRITICAL FIX: Uses company_code AND request to resolve the correct backend.
-    Tokens from TEST001 validate against dev100-be, TEST002 against dev109-be.
+    Backend URL is resolved dynamically from env vars — no hardcoded URLs.
     """
-    # Get company code from various sources
     resolved_company_code = company_code
-    
-    # If no company code provided, try to get from request header
+
     if not resolved_company_code and request:
         resolved_company_code = await get_company_code_header(request)
-    
-    # Cache hit with company code - use it
+
+    # Cache hit
     cached = UserSessionManager.get(token, resolved_company_code)
     if cached:
         logger.info(f"✅ Using cached user session for company: {resolved_company_code}")
         return cached
-    
-    # CRITICAL FIX: Resolve backend URL using both company code and request
+
+    # Resolve backend URL — env vars only, no hardcoded fallbacks
     backend_url = resolve_backend_url(company_code=resolved_company_code, request=request)
     validate_url = f"{backend_url}/api/user"
 
@@ -326,8 +350,8 @@ async def validate_token_with_backend(
             location = response.headers.get("location", "unknown")
             logger.error(
                 f"Token validation redirected (302) to '{location}'. "
-                f"Likely wrong backend URL '{backend_url}' for this token. "
-                f"Company code: {resolved_company_code}"
+                f"Likely wrong backend URL '{backend_url}' for company '{resolved_company_code}'. "
+                f"Check LARAVEL_BACKEND_URL_{(resolved_company_code or 'DEFAULT').upper()} in .env."
             )
             return None
 
@@ -335,23 +359,21 @@ async def validate_token_with_backend(
             data = response.json()
 
             # Manager detection from Laravel response
-            is_superuser     = data.get("SUPERUSER") == "1"
-            role             = data.get("role", "sales_rep")
-            is_manager_role  = role.lower() in ("manager", "admin", "supervisor", "director")
-            is_manager_flag  = data.get("is_manager", False)
-            is_manager       = is_superuser or is_manager_role or is_manager_flag
-            user_role        = "manager" if is_manager else "sales_rep"
+            is_superuser    = data.get("SUPERUSER") == "1"
+            role            = data.get("role", "sales_rep")
+            is_manager_role = role.lower() in ("manager", "admin", "supervisor", "director")
+            is_manager_flag = data.get("is_manager", False)
+            is_manager      = is_superuser or is_manager_role or is_manager_flag
+            user_role       = "manager" if is_manager else "sales_rep"
 
-            # Company code extraction
+            # Company code extraction — prefer the one already known from header
             company_code_val = (
-                resolved_company_code or
-                data.get("company_code") or
-                data.get("tenant_code") or
-                data.get("CompanyID") or
-                data.get("company_id")
+                resolved_company_code
+                or data.get("company_code")
+                or data.get("tenant_code")
+                or data.get("CompanyID")
+                or data.get("company_id")
             )
-            
-            # If company code is numeric, prefix with 'C'
             if company_code_val and str(company_code_val).isdigit():
                 company_code_val = f"C{company_code_val}"
 
@@ -376,8 +398,7 @@ async def validate_token_with_backend(
                 f"Role: {user_role}, Company: {company_code_val}, "
                 f"Backend: {backend_url}"
             )
-            
-            # Store with company code for proper isolation
+
             UserSessionManager.store(token, user_info)
             return user_info
 
@@ -405,7 +426,6 @@ async def extract_user_info_from_token(
     request: Request = None,
 ) -> Dict[str, Any]:
     """Return full user_info dict for a token."""
-    # Get company code from request if available
     company_code = None
     if request:
         company_code = await get_company_code_header(request)

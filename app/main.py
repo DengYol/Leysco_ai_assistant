@@ -10,6 +10,7 @@ UPDATED: S1.0 Input Validation - Added Pydantic validation and sanitization
 UPDATED: S1.1 + S1.2 Rate Limiting & Error Handling - Added rate limits and secure errors
 UPDATED: S1.3 + S2.0 Audit Trail & RBAC - Added audit logging and role-based access control
 UPDATED: S2.1 + S2.2 + S2.3 Token Management & Encryption - Added JWT tokens, request signing, and encryption
+UPDATED: S3.0 Authentication Service - Added production auth with JWT tokens, refresh, and logout
 FIXED: Background scanner no longer uses TEST_USER_TOKEN or hardcoded users.
        It authenticates per-tenant using service account credentials and only
        scans users who have active sessions (real logged-in users).
@@ -26,6 +27,7 @@ ADDED: RBAC (S2.0) - Role-based access control with granular permissions
 ADDED: Token management (S2.1) - JWT tokens with expiration and refresh support
 ADDED: Request signing (S2.2) - HMAC-SHA256 request integrity verification
 ADDED: Encryption (S2.3) - AES-256 encryption for sensitive data
+ADDED: Authentication service (S3.0) - Production JWT auth with refresh tokens
 """
 
 from fastapi import FastAPI, Request
@@ -43,6 +45,7 @@ from app.core.token_manager import get_token_manager
 from app.core.request_signing import get_request_signer
 from app.core.encryption import get_encryption_manager
 from app.core.security_headers import security_headers_middleware, SECURITY_HEADERS
+from app.core.auth_service import get_auth_service
 # S1.0 Input Validation
 from app.api.middleware.validators import validation_error_handler
 from fastapi.exceptions import RequestValidationError
@@ -547,6 +550,18 @@ async def startup_event():
     logger.info("   - Referrer Policy")
     logger.info("   - Permissions Policy")
 
+    # S3.0: Authentication Service (NEW)
+    logger.info("\n🔐 Initializing Authentication Service (S3.0)...")
+    auth_service = get_auth_service()
+    logger.info("✅ Authentication service initialized")
+    logger.info("   - User login endpoint: /api/auth/login")
+    logger.info("   - Token refresh endpoint: /api/auth/refresh")
+    logger.info("   - Token verification endpoint: /api/auth/verify")
+    logger.info("   - Logout endpoint: /api/auth/logout")
+    logger.info("   - Access token TTL: 24 hours")
+    logger.info("   - Refresh token TTL: 30 days")
+    logger.info("   - Rate limiting: 5 failed attempts per 5 minutes")
+
     # Phase 1 - Initialize database and scheduler
     logger.info("\n📦 Initializing Phase 1 (Database & Scheduler)...")
     await _init_phase1()
@@ -585,6 +600,7 @@ async def startup_event():
     logger.info(f"🔐 Authentication endpoints:")
     logger.info(f"   POST   /api/auth/login")
     logger.info(f"   POST   /api/auth/logout")
+    logger.info(f"   POST   /api/auth/refresh")
     logger.info(f"   POST   /api/auth/verify")
     logger.info(f"📚 API Documentation: http://localhost:8000/docs")
     logger.info("=" * 60)
@@ -729,6 +745,7 @@ def health_check():
         "phase1_3_vector_store_enabled": VECTOR_STORE_AVAILABLE,
         "chat_persistence_enabled": CHAT_PERSISTENCE_AVAILABLE,
         "auth_enabled": True,
+        "auth_service_initialized": True,
         "rate_limiting_enabled": True,
         "error_handling_enabled": True,
         "audit_trail_enabled": True,
@@ -736,7 +753,7 @@ def health_check():
         "token_management_enabled": True,
         "request_signing_enabled": True,
         "encryption_enabled": True,
-        "security_headers_enabled": True,  # ADD THIS LINE
+        "security_headers_enabled": True,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -749,6 +766,7 @@ def api_info():
         "endpoints": {
             "login":            "/api/auth/login",
             "logout":           "/api/auth/logout",
+            "refresh":          "/api/auth/refresh",
             "verify_token":     "/api/auth/verify",
             "items":            "/api/v1/{tenant_id}/items",
             "inventory":        "/api/v1/{tenant_id}/inventory/",
@@ -772,6 +790,8 @@ def api_info():
             "chat_persistence":       CHAT_PERSISTENCE_AVAILABLE,
             "erp_knowledge_base":     VECTOR_STORE_AVAILABLE,
             "auth_endpoints":         True,
+            "jwt_tokens":             True,
+            "token_refresh":          True,
             "input_validation":       True,
             "rate_limiting":          True,
             "error_handling":         True,
@@ -780,7 +800,7 @@ def api_info():
             "token_management":       True,
             "request_signing":        True,
             "encryption":             True,
-            "security_headers":       True,  # ADD THIS LINE
+            "security_headers":       True,
         },
     }
 

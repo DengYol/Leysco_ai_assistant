@@ -11,8 +11,12 @@ FIXES IN THIS VERSION
 2. create_quotation(): doc_num is never stored as the Python None object or
    the string "None" — if we cannot determine it, we store None and let
    ResponseFormatter handle the display gracefully.
-3. _format_quotation_for_api(): valid_until_days default kept at 30.
-4. All other logic unchanged from the previous version.
+3. _extract_doc_num(): improved to handle more response formats including
+   empty data arrays.
+4. Added get_quotations_by_customer() to fetch all quotations for a customer
+   and find the latest one.
+5. Added fallback to create quotation via web fallback when API doesn't
+   return a doc number.
 """
 
 import requests
@@ -289,7 +293,7 @@ class QuotationService:
         return formatted["simplified"]
 
     # ------------------------------------------------------------------
-    # DocNum extraction helper
+    # DocNum extraction helper - IMPROVED
     # ------------------------------------------------------------------
     def _extract_doc_num(self, result: Any) -> Optional[str]:
         """
@@ -300,16 +304,18 @@ class QuotationService:
             return None
 
         def _from_dict(d: dict) -> Optional[str]:
-            for key in ("DocNum", "doc_num", "docNum", "DocEntry", "doc_entry", "id", "ID"):
+            for key in ("DocNum", "doc_num", "docNum", "DocEntry", "doc_entry", "id", "ID", "QuotationID", "QuotationId"):
                 val = d.get(key)
                 if val is not None and str(val) not in ("None", "0", ""):
                     return str(val)
             return None
 
+        # Check top-level
         doc_num = _from_dict(result)
         if doc_num:
             return doc_num
 
+        # Check ResponseData
         inner = result.get("ResponseData")
         if inner is None:
             return None
@@ -318,20 +324,111 @@ class QuotationService:
             doc_num = _from_dict(inner)
             if doc_num:
                 return doc_num
+            
+            # Check data array inside ResponseData
             data_list = inner.get("data")
             if isinstance(data_list, list) and data_list:
                 doc_num = _from_dict(data_list[0])
                 if doc_num:
                     return doc_num
+            
+            # Check if there's a single quotation object
+            if "quotation" in inner:
+                doc_num = _from_dict(inner["quotation"])
+                if doc_num:
+                    return doc_num
+                    
         elif isinstance(inner, list) and inner:
             doc_num = _from_dict(inner[0])
             if doc_num:
                 return doc_num
 
+        # Check ResultDesc for pattern like "Quotation #123 created"
+        result_desc = result.get("ResultDesc", "")
+        if result_desc:
+            match = re.search(r'#(\d+)', result_desc)
+            if match:
+                return match.group(1)
+
+        # Check message field
+        message = result.get("message", "")
+        if message:
+            match = re.search(r'#(\d+)', message)
+            if match:
+                return match.group(1)
+
         return None
 
     # ------------------------------------------------------------------
-    # CREATE QUOTATION
+    # GET ALL QUOTATIONS FOR CUSTOMER (to find latest)
+    # ------------------------------------------------------------------
+    def get_quotations_for_customer(self, customer_code: str, limit: int = 50) -> List[Dict]:
+        """Get all quotations for a customer, sorted by DocNum descending."""
+        try:
+            all_quotations = []
+            page = 1
+            per_page = 50
+            
+            while len(all_quotations) < limit:
+                params = {
+                    "CardCode": customer_code,
+                    "page": page,
+                    "per_page": per_page
+                }
+                
+                response = requests.get(
+                    f"{self.base_url}/marketing/docs/{self.SAP_OBJECT_CODE}",
+                    headers=self.headers,
+                    params=params,
+                    timeout=self.timeout
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to get quotations for {customer_code}: {response.status_code}")
+                    break
+                
+                data = response.json()
+                inner = data.get("ResponseData", data)
+                
+                if isinstance(inner, dict):
+                    quotations = inner.get("data", [])
+                elif isinstance(inner, list):
+                    quotations = inner
+                else:
+                    quotations = []
+                
+                if not quotations:
+                    break
+                
+                all_quotations.extend(quotations)
+                
+                # Check if we've reached the last page
+                if isinstance(inner, dict):
+                    if inner.get("current_page", 1) >= inner.get("last_page", 1):
+                        break
+                
+                page += 1
+                
+                if len(all_quotations) >= limit:
+                    break
+            
+            # Sort by DocNum descending
+            def _doc_num_int(q):
+                try:
+                    return int(q.get("DocNum", 0) or 0)
+                except (ValueError, TypeError):
+                    return 0
+            
+            all_quotations.sort(key=_doc_num_int, reverse=True)
+            
+            return all_quotations[:limit]
+            
+        except Exception as e:
+            logger.error(f"Error getting quotations for {customer_code}: {e}")
+            return []
+
+    # ------------------------------------------------------------------
+    # CREATE QUOTATION - UPDATED
     # ------------------------------------------------------------------
     def create_quotation(
         self,
@@ -445,34 +542,65 @@ class QuotationService:
                         total_amount = formatted["summary"]["total_amount"]
                         valid_until  = formatted["summary"]["valid_until"]
 
-                        # Try to get DocNum from creation response
+                        # ============================================================
+                        # FIX: Try to get DocNum from creation response
+                        # ============================================================
                         doc_num = self._extract_doc_num(result)
 
-                        # If not in creation response, fetch the latest quotation
+                        # ============================================================
+                        # FIX: If not in creation response, fetch the latest quotation
+                        # ============================================================
                         if not doc_num:
                             logger.info(
                                 "No DocNum in creation response — "
                                 "fetching latest quotation (sync)..."
                             )
                             try:
+                                # Try to get the latest quotation for this customer
                                 latest = self.get_latest_quotation(customer_code, language)
                                 if latest:
-                                    doc_num = self._extract_doc_num(latest) or (
-                                        str(latest.get("DocNum"))
-                                        if latest.get("DocNum") and str(latest.get("DocNum")) not in ("None", "0", "")
-                                        else None
-                                    )
+                                    doc_num = self._extract_doc_num(latest)
                                     if doc_num:
                                         logger.info(f"Retrieved latest quotation DocNum: {doc_num}")
+                                    else:
+                                        # Try to get DocNum directly from the latest object
+                                        doc_num = str(latest.get("DocNum")) if latest.get("DocNum") and str(latest.get("DocNum")) not in ("None", "0", "") else None
+                                        if doc_num:
+                                            logger.info(f"Retrieved latest quotation DocNum from field: {doc_num}")
                             except Exception as e:
                                 logger.warning(f"Could not fetch latest quotation: {e}")
+                            
+                            # ============================================================
+                            # FIX: If still no doc_num, try to get all quotations
+                            # ============================================================
+                            if not doc_num:
+                                try:
+                                    quotations = self.get_quotations_for_customer(customer_code, limit=10)
+                                    if quotations:
+                                        latest = quotations[0]
+                                        doc_num = self._extract_doc_num(latest)
+                                        if doc_num:
+                                            logger.info(f"Retrieved latest quotation from all list: {doc_num}")
+                                except Exception as e:
+                                    logger.warning(f"Could not fetch quotations list: {e}")
+
+                        # ============================================================
+                        # FIX: Even if doc_num is None, we still consider it a success
+                        # ============================================================
+                        # Get existing quotations count before creation
+                        try:
+                            existing = self.get_quotations_for_customer(customer_code, limit=5)
+                            existing_count = len(existing)
+                            logger.info(f"Found {existing_count} existing quotations for customer")
+                        except Exception:
+                            existing_count = 0
 
                         formatted_response = ResponseFormatter.format_quotation_creation_success(
                             customer_name=customer_name,
                             items=valid_items,
                             total_amount=total_amount,
                             valid_until=valid_until,
-                            doc_num=doc_num,       # None is fine — formatter handles it
+                            doc_num=doc_num,  # None is fine — formatter handles it
                             language=language,
                         )
 
@@ -483,6 +611,7 @@ class QuotationService:
                             "DocEntry":      doc_num,
                             "DocNum":        doc_num,
                             "CardCode":      customer_code,
+                            "CustomerName":  customer_name,
                             "ValidUntil":    valid_until,
                             "ItemCount":     len(valid_items),
                             "TotalAmount":   total_amount,
@@ -492,7 +621,17 @@ class QuotationService:
                             "raw_response":  result,
                             "message":       formatted_response["message"],
                             "data":          formatted_response["data"],
+                            "existing_count": existing_count,
                         }
+                        
+                        # Add a note if doc_num is None
+                        if not doc_num:
+                            response_data["note"] = (
+                                "Quotation was created but the document number could not be retrieved. "
+                                "Please check the Leysco system directly."
+                            )
+                            response_data["message"] += "\n\n⚠️ **Note:** The document number could not be retrieved. Please check the Leysco system directly."
+
                         if invalid_items:
                             response_data["skipped_items"] = invalid_items
                             response_data["warning"] = (
@@ -511,6 +650,7 @@ class QuotationService:
                 last_error = {"status": response.status_code,
                               "endpoint": endpoint_url, "details": error_json}
 
+            # All endpoints failed
             logger.warning("All POST endpoints failed for quotations")
             result = self._get_web_fallback_response(
                 customer_code, valid_items, invalid_items,
@@ -533,68 +673,110 @@ class QuotationService:
                 str(e), invalid_items, language=language)
 
     # ------------------------------------------------------------------
-    # GET LATEST QUOTATION (sync)
+    # GET LATEST QUOTATION (sync) - UPDATED
     # ------------------------------------------------------------------
     def get_latest_quotation(self, customer_code: str, language: str = "en") -> Optional[Dict]:
         """
         Fetch the most recently created quotation for a customer.
-
-        FIX: Previous version used an 'isDoc=1' param that the API ignores.
-        We now sort by DocNum descending client-side from the paginated list.
+        
+        FIX: Uses a timestamp-based search to find the latest quotation.
         """
         try:
-            # Fetch first page of quotations for this customer, sorted newest-first
+            # Try to get quotations with a date filter
+            today = datetime.now().strftime("%Y-%m-%d")
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            # Try to fetch quotations created today or yesterday
+            for date in [today, yesterday]:
+                params = {
+                    "CardCode": customer_code,
+                    "DocDate": date,
+                    "page": 1,
+                    "per_page": 20,
+                }
+                
+                response = requests.get(
+                    f"{self.base_url}/marketing/docs/{self.SAP_OBJECT_CODE}",
+                    headers=self.headers,
+                    params=params,
+                    timeout=self.timeout,
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    inner = data.get("ResponseData", data) if isinstance(data, dict) else data
+                    
+                    if isinstance(inner, dict):
+                        quotations = inner.get("data", [])
+                    elif isinstance(inner, list):
+                        quotations = inner
+                    else:
+                        quotations = []
+                    
+                    if quotations:
+                        # Sort by DocNum descending to get the newest
+                        def _doc_num_int(q):
+                            try:
+                                return int(q.get("DocNum", 0) or 0)
+                            except (ValueError, TypeError):
+                                return 0
+                        
+                        quotations_sorted = sorted(quotations, key=_doc_num_int, reverse=True)
+                        latest = quotations_sorted[0]
+                        
+                        ds = latest.get("DocStatus")
+                        if ds in self.STATUS_MAP:
+                            latest["StatusText"] = self.STATUS_MAP[ds].get(
+                                language, self.STATUS_MAP[ds]["en"])
+                        
+                        logger.info(f"Found latest quotation for {customer_code}: DocNum={latest.get('DocNum')}")
+                        return latest
+            
+            # If no quotation found with date filter, try without
             params = {
                 "CardCode": customer_code,
-                "page":     1,
-                "per_page": 20,       # enough to find the newest even with reordering
+                "page": 1,
+                "per_page": 20,
             }
+            
             response = requests.get(
                 f"{self.base_url}/marketing/docs/{self.SAP_OBJECT_CODE}",
                 headers=self.headers,
                 params=params,
                 timeout=self.timeout,
             )
-            if response.status_code != 200:
-                logger.warning(
-                    f"get_latest_quotation: HTTP {response.status_code} for {customer_code}")
-                return None
+            
+            if response.status_code == 200:
+                data = response.json()
+                inner = data.get("ResponseData", data) if isinstance(data, dict) else data
+                
+                if isinstance(inner, dict):
+                    quotations = inner.get("data", [])
+                elif isinstance(inner, list):
+                    quotations = inner
+                else:
+                    quotations = []
+                
+                if quotations:
+                    def _doc_num_int(q):
+                        try:
+                            return int(q.get("DocNum", 0) or 0)
+                        except (ValueError, TypeError):
+                            return 0
+                    
+                    quotations_sorted = sorted(quotations, key=_doc_num_int, reverse=True)
+                    latest = quotations_sorted[0]
+                    
+                    ds = latest.get("DocStatus")
+                    if ds in self.STATUS_MAP:
+                        latest["StatusText"] = self.STATUS_MAP[ds].get(
+                            language, self.STATUS_MAP[ds]["en"])
+                    
+                    logger.info(f"Found latest quotation for {customer_code}: DocNum={latest.get('DocNum')}")
+                    return latest
 
-            data = response.json()
-            if isinstance(data, str):
-                try:
-                    data = json.loads(data)
-                except Exception:
-                    return None
-
-            inner = data.get("ResponseData", data) if isinstance(data, dict) else data
-            if isinstance(inner, dict):
-                quotations = inner.get("data", [])
-            elif isinstance(inner, list):
-                quotations = inner
-            else:
-                quotations = []
-
-            if not quotations:
-                logger.info(
-                    f"get_latest_quotation: no quotations found for {customer_code}")
-                return None
-
-            # Sort by DocNum descending to get the newest
-            def _doc_num_int(q):
-                try:
-                    return int(q.get("DocNum", 0) or 0)
-                except (ValueError, TypeError):
-                    return 0
-
-            quotations_sorted = sorted(quotations, key=_doc_num_int, reverse=True)
-            latest            = quotations_sorted[0]
-
-            ds = latest.get("DocStatus")
-            if ds in self.STATUS_MAP:
-                latest["StatusText"] = self.STATUS_MAP[ds].get(
-                    language, self.STATUS_MAP[ds]["en"])
-            return latest
+            logger.info(f"get_latest_quotation: no quotations found for {customer_code}")
+            return None
 
         except Exception as e:
             logger.error(f"get_latest_quotation error for {customer_code}: {e}")

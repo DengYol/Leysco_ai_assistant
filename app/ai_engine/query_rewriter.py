@@ -7,6 +7,104 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# NON-ITEM WORDS
+# Words that look like item names when captured by "stock of X" patterns
+# but are actually generic qualifiers. Expanded to include adjectives like
+# "low"/"high" that appear in alert-style queries.
+# ---------------------------------------------------------------------------
+_NON_ITEM_WORDS = {
+    # Generic stock/inventory words
+    "levels", "level", "all", "everything", "items", "products",
+    "alerts", "alert", "report", "summary", "overview", "list",
+    "current", "now", "today", "hisa", "viwango", "me", "us",
+    # Adjectives used in alert-style queries ("low stock", "high stock")
+    "low", "high", "minimum", "min", "critical", "zero", "empty",
+    "running", "out", "near", "reorder", "insufficient", "short",
+    "excess", "surplus", "maximum", "max",
+}
+
+# ---------------------------------------------------------------------------
+# LOW-STOCK PATTERNS
+# Must be checked at Step 0 — before ANY stock or price pattern — so
+# adjectives like "low" are never extracted as item names.
+# ---------------------------------------------------------------------------
+_LOW_STOCK_PATTERNS = [
+    r"\blow[\s\-]?stock\b",
+    r"\bstock[\s\-]?alert[s]?\b",
+    r"\bstock[\s\-]?level[s]?\s*(are\s*)?(low|critical|minimum)\b",
+    r"\breorder[\s\-]?(alert[s]?|list|report|point)?\b",
+    r"\bitems?\s+(running|near(ing)?)\s+(low|out)\b",
+    r"\bwhat\s+(needs?|require[s]?)\s+reorder(ing)?\b",
+    r"\bminimum\s+stock\b",
+    r"\bcritical\s+stock\b",
+    r"\bstock\s+(running\s+)?out\b",
+    r"\bout[\s\-]of[\s\-]stock\b",
+    r"\bstock\s+shortage[s]?\b",
+    r"\bbelow\s+(minimum|reorder|safety)\b",
+]
+
+# ---------------------------------------------------------------------------
+# CONVERSATIONAL / GREETING PATTERNS
+# Must be checked at Step 0 — before ANY price or item extraction.
+# This prevents "Tell me about yourself" from being treated as a price query.
+# ---------------------------------------------------------------------------
+_CONVERSATIONAL_PATTERNS = [
+    r"^(?:tell me about yourself|who are you|what are you)$",
+    r"^(?:introduce yourself|about you|what is your name|who made you|who created you)$",
+    r"^(?:what do you do|how can you help me|what are your capabilities|your features|about yourself)$",
+    r"^(?:tell me more about yourself|explain yourself|what is your purpose)$",
+    r"^(?:how do you work|what can you do|help me understand you)$",
+]
+
+# ---------------------------------------------------------------------------
+# ITEM DETAIL PATTERNS
+# Must be checked before customer_rules sees "details of X", otherwise
+# "show item details of Cap Measuring" steals the item name as a customer.
+# ---------------------------------------------------------------------------
+_ITEM_DETAIL_PATTERNS = [
+    # "show item/items details of X" — singular OR plural
+    r"(?:show|get|view|display|fetch)\s+items?\s+details?\s+(?:of|for)\s+(.+)",
+    r"(?:show|get|view|display|fetch)\s+products?\s+details?\s+(?:of|for)\s+(.+)",
+    # bare "item/items details of X"
+    r"items?\s+details?\s+(?:of|for|about)\s+(.+)",
+    r"products?\s+details?\s+(?:of|for|about)\s+(.+)",
+    # "details of item/items X"
+    r"details?\s+(?:of|for|about)\s+(?:items?|products?)\s+(.+)",
+    r"(?:show|get|view)\s+details?\s+(?:of|for)\s+(?:items?|products?)\s+(.+)",
+    # Swahili
+    r"(?:maelezo|taarifa)\s+ya\s+bidhaa\s+(.+)",
+]
+
+# ---------------------------------------------------------------------------
+# ITEM DETAIL SIGNAL WORDS
+# If any of these appear BEFORE "details" in the query, the subject is an
+# item — not a customer. Used as a guard in customer_rules as well.
+# ---------------------------------------------------------------------------
+ITEM_DETAIL_SIGNALS = {
+    "item", "product", "sku", "stock", "inventory",
+    "bidhaa", "kitu",
+}
+
+# ---------------------------------------------------------------------------
+# LISTING / BROWSE PATTERNS
+# Detects "show me 10 items", "list all products", "browse inventory" etc.
+# Checked before price/stock patterns so a number ("10") is never mistaken
+# for part of a price/stock query, and the context resolver never inherits
+# item_name from the previous turn.
+# Tuple format: (regex_pattern, has_numeric_qty_capture_group)
+# ---------------------------------------------------------------------------
+_LISTING_PATTERNS = [
+    # "show me 10 items" / "list 5 products" / "get me 20 items"
+    (r"(?:show(?:\s+me)?|list|get(?:\s+me)?|display|browse|view)\s+(\d+)\s+(?:items?|products?|inventory)", True),
+    # "show me all items" / "list all products"
+    (r"(?:show(?:\s+me)?|list|get(?:\s+me)?|display|browse|view)\s+(?:all|every)\s+(?:items?|products?|inventory)", False),
+    # bare "show me items" / "browse items" / "view products"
+    (r"(?:show(?:\s+me)?|list|get(?:\s+me)?|display|browse|view)\s+(?:items?|products?|inventory)$", False),
+    # Swahili: "onyesha bidhaa" / "orodhesha 10 bidhaa"
+    (r"(?:onyesha|orodhesha|pata)\s+(\d+)?\s*(?:bidhaa|vitu)", False),
+]
+
 
 class QueryRewriter:
     """
@@ -19,22 +117,31 @@ class QueryRewriter:
         # CRITICAL: PRICE-RELATED PATTERNS - HIGHEST PRIORITY
         # =========================================================
         self.price_patterns = [
+            # Highest specificity first
             (r"^(?:what is|what\'s|whats)\s+the\s+price\s+of\s+(.+)", "price"),
             (r"^(?:price|cost|bei|gharama)\s+(?:of|ya)?\s*(.+)", "price"),
             (r"^how\s+much\s+(?:is|does)\s+(.+)\s+(?:cost|price)?$", "price"),
             (r"(?:how much|what'?s the price|how much is|price of|cost of|bei ya|gharama ya)\s+(.+)", "price"),
-            (r"(.+)\s+(?:price|cost|bei|gharama)", "price"),
-            (r"(?:expensive|cheap|costly)\s+(.+)", "price"),
+            # FIX: "QUALIFIER price for ITEM" — capture what's AFTER "for"
+            # Handles: "best price for vegimax", "competitors price for vegimax 30ml",
+            #          "cheapest price for cabbage", "market price for maize"
+            # Must run BEFORE the greedy (.+)\s+price pattern.
+            (r"(?:best|cheapest|lowest|highest|market|retail|wholesale|competitor[s]?|current|latest|going)\s+(?:price|cost|rate|bei|gharama)\s+(?:for|of|ya)\s+(.+)", "price"),
             (r"(?:tell me|show me|get me)\s+(?:the )?price\s+(?:of|for)?\s*(.+)", "price"),
             (r"(?:what does|how much does)\s+(.+)\s+(?:cost|sell for)", "price"),
+            # Greedy catch-all: "ITEM price/cost" where item is BEFORE price word.
+            # Non-greedy (.+?) so it stops at the first space before price/cost.
+            (r"^(.+?)\s+(?:price|cost|bei|gharama)(?:\s+for\s+\S+)?$", "price"),
+            (r"(?:expensive|cheap|costly)\s+(.+)", "price"),
         ]
 
-        # Stock-related patterns
+        # Stock-related patterns — require "of/for" before the item to
+        # avoid capturing generic words from "show me stock levels" etc.
         self.stock_patterns = [
-            (r"(?:stock|inventory|available|hisa|viwango|idadi)\s+(?:of|for|ya|za)?\s*(.+)", "stock"),
+            (r"(?:stock|inventory|available|hisa|viwango|idadi)\s+(?:of|for|ya|za)\s+(.+)", "stock"),
             (r"(?:how many|quantity of)\s+(.+)\s+(?:do we have|is available|zilizopo)", "stock"),
             (r"(?:is there|do we have)\s+(.+)\s+(?:in stock|available)", "stock"),
-            (r"(?:check|look up)\s+(?:stock of|inventory for)?\s*(.+)", "stock"),
+            (r"(?:check|look up)\s+(?:stock of|inventory for)\s+(.+)", "stock"),
             (r"(.+)\s+(?:stock|inventory|hisa)", "stock"),
         ]
 
@@ -95,7 +202,7 @@ class QueryRewriter:
             (r"(?:does|can)\s+([A-Za-z0-9\s]+)\s+need\s+approval", "approval_check"),
         ]
 
-        # Critical: Churn risk / Customer health patterns (HIGH PRIORITY)
+        # Churn risk / Customer health patterns (HIGH PRIORITY)
         self.churn_risk_patterns = [
             (r"(?:show|customer|list|get|find)\s+customers?\s+(?:at|with|having)?\s+(?:churn\s+risk|churn risk|risk)", "customer_health"),
             (r"(?:who|customers)\s+(?:is|are)\s+(?:likely|about)\s+to\s+(?:leave|churn)", "customer_health"),
@@ -200,90 +307,172 @@ class QueryRewriter:
 
         # Intent to standard phrase mapping
         self.intent_phrases = {
-            "GET_ITEM_PRICE": "price of",
-            "GET_STOCK_LEVELS": "stock of",
-            "GET_TOP_SELLING_ITEMS": "top selling items",
-            "GET_SLOW_MOVING_ITEMS": "slow moving items",
+            "GET_ITEM_PRICE":             "price of",
+            "GET_STOCK_LEVELS":           "stock of",
+            "GET_LOW_STOCK":              "low stock alerts",
+            "GET_ITEM_DETAILS":           "item details of",
+            "GET_TOP_SELLING_ITEMS":      "top selling items",
+            "GET_SLOW_MOVING_ITEMS":      "slow moving items",
             "GET_OUTSTANDING_DELIVERIES": "outstanding deliveries",
-            "TRACK_DELIVERY": "track delivery",
-            "CREATE_QUOTATION": "create quotation for",
-            "GET_CUSTOMERS": "show customers",
-            "GET_CUSTOMER_HEALTH": "show customers at churn risk",
-            "GET_CUSTOMER_ORDERS": "customer orders for",
-            "GET_WAREHOUSES": "show warehouses",
-            "FIND_CUSTOMERS_BY_ITEM": "customers who buy",
-            "GET_AR_INVOICES": "show invoices",
-            "GET_OVERDUE_INVOICES": "overdue invoices",
-            "GET_CUSTOMER_BALANCE": "customer balance for",
-            "SEND_PAYMENT_REMINDER": "send reminder to",
-            "GET_PURCHASE_ORDERS": "purchase orders",
-            "CREATE_PURCHASE_ORDER": "create purchase order for",
-            "GET_REORDER_REPORT": "what needs reordering",
-            "CREATE_STOCK_TRANSFER": "transfer stock",
+            "TRACK_DELIVERY":             "track delivery",
+            "CREATE_QUOTATION":           "create quotation for",
+            "GET_CUSTOMERS":              "show customers",
+            "GET_CUSTOMER_HEALTH":        "show customers at churn risk",
+            "GET_CUSTOMER_ORDERS":        "customer orders for",
+            "GET_WAREHOUSES":             "show warehouses",
+            "FIND_CUSTOMERS_BY_ITEM":     "customers who buy",
+            "GET_AR_INVOICES":            "show invoices",
+            "GET_OVERDUE_INVOICES":       "overdue invoices",
+            "GET_CUSTOMER_BALANCE":       "customer balance for",
+            "SEND_PAYMENT_REMINDER":      "send reminder to",
+            "GET_PURCHASE_ORDERS":        "purchase orders",
+            "CREATE_PURCHASE_ORDER":      "create purchase order for",
+            "GET_REORDER_REPORT":         "what needs reordering",
+            "CREATE_STOCK_TRANSFER":      "transfer stock",
             "CONVERT_QUOTATION_TO_ORDER": "convert quotation to order",
-            "POST_INVOICE": "post invoice for",
+            "POST_INVOICE":               "post invoice for",
         }
+
+    # =========================================================
+    # PUBLIC ENTRY POINT
+    # =========================================================
 
     def rewrite(self, message: str) -> Tuple[str, str, Optional[dict]]:
         """
         Rewrite query and extract structured information.
 
+        Priority ladder (first match wins, short-circuits the rest):
+          0a. Conversational queries     → GREETING
+          0b. Low-stock alert queries    → GET_LOW_STOCK
+          0c. Item detail queries        → GET_ITEM_DETAILS
+          0d. Price queries              → GET_ITEM_PRICE
+          1.  Protected patterns         → GET_CUSTOMER_HEALTH
+          2.  Invoice patterns
+          3.  Purchase patterns
+          4.  Inventory movement
+          5.  Document transitions
+          6.  Business rules
+          7.  Warehouse patterns
+          8.  Misspelling fix
+          9.  _detect_intent_and_extract (inner rules)
+          10. _rewrite_for_intent
+          11. _pattern_based_rewrite
+          12. Query cleanup
+
         Returns:
-            Tuple of (rewritten_message, detected_intent, extracted_entities)
+            (rewritten_message, detected_intent, extracted_entities)
         """
         original = message
-        rewritten = message
-        detected_intent = None
-        extracted_entities = {}
+        message_lower = message.lower().strip()
 
-        # =========================================================
-        # STEP 0: CHECK FOR PRICE QUERIES FIRST (CRITICAL!)
-        # =========================================================
+        # =================================================================
+        # STEP 0a: CONVERSATIONAL / GREETING QUERIES
+        # Must run before ANY price or item extraction.
+        # This prevents "Tell me about yourself" from being treated as a price query.
+        # =================================================================
+        for pattern in _CONVERSATIONAL_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                logger.info(f"Conversational pattern detected: '{original}' → GREETING")
+                return original, "GREETING", {}
+
+        # Also check for variations of conversational queries
+        conversational_variations = [
+            "tell me about yourself", "who are you", "what are you",
+            "introduce yourself", "about you", "what is your name",
+            "who made you", "who created you", "what do you do",
+            "how can you help me", "what are your capabilities",
+            "your features", "about yourself", "tell me more about yourself",
+            "explain yourself", "what is your purpose", "how do you work",
+            "what can you do", "help me understand you", "tell me about you",
+            "what's your name", "whats your name", "who are you?"
+        ]
+        for variation in conversational_variations:
+            if variation in message_lower:
+                logger.info(f"Conversational variation detected: '{original}' → GREETING")
+                return original, "GREETING", {}
+
+        # =================================================================
+        # STEP 0b: LOW-STOCK ALERT QUERIES
+        # Must run before stock/price patterns so "low" is never treated
+        # as an item name (e.g. "Low stock alerts" → item_name="low").
+        # =================================================================
+        for pattern in _LOW_STOCK_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                logger.info(f"Low-stock pattern: '{original}' → GET_LOW_STOCK")
+                return original, "GET_LOW_STOCK", {}
+
+        # =================================================================
+        # STEP 0c: ITEM DETAIL QUERIES
+        # Must run before customer_rules sees "details of X", otherwise
+        # "show item details of Cap Measuring" is stolen as customer_name.
+        # =================================================================
+        for pattern in _ITEM_DETAIL_PATTERNS:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                item_name = match.group(1).strip()
+                logger.info(f"Item detail pattern: '{original}' → GET_ITEM_DETAILS (item: {item_name})")
+                return f"item details of {item_name}", "GET_ITEM_DETAILS", {"item_name": item_name}
+
+        # =================================================================
+        # STEP 0c-2: ITEM LISTING / BROWSE QUERIES
+        # "show me 10 items", "list all products", "browse inventory" etc.
+        # Must run before price/stock patterns so "10" is never mistaken for
+        # part of a price query, and before context resolution so item_name
+        # is never inherited from the previous turn for a generic browse.
+        # =================================================================
+        for _pat, _has_qty in _LISTING_PATTERNS:
+            _m = re.search(_pat, message_lower, re.IGNORECASE)
+            if _m:
+                _qty = None
+                if _has_qty and _m.lastindex and _m.group(1):
+                    _qty = int(_m.group(1))
+                _list_entities: dict = {"_is_listing": True}
+                if _qty:
+                    _list_entities["quantity"] = _qty
+                logger.info(
+                    f"Item listing pattern: '{original}' → GET_ITEMS "
+                    f"(qty={_qty}, _is_listing=True)"
+                )
+                return original, "GET_ITEMS", _list_entities
+
+        # =================================================================
+        # STEP 0d: PRICE QUERIES
+        # =================================================================
         for pattern, _ in self.price_patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
                 item_name = self._extract_item_name(match.group(1) if match.groups() else message)
                 if item_name:
                     extracted_entities = {"item_name": item_name}
-                    logger.info(f"Price pattern detected: '{original}' → intent: GET_ITEM_PRICE (item: {item_name})")
+                    logger.info(f"Price pattern: '{original}' → GET_ITEM_PRICE (item: {item_name})")
                     return f"price of {item_name}", "GET_ITEM_PRICE", extracted_entities
 
-        # Step 1: Check for PROTECTED patterns
-        protected_patterns = [
-            (self.churn_risk_patterns, "GET_CUSTOMER_HEALTH"),
-        ]
-
-        for patterns, intent_type in protected_patterns:
+        # Step 1: PROTECTED patterns (churn risk — cannot be overridden by anything)
+        for patterns, intent_type in [(self.churn_risk_patterns, "GET_CUSTOMER_HEALTH")]:
             for pattern, _ in patterns:
-                if re.search(pattern, rewritten, re.IGNORECASE):
-                    logger.info(f"Protected pattern detected: '{original}' → intent: {intent_type}")
+                if re.search(pattern, message, re.IGNORECASE):
+                    logger.info(f"Protected pattern: '{original}' → {intent_type}")
                     return original, intent_type, {}
 
-        # Step 2: Check for INVOICE patterns
+        # Step 2: INVOICE patterns
         for pattern, inv_type in self.invoice_patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
                 entities = {}
                 if match.groups() and match.group(1):
                     entities["customer_name"] = self._extract_customer_name(match.group(1))
-                
                 if inv_type == "overdue_invoices":
-                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_OVERDUE_INVOICES")
                     return f"overdue invoices for {entities.get('customer_name', '')}".strip(), "GET_OVERDUE_INVOICES", entities
                 elif inv_type == "customer_balance":
-                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_CUSTOMER_BALANCE")
                     return f"customer balance for {entities.get('customer_name', '')}".strip(), "GET_CUSTOMER_BALANCE", entities
                 elif inv_type == "payment_reminder":
-                    logger.info(f"Invoice pattern detected: '{original}' → intent: SEND_PAYMENT_REMINDER")
                     return f"send reminder to {entities.get('customer_name', '')}".strip(), "SEND_PAYMENT_REMINDER", entities
                 elif inv_type == "aging_report":
-                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_AGING_REPORT")
                     return "aging report", "GET_AGING_REPORT", {}
                 else:
-                    logger.info(f"Invoice pattern detected: '{original}' → intent: GET_AR_INVOICES")
                     return f"show invoices for {entities.get('customer_name', '')}".strip(), "GET_AR_INVOICES", entities
 
-        # Step 3: Check for PURCHASE patterns (only if not a price query)
+        # Step 3: PURCHASE patterns
         for pattern, po_type in self.purchase_patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
@@ -294,7 +483,6 @@ class QueryRewriter:
                         entities["items_raw"] = match.group(2)
                     elif match.groups():
                         entities["vendor_name"] = self._extract_customer_name(match.group(1))
-                    logger.info(f"Purchase pattern detected: '{original}' → intent: CREATE_PURCHASE_ORDER")
                     return message, "CREATE_PURCHASE_ORDER", entities
                 elif po_type == "purchase_orders" and match.groups() and match.group(1):
                     entities["vendor_name"] = self._extract_customer_name(match.group(1))
@@ -308,10 +496,9 @@ class QueryRewriter:
                     entities["po_num"] = match.group(1)
                     return f"approve purchase order {entities['po_num']}", "APPROVE_PURCHASE_ORDER", entities
                 else:
-                    logger.info(f"Purchase pattern detected: '{original}' → intent: GET_PURCHASE_ORDERS")
                     return "purchase orders", "GET_PURCHASE_ORDERS", {}
 
-        # Step 4: Check for INVENTORY MOVEMENT patterns
+        # Step 4: INVENTORY MOVEMENT patterns
         for pattern, inv_type in self.inventory_movement_patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
@@ -320,13 +507,11 @@ class QueryRewriter:
                     if len(match.groups()) >= 2:
                         entities["warehouse"] = match.group(1) if match.group(1) else "MAIN"
                         entities["items_raw"] = match.group(2)
-                    logger.info(f"Inventory movement pattern detected: '{original}' → intent: CREATE_GOODS_ISSUE")
                     return message, "CREATE_GOODS_ISSUE", entities
                 elif inv_type == "goods_receipt":
                     if match.groups():
-                        if match.group(1):  # PO number
+                        if match.group(1):
                             entities["po_num"] = match.group(1)
-                            logger.info(f"Inventory movement pattern detected: '{original}' → intent: CREATE_GOODS_RECEIPT")
                             return f"create goods receipt for po {entities['po_num']}", "CREATE_GOODS_RECEIPT", entities
                         elif match.group(2):
                             entities["items_raw"] = match.group(2)
@@ -335,7 +520,6 @@ class QueryRewriter:
                     entities["from_warehouse"] = match.group(1)
                     entities["to_warehouse"] = match.group(2)
                     entities["items_raw"] = match.group(3)
-                    logger.info(f"Inventory movement pattern detected: '{original}' → intent: CREATE_STOCK_TRANSFER")
                     return message, "CREATE_STOCK_TRANSFER", entities
                 elif inv_type == "reorder_report":
                     return "what needs reordering", "GET_REORDER_REPORT", {}
@@ -345,7 +529,7 @@ class QueryRewriter:
                 elif inv_type == "inventory_valuation":
                     return "inventory valuation", "GET_INVENTORY_VALUATION", {}
 
-        # Step 5: Check for DOCUMENT TRANSITION patterns
+        # Step 5: DOCUMENT TRANSITION patterns
         for pattern, trans_type in self.document_transition_patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
@@ -353,12 +537,10 @@ class QueryRewriter:
                 if trans_type == "convert_quotation":
                     if match.groups() and match.group(1):
                         entities["doc_num"] = match.group(1)
-                    logger.info(f"Document transition pattern detected: '{original}' → intent: CONVERT_QUOTATION_TO_ORDER")
                     return message, "CONVERT_QUOTATION_TO_ORDER", entities
                 elif trans_type == "post_invoice":
                     if match.groups() and match.group(1):
                         entities["doc_num"] = match.group(1)
-                    logger.info(f"Document transition pattern detected: '{original}' → intent: POST_INVOICE")
                     return message, "POST_INVOICE", entities
                 elif trans_type == "cancel_document" and match.groups():
                     entities["doc_num"] = match.group(1)
@@ -367,7 +549,7 @@ class QueryRewriter:
                     entities["doc_num"] = match.group(1)
                     return f"reverse document {entities['doc_num']}", "REVERSE_DOCUMENT", entities
 
-        # Step 6: Check for BUSINESS RULES patterns
+        # Step 6: BUSINESS RULES patterns
         for pattern, rule_type in self.business_rules_patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
@@ -379,27 +561,26 @@ class QueryRewriter:
                     entities["item_name"] = self._extract_item_name(match.group(1))
                     return f"check stock availability for {entities['item_name']}", "CHECK_STOCK_AVAILABILITY", entities
 
-        # Step 7: Check warehouse patterns
+        # Step 7: WAREHOUSE patterns
         for pattern, _ in self.warehouse_patterns:
             if re.search(pattern, message, re.IGNORECASE):
-                logger.info(f"Warehouse pattern detected: '{original}' → intent: GET_WAREHOUSES")
                 return "show warehouses?", "GET_WAREHOUSES", {}
 
-        # Step 8: Fix common misspellings
-        rewritten = self._fix_misspellings(rewritten)
+        # Step 8: Fix misspellings
+        rewritten = self._fix_misspellings(message)
 
-        # Step 9: Try to detect intent and extract entities
+        # Step 9: Rule-based intent + entity detection
         detected_intent, extracted_entities = self._detect_intent_and_extract(rewritten)
 
-        # Step 10: Rewrite based on detected intent
+        # Step 10: Rewrite to standard phrase
         if detected_intent:
             rewritten = self._rewrite_for_intent(rewritten, detected_intent, extracted_entities)
 
-        # Step 11: If no intent detected, try pattern matching
+        # Step 11: Pattern-based fallback
         if not detected_intent:
             detected_intent, rewritten, extracted_entities = self._pattern_based_rewrite(rewritten)
 
-        # Step 12: Clean up the rewritten query
+        # Step 12: Clean up
         rewritten = self._clean_query(rewritten)
 
         if rewritten != original:
@@ -407,8 +588,11 @@ class QueryRewriter:
 
         return rewritten, detected_intent, extracted_entities
 
+    # =========================================================
+    # INTERNAL HELPERS
+    # =========================================================
+
     def _fix_misspellings(self, text: str) -> str:
-        """Fix common misspellings"""
         result = text.lower()
         for wrong, correct in self.misspellings.items():
             if wrong in result:
@@ -416,17 +600,34 @@ class QueryRewriter:
         return result
 
     def _detect_intent_and_extract(self, text: str) -> Tuple[Optional[str], dict]:
-        """Detect intent and extract entities from text"""
+        """Inner rule-based intent + entity detection (runs after Steps 0-7)."""
         text_lower = text.lower()
         entities = {}
 
-        # CRITICAL: Check for churn risk first (highest priority)
+        # ================================================================
+        # FIX: Check conversational queries again
+        # ================================================================
+        for pattern in _CONVERSATIONAL_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return "GREETING", entities
+
+        # Churn risk — highest priority inside this method too
         for pattern, _ in self.churn_risk_patterns:
             if re.search(pattern, text_lower, re.IGNORECASE):
-                logger.info(f"Detected churn risk intent: '{text}'")
                 return "GET_CUSTOMER_HEALTH", entities
 
-        # Check for price queries
+        # Low-stock — check again in case query was misspelling-corrected
+        for pattern in _LOW_STOCK_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return "GET_LOW_STOCK", {}
+
+        # Item details — check again after misspelling correction
+        for pattern in _ITEM_DETAIL_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return "GET_ITEM_DETAILS", {"item_name": match.group(1).strip()}
+
+        # Price queries
         for pattern, _ in self.price_patterns:
             match = re.search(pattern, text_lower)
             if match:
@@ -434,15 +635,18 @@ class QueryRewriter:
                 if entities["item_name"]:
                     return "GET_ITEM_PRICE", entities
 
-        # Check for stock queries
+        # Stock queries — only when captured word is a real item name
         for pattern, _ in self.stock_patterns:
             match = re.search(pattern, text_lower)
             if match:
-                entities["item_name"] = self._extract_item_name(match.group(1) if match.groups() else text)
-                if entities["item_name"]:
+                candidate = self._extract_item_name(match.group(1) if match.groups() else text)
+                if candidate and candidate.lower().strip() not in _NON_ITEM_WORDS:
+                    entities["item_name"] = candidate
                     return "GET_STOCK_LEVELS", entities
+                if re.search(r'\b(?:stock|inventory)\b', text_lower):
+                    return "GET_STOCK_LEVELS", {}
 
-        # Check for delivery queries
+        # Delivery queries
         for pattern, delivery_type in self.delivery_patterns:
             match = re.search(pattern, text_lower)
             if match:
@@ -453,26 +657,24 @@ class QueryRewriter:
                         entities["delivery_number"] = match.group(1)
                     return "TRACK_DELIVERY", entities
 
-        # Check for top selling
+        # Top/slow selling
         for pattern, _ in self.top_selling_patterns:
             if re.search(pattern, text_lower):
                 return "GET_TOP_SELLING_ITEMS", entities
 
-        # Check for slow moving
         for pattern, _ in self.slow_moving_patterns:
             if re.search(pattern, text_lower):
                 return "GET_SLOW_MOVING_ITEMS", entities
 
-        # Check for quotation creation
+        # Quotation
         for pattern, _ in self.quotation_patterns:
             match = re.search(pattern, text_lower)
             if match:
                 if match.groups():
-                    customer_part = match.group(1)
-                    entities["customer_name"] = self._extract_customer_name(customer_part)
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
                 return "CREATE_QUOTATION", entities
 
-        # Check for customer queries
+        # Customer queries
         for pattern, intent_type in self.customer_patterns:
             match = re.search(pattern, text_lower)
             if match:
@@ -485,149 +687,169 @@ class QueryRewriter:
 
         return None, entities
 
+    # Size token pattern — matches "30ml", "1l", "500g", "2kg", "125ml" etc.
+    _SIZE_TOKEN_RE = re.compile(
+        r"^\d+(?:\.\d+)?\s*(?:ml|l(?![a-zA-Z])|lt|g(?![a-zA-Z])|kg|gm|pcs?|units?|x(?![a-zA-Z]))",
+        re.IGNORECASE,
+    )
+
     def _extract_item_name(self, text: str) -> Optional[str]:
-        """Extract item name from text"""
         if not text:
             return None
-
         text = text.strip()
 
+        # Try known-item patterns first.
+        # FIX: after matching the base name, also capture a trailing size token
+        # ("vegimax 30ml" → "vegimax" matched by pattern, then "30ml" appended).
         for pattern in self.item_extraction:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return match.group(0)
+                base = match.group(0)
+                # Check for a size token immediately after the matched name
+                remainder = text[match.end():].strip()
+                size_match = self._SIZE_TOKEN_RE.match(remainder)
+                if size_match:
+                    return f"{base} {size_match.group(0).strip()}"
+                return base
 
-        filler_words = ["the", "a", "an", "of", "for", "to", "in", "at", "with", "about", "tell", "me", "show", "get"]
+        filler_words = {
+            "the", "a", "an", "of", "for", "to", "in", "at",
+            "with", "about", "tell", "me", "show", "get",
+            "levels", "level", "all", "alerts", "alert",
+            "summary", "overview", "report", "list",
+        }
+        # Keep size tokens even though they look like non-words
         words = text.split()
-        cleaned = [w for w in words if w not in filler_words]
+        cleaned = []
+        for w in words:
+            if self._SIZE_TOKEN_RE.match(w):
+                cleaned.append(w)          # always keep size tokens
+            elif w.lower() not in filler_words:
+                cleaned.append(w)
 
         if cleaned:
-            return " ".join(cleaned[:3])
-
+            result = " ".join(cleaned[:4]).strip()  # up to 4 tokens for "brand size"
+            if result.lower() in _NON_ITEM_WORDS:
+                return None
+            return result
         return None
 
     def _extract_customer_name(self, text: str) -> Optional[str]:
-        """Extract customer name from text"""
         if not text:
             return None
-
         remove_words = {"a", "quotation", "quote", "for", "with", "the", "and", "new"}
         words = text.split()
         cleaned = [w for w in words if w.lower() not in remove_words]
-
-        if cleaned:
-            return " ".join(cleaned[:2])
-
-        return None
+        return " ".join(cleaned[:2]) if cleaned else None
 
     def _rewrite_for_intent(self, text: str, intent: str, entities: dict) -> str:
-        """Rewrite query into standard format for the detected intent."""
         standard_phrase = self.intent_phrases.get(intent, "")
 
         if intent == "GET_ITEM_PRICE" and entities.get("item_name"):
             return f"{standard_phrase} {entities['item_name']}"
-
         if intent == "GET_STOCK_LEVELS" and entities.get("item_name"):
             return f"{standard_phrase} {entities['item_name']}"
-
+        if intent == "GET_LOW_STOCK":
+            return standard_phrase
+        if intent == "GET_ITEM_DETAILS" and entities.get("item_name"):
+            return f"{standard_phrase} {entities['item_name']}"
         if intent == "GET_CUSTOMER_ORDERS" and entities.get("customer_name"):
             return f"{standard_phrase} {entities['customer_name']}"
-
         if intent == "GET_CUSTOMER_BALANCE" and entities.get("customer_name"):
             return f"{standard_phrase} {entities['customer_name']}"
-
         if intent == "SEND_PAYMENT_REMINDER" and entities.get("customer_name"):
             return f"{standard_phrase} {entities['customer_name']}"
-
         if intent == "CREATE_PURCHASE_ORDER" and entities.get("vendor_name"):
             return f"{standard_phrase} {entities['vendor_name']}"
-
-        # CREATE_QUOTATION: return original text unchanged
-        if intent == "CREATE_QUOTATION":
+        if intent in ("CREATE_QUOTATION", "GET_CUSTOMER_HEALTH",
+                      "CONVERT_QUOTATION_TO_ORDER", "POST_INVOICE",
+                      "CREATE_STOCK_TRANSFER", "CREATE_GOODS_ISSUE", "CREATE_GOODS_RECEIPT"):
             return text
-
-        # GET_CUSTOMER_HEALTH: preserve original text unchanged
-        if intent == "GET_CUSTOMER_HEALTH":
-            return text
-
-        # For document transitions, preserve original text
-        if intent in ["CONVERT_QUOTATION_TO_ORDER", "POST_INVOICE", "CREATE_STOCK_TRANSFER", 
-                      "CREATE_GOODS_ISSUE", "CREATE_GOODS_RECEIPT"]:
-            return text
-
         return text
 
     def _pattern_based_rewrite(self, text: str) -> Tuple[Optional[str], str, dict]:
-        """Pattern-based rewrite for ambiguous queries"""
         text_lower = text.lower()
         entities = {}
 
-        # What is... patterns
+        # ================================================================
+        # FIX: Check conversational queries in pattern-based fallback
+        # ================================================================
+        for pattern in _CONVERSATIONAL_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return "GREETING", text, entities
+
+        # Low-stock check first — belt-and-suspenders for this method
+        for pattern in _LOW_STOCK_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return "GET_LOW_STOCK", self.intent_phrases["GET_LOW_STOCK"], {}
+
+        # Item detail check — belt-and-suspenders
+        for pattern in _ITEM_DETAIL_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                item_name = match.group(1).strip()
+                return "GET_ITEM_DETAILS", f"item details of {item_name}", {"item_name": item_name}
+
+        # "what is..." patterns
         if text_lower.startswith("what is") or text_lower.startswith("what's"):
             if "price" in text_lower or "cost" in text_lower:
                 item = self._extract_item_name(text_lower.replace("what is", "").replace("what's", ""))
                 if item:
                     return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
-
             if "stock" in text_lower or "available" in text_lower:
                 item = self._extract_item_name(text_lower)
                 if item:
                     return "GET_STOCK_LEVELS", f"stock of {item}", {"item_name": item}
-
             if "overdue" in text_lower or "invoice" in text_lower:
                 return "GET_OVERDUE_INVOICES", "overdue invoices", {}
 
-        # How many/much patterns
+        # "how many/much" patterns
         if text_lower.startswith("how many") or text_lower.startswith("how much"):
             if "stock" in text_lower or "available" in text_lower or "left" in text_lower:
                 item = self._extract_item_name(text_lower)
                 if item:
                     return "GET_STOCK_LEVELS", f"stock of {item}", {"item_name": item}
-
             if "price" in text_lower or "cost" in text_lower:
                 item = self._extract_item_name(text_lower)
                 if item:
                     return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
 
-        # Show / View / List patterns
+        # "show / view / list / display / see" patterns
         if re.match(r'^(?:show(?:\s+me)?|view|list|display|see)\b', text_lower):
             rest = re.sub(r'^(?:show(?:\s+me)?|view|list|display|see)\s*', '', text_lower).strip()
 
             if "churn risk" in rest or "customer health" in rest or "at risk" in rest:
                 return "GET_CUSTOMER_HEALTH", text, {}
-
             if "invoice" in rest:
                 if "overdue" in rest:
                     return "GET_OVERDUE_INVOICES", "overdue invoices", {}
                 return "GET_AR_INVOICES", "show invoices", {}
-
             if "purchase order" in rest or "po" in rest:
                 return "GET_PURCHASE_ORDERS", "purchase orders", {}
-
             if "warehouse" in rest or "warehouses" in rest:
                 return "GET_WAREHOUSES", "show warehouses", {}
-
             if "price" in rest:
                 item = self._extract_item_name(rest)
                 if item:
                     return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
-
             if "stock" in rest or "inventory" in rest:
                 item = self._extract_item_name(rest)
-                if item:
+                if item and item.lower() not in _NON_ITEM_WORDS:
                     return "GET_STOCK_LEVELS", f"stock of {item}", {"item_name": item}
-
+                return "GET_STOCK_LEVELS", text, {}
             if "customer" in rest or "customers" in rest:
                 return "GET_CUSTOMERS", "show customers", {}
-
             if "order" in rest or "orders" in rest:
                 customer = self._extract_customer_name(rest)
                 if customer:
                     return "GET_CUSTOMER_ORDERS", f"customer orders for {customer}", {"customer_name": customer}
 
-        # Tell me about patterns
+        # "tell me about" patterns
         if text_lower.startswith("tell me about"):
             topic = text_lower.replace("tell me about", "").strip()
+            # Check if it's conversational
+            if topic in ["yourself", "you", "yourself?", "you?"]:
+                return "GREETING", text, entities
             item = self._extract_item_name(topic)
             if item:
                 return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
@@ -635,32 +857,22 @@ class QueryRewriter:
         return None, text, entities
 
     def _clean_query(self, text: str) -> str:
-        """Clean and normalize the query"""
         text = re.sub(r'\s+', ' ', text).strip()
         if not text.endswith(('?', '.', '!')):
             text += '?'
         return text
 
     def expand_query(self, query: str) -> List[str]:
-        """Generate query variations for better matching"""
         variations = [query]
-
         if "price of" in query:
             item = query.replace("price of", "").strip()
-            variations.append(f"how much is {item}")
-            variations.append(f"what does {item} cost")
-            variations.append(f"{item} price")
-
+            variations += [f"how much is {item}", f"what does {item} cost", f"{item} price"]
         if "stock of" in query:
             item = query.replace("stock of", "").strip()
-            variations.append(f"how many {item} in stock")
-            variations.append(f"inventory of {item}")
-            variations.append(f"{item} available")
-
+            variations += [f"how many {item} in stock", f"inventory of {item}", f"{item} available"]
         direct = re.sub(r'^(what|how|where|when|why|tell me|show me|can you)\s+', '', query.lower())
         if direct != query.lower():
             variations.append(direct)
-
         return list(set(variations))
 
 
@@ -669,7 +881,6 @@ _query_rewriter = None
 
 
 def get_query_rewriter() -> QueryRewriter:
-    """Get singleton query rewriter instance"""
     global _query_rewriter
     if _query_rewriter is None:
         _query_rewriter = QueryRewriter()

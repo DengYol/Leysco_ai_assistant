@@ -1,7 +1,11 @@
 """Prompt building for LLM Service"""
 
+import asyncio
+import inspect
+import logging
 import random
 from typing import Optional, Dict, Any
+
 from .constants import (
     LANGUAGE_INSTRUCTIONS,
     INTENT_SYSTEM_PROMPTS,
@@ -10,6 +14,54 @@ from .constants import (
 )
 from .memory import get_conversation_memory
 from .utils import get_response_styles
+
+logger = logging.getLogger(__name__)
+
+
+def _call_get_knowledge(intent_key: str) -> str:
+    """
+    Safely call get_knowledge regardless of whether it is sync or async.
+
+    The original implementation in leysco_knowledge_base.py is declared
+    `async def get_knowledge(...)` even though it only reads from an in-memory
+    dict and never actually awaits anything.  Calling it without `await` in a
+    synchronous context (like _build_system_prompt) causes the
+    "coroutine was never awaited" RuntimeWarning and returns None instead of
+    the knowledge content.
+
+    This helper detects which case we're in and handles both:
+      - If get_knowledge is a plain function  → call it directly.
+      - If get_knowledge is a coroutine func  → run it safely:
+          * Inside a running event loop  → schedule and wait via run_coroutine_threadsafe
+          * Outside a running event loop → use asyncio.run()
+    """
+    try:
+        from app.ai_engine.leysco_knowledge_base import get_knowledge
+    except ImportError:
+        logger.warning("leysco_knowledge_base not found, skipping knowledge injection")
+        return ""
+
+    try:
+        if not inspect.iscoroutinefunction(get_knowledge):
+            # Already a plain sync function — just call it
+            return get_knowledge(intent_key) or ""
+
+        # It's async — run it safely
+        try:
+            loop = asyncio.get_running_loop()
+            # We are inside a running loop (e.g. called from an async context
+            # via asyncio.to_thread).  Use run_coroutine_threadsafe so we don't
+            # try to nest event loops.
+            import concurrent.futures
+            future = asyncio.run_coroutine_threadsafe(get_knowledge(intent_key), loop)
+            return future.result(timeout=2) or ""
+        except RuntimeError:
+            # No running loop — safe to use asyncio.run()
+            return asyncio.run(get_knowledge(intent_key)) or ""
+
+    except Exception as e:
+        logger.warning(f"get_knowledge({intent_key!r}) failed: {e}")
+        return ""
 
 
 class PromptBuilder:
@@ -23,10 +75,7 @@ class PromptBuilder:
         styles = get_response_styles()
         intent_styles = styles.get(intent, ["friendly", "helpful", "professional"])
         
-        # Get last used style for this intent
         last_style = self._last_response_styles.get(intent)
-        
-        # Pick a different style if possible
         available_styles = [s for s in intent_styles if s != last_style]
         if not available_styles:
             available_styles = intent_styles
@@ -44,7 +93,7 @@ class PromptBuilder:
         user_message: str = "",
         formatted_data: Optional[str] = None
     ) -> str:
-        """Build enhanced system prompt with conversation context"""
+        """Build enhanced system prompt with conversation context."""
         parts = []
         
         # Language instruction
@@ -68,6 +117,15 @@ class PromptBuilder:
         # Intent-specific instructions
         intent_instruction = INTENT_SYSTEM_PROMPTS.get(intent_key, DEFAULT_SYSTEM_PROMPT)
         parts.append(f"--- YOUR ROLE ---\n{intent_instruction}\n")
+        
+        # FIX: Use the safe wrapper instead of calling get_knowledge() directly.
+        # Previously this was:
+        #   kb_content = get_knowledge(intent_key)          ← returned a coroutine object
+        # Now it safely awaits the coroutine where necessary.
+        if intent_key not in ("GENERAL", "UNKNOWN"):
+            kb_content = _call_get_knowledge(intent_key)
+            if kb_content:
+                parts.append(f"--- LEYSCO KNOWLEDGE BASE ---\n{kb_content}\n")
         
         # Conversation history (if available)
         if session_id:

@@ -1,675 +1,799 @@
-"""
-app/ai_engine/leysco_knowledge_base.py (P1.3 - ERP-SOURCED)
-===========================================================
-Leysco AI Assistant — Knowledge Base
+"""Query rewriting and expansion for better intent detection"""
 
-CHANGE: Knowledge is now sourced from ERP API instead of hardcoded.
-- Items, customers, pricing are LIVE from ERP
-- Training/policy/contact info remains static (policy)
-- All data is cached with tenant scoping
-"""
-
+import re
 import logging
-import asyncio
-import hashlib
-from typing import Dict, Any, Optional, List
-from functools import wraps
-from datetime import datetime, timedelta
-
-from app.services.cache_service import get_cache_service
-from app.services.leysco_api.client import get_leysco_api_client
+from typing import Optional, Tuple, List, Dict
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# CACHE DECORATOR (unchanged from before)
-# ============================================================================
-
-def cache_kb(ttl_seconds: int = 3600):
-    """Cache knowledge base responses for configurable TTL."""
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            cache = get_cache_service()
-            
-            # Generate cache key
-            func_name = func.__name__
-            cache_str = f"kb:{func_name}:{str(args[1:])}:{str(sorted(kwargs.items()))}"
-            cache_key = hashlib.md5(cache_str.encode()).hexdigest()
-            
-            # Check cache
-            cached = cache.get_simple(cache_key)
-            if cached is not None:
-                logger.info(f"⚡ KB cache hit: {func_name}")
-                return cached
-            
-            # Execute function (now async)
-            result = await func(*args, **kwargs)
-            
-            # Cache result
-            if result:
-                cache.set_simple(cache_key, result, ttl=ttl_seconds)
-            
-            return result
-        return wrapper
-    return decorator
-
-
-# ============================================================================
-# 1. STATIC COMPANY PROFILE (Policy - doesn't change from ERP)
-# ============================================================================
-
-COMPANY_PROFILE = """
-Company Name: Leysco Limited
-Tagline: Simply Reliable
-Industry: Software Development & IT Consultancy — Kenya
-Location: APA Arcade, Hurlingham, Nairobi, Kenya
-Phone: +254(0) 780 457 591
-Email: info@leysco.com
-Website: https://leysco.com
-
-Who We Are:
-Leysco is a software development and consultancy company specialising in
-enterprise-wide Resource Planning and Management Systems that support
-critical business processes and decision-making for organisations in Kenya.
-
-What differentiates Leysco is their culture that fosters creativity and open
-communication, enabling their team to achieve their full potential with a
-clear sense of purpose.
-
-Core Services:
-1. SAP ERP Implementation
-2. Leysco Systems Consulting
-3. Web Application Development
-4. Mobile Apps Development
-5. Web Development and Hosting
-6. EDMS (Electronic Document Management System)
-"""
-
-CONTACT_INFO = """
-Leysco Limited — Contact Details
-
-Company: Leysco Limited
-Address: APA Arcade, Hurlingham, Nairobi, Kenya
-Phone: +254(0) 780 457 591
-Email: info@leysco.com
-Website: https://leysco.com
-EDMS Portal: https://pgtl.xedms.com
-
-System Support (Leysco100 / SAP):
-- For SAP system issues: Contact Leysco IT support via info@leysco.com
-- Phone support: +254(0) 780 457 591
-"""
-
-PAYMENT_METHODS = """
-Leysco Payment Methods:
-
-ACCEPTED PAYMENT OPTIONS:
-1. M-Pesa — Paybill number (get current details from Finance)
-2. Bank Transfer — Account details available from Finance department
-3. Cash — At our offices (receipt issued)
-4. Cheque — Subject to clearance before goods release
-
-CREDIT TERMS:
-- Credit customers: Payment due within agreed credit period (30/60 days)
-- New customers: Cash on delivery until credit account is approved
-"""
-
-# ============================================================================
-# 2. TRAINING MODULES (Static - policy-based)
-# ============================================================================
-
-TRAINING_MODULES = {
-    "TRAINING_MODULE": """
-LEYSCO100 TRAINING OVERVIEW
-
-Available training topics — just ask me about any of these:
-
-1. HOW TO CREATE A QUOTATION
-2. HOW TO CHECK STOCK
-3. HOW TO FIND CUSTOMER INFORMATION
-4. HOW TO TRACK DELIVERIES
-5. HOW TO USE PRICING
-6. PAYMENT METHODS
-7. RETURNS & REFUNDS
-8. UNDERSTANDING THE DASHBOARD
-
-Which topic would you like to start with?
-""",
-    "TRAINING_GUIDE": """
-LEYSCO100 STEP-BY-STEP GUIDES
-
-I can walk you through:
-- Creating a quotation
-- Checking stock levels
-- Looking up customer details
-- Understanding pricing and discounts
-- Processing returns and refunds
-- Reading the dashboard KPIs
-
-Just ask: "How do I [task]?" and I'll guide you step by step.
-""",
-    "TRAINING_FAQ": """
-FREQUENTLY ASKED QUESTIONS
-
-Q: How do I check if an item is in stock?
-A: Ask me: "Stock level for [item name]"
-
-Q: Why is my customer's price different from the list price?
-A: Customers can have special pricing agreements. Always use "Price of [item] for [customer]"
-
-Q: What if the item a customer wants is out of stock?
-A: Ask me to "recommend alternatives for [crop/use]"
-
-Q: How long is a quotation valid?
-A: Check with your sales manager for the current validity period.
-
-Q: How do I know a customer's credit limit?
-A: Ask me "Customer details for [name]" — it shows their credit status.
-""",
-    "TRAINING_WEBINAR": """
-LEYSCO100 LIVE TRAINING SESSIONS
-
-For live training sessions, webinars, and workshops:
-- Contact your sales manager or HR department
-- Ask about the next scheduled Leysco100 onboarding session
-""",
-    "TRAINING_VIDEO": """
-LEYSCO100 VIDEO TRAINING
-
-For video tutorials and screencasts on using Leysco100:
-- Contact your IT department or system administrator
-- Ask your manager about available training materials
-""",
-}
-
-HOW_TO_CREATE_QUOTATION = """
-HOW TO CREATE A SALES QUOTATION
-
-Step 1 — Find your customer
-  Ask: "Show me customer [name]" or "Customer details for [name]"
-
-Step 2 — Check what's in stock
-  Ask: "What's the stock level for [product]?"
-
-Step 3 — Get the right price
-  Ask: "Price of [item] for customer [name]"
-
-Step 4 — Create the quotation
-  Say: "Create a quote for [customer] — [quantity] [item]"
-
-Step 5 — Confirm with customer
-  Share the quotation number with the customer for reference.
-"""
-
-HOW_TO_ORDER = """
-HOW TO PLACE A SALES ORDER
-
-Step 1 — Verify customer account
-Step 2 — Confirm stock availability
-Step 3 — Get customer pricing
-Step 4 — Create quotation first (recommended)
-Step 5 — Submit order
-"""
-
-SALES_REP_QUICK_REFERENCE = """
-SALES REP DAILY CHEAT SHEET
-
---- MOST USEFUL COMMANDS ---
-Check stock: "Stock level for [item name]"
-Get prices: "Price of [item] for customer [name]"
-Find a customer: "Show customer [name]"
-Create a quote: "Create a quote for [customer] — [qty] [item]"
-Track deliveries: "Outstanding deliveries"
-
---- BEFORE A CUSTOMER VISIT ---
-1. Check their order history: "Orders for [customer name]"
-2. Check prices for their key products: "Price of [item] for [customer]"
-3. Check current stock of what they usually buy
-"""
-
-ONBOARDING_GUIDE = """
-WELCOME TO LEYSCO100 AI ASSISTANT!
-
-I'm your AI-powered assistant for the Leysco100 ERP system.
-I can help you navigate all 10 system modules using plain English.
-
---- WHAT I CAN DO ---
-
-SALES & PRICING:
-  "Price of VegiMax"
-  "Create a quote for [customer] — [qty] [item]"
-  "Show orders for [customer]"
-
-INVENTORY:
-  "Show me all items"
-  "Stock level for cabbage seeds"
-  "Low stock alerts"
-
-BUSINESS PARTNERS:
-  "Show me customers"
-  "Customer details for [name]"
-
-LOGISTICS:
-  "Outstanding deliveries"
-
-TRAINING & GUIDANCE:
-  "How do I create a quotation?"
-  "What does DAP mean?"
-  "Show me the sales rep cheat sheet"
-
---- YOUR FIRST 5 ACTIONS ---
-1. "Show me items" — see the full product catalogue
-2. "Show me customers" — browse your customer list
-3. "Low stock alerts" — see what needs restocking
-4. "Price of [top product]" — confirm your pricing
-5. "How do I create a quote?" — step-by-step guide
-"""
-
-# ============================================================================
-# 3. GLOSSARY (Static)
-# ============================================================================
-
-GLOSSARY = {
-    "SKU": "Stock Keeping Unit — the unique code for each product",
-    "MOQ": "Minimum Order Quantity — the smallest amount you can order",
-    "UOM": "Unit of Measure — how the item is sold (e.g. KG, BAG, PIECE)",
-    "ETA": "Estimated Time of Arrival — when a shipment is expected",
-    "GRN": "Goods Received Note — document confirming stock received",
-    "DN": "Delivery Note — document that goes with goods sent to a customer",
-    "PO": "Purchase Order — an order placed to a supplier",
-    "SO": "Sales Order — a confirmed order from a customer",
-    "CAN": "Calcium Ammonium Nitrate — a common nitrogen fertilizer",
-    "DAP": "Di-Ammonium Phosphate — fertilizer used at planting",
-    "NPK": "Nitrogen, Phosphorus, Potassium — main nutrients in fertilizers",
-    "SAP": "Systems, Applications and Products — the ERP system",
-    "ERP": "Enterprise Resource Planning — integrated business management",
-    "KPI": "Key Performance Indicator — a measurable target",
-    "BOM": "Bill of Materials — list of components for production",
-    "WH": "Warehouse — storage location for inventory items",
-    "GP": "Gate Pass — authorisation for goods entering/leaving",
-    "KES": "Kenyan Shilling — the currency used",
+# Words that look like item names when captured by "stock of X" patterns
+# but are actually generic words meaning "show all stock".
+_NON_ITEM_WORDS = {
+    "levels", "level", "all", "everything", "items", "products",
+    "alerts", "alert", "report", "summary", "overview", "list",
+    "current", "now", "today", "hisa", "viwango", "me", "us",
 }
 
 # ============================================================================
-# 4. ANALYTICS KNOWLEDGE (Static)
+# KNOWLEDGE / COMPANY TOPIC BYPASS
+# ============================================================================
+# These patterns match queries that are clearly about the company, the system,
+# or general information — NOT about ERP items or prices.
+# They are checked at the very top of rewrite() before anything else so that
+# "tell me about Leysco", "what is Leysco", "who are you" etc. never get
+# mis-routed to GET_ITEM_PRICE.
 # ============================================================================
 
-SALES_ANALYTICS_KNOWLEDGE = """
-📊 SALES ANALYTICS OVERVIEW
+# Exact company / product name tokens (lowercase). Queries whose subject
+# matches one of these are treated as company-info requests.
+_COMPANY_TOKENS = {
+    "leysco", "leysco limited", "leysco100", "leysco 100",
+    "the company", "this app", "this system", "the system",
+    "this platform", "the platform",
+}
 
-The sales analytics feature provides insights into your sales performance:
+# Phrases that signal a general / company-info question regardless of subject.
+_GENERAL_INFO_PATTERNS = [
+    # "tell me about leysco / the company / this system"
+    r'\btell\s+me\s+about\s+(?:leysco|the\s+company|this\s+(?:app|system|platform))\b',
+    # "what is leysco / leysco100"
+    r'\bwhat\s+(?:is|are)\s+leysco(?:100)?\b',
+    # "who are you / who made you / who built this"
+    r'\bwho\s+(?:are\s+you|made\s+you|built\s+(?:you|this)|created\s+(?:you|this))\b',
+    # "about leysco / about the company"
+    r'\babout\s+(?:leysco(?:100)?|the\s+company|this\s+(?:app|system|platform))\b',
+    # "what does leysco do / what does leysco sell"
+    r'\bwhat\s+does\s+leysco(?:100)?\s+(?:do|sell|offer|provide)\b',
+    # "contact leysco / leysco contact / leysco phone / leysco email"
+    r'\b(?:contact|contacts?|phone|email|address|website)\s+(?:of\s+|for\s+)?leysco(?:100)?\b',
+    r'\bleysco(?:100)?\s+(?:contact|phone|email|address|website)\b',
+    # "how does this work / how does leysco work"
+    r'\bhow\s+does\s+(?:leysco(?:100)?|this\s+(?:app|system|platform))\s+work\b',
+    # greeting-style: "introduce yourself / what can you do"
+    r'\bintroduce\s+yourself\b',
+    r'\bwhat\s+can\s+(?:you|i)\s+(?:do|help|ask)\b',
+    # payment methods / policies
+    r'\b(?:payment\s+method|how\s+(?:do\s+i\s+pay|to\s+pay)|accepted\s+payment)\b',
+    r'\b(?:return\s+policy|refund\s+policy|credit\s+(?:terms|limit\s+policy))\b',
+]
 
-KEY METRICS AVAILABLE:
-- Total Revenue — overall sales value
-- Total Transactions — number of sales orders
-- Average Order Value — revenue per transaction
-- Unique Customers — customer count
-- Total Items Sold — quantity of products sold
+# Training / how-to patterns — also general knowledge, not ERP item queries
+_TRAINING_PATTERNS = [
+    r'\bhow\s+(?:do\s+i|to)\s+(?:create|make|prepare)\s+(?:a\s+)?(?:quote|quotation)\b',
+    r'\bhow\s+(?:do\s+i|to)\s+(?:check|view|find|search)\s+(?:stock|inventory|items?|customers?)\b',
+    r'\bhow\s+(?:do\s+i|to)\s+(?:track|find)\s+(?:a\s+)?(?:delivery|order)\b',
+    r'\btraining\b',
+    r'\bonboarding\b',
+    r'\bhelp\b',
+    r'\bfaq\b',
+    r'\bglossary\b',
+    r'\bwhat\s+(?:is|are|does)\s+(?:sku|moq|uom|eta|grn|dn|po\b|so\b|dap|npk|sap|erp|kpi|bom|gp|kes)\b',
+]
 
-TRENDS YOU CAN TRACK:
-- Revenue change over time (daily, weekly, monthly)
-- Transaction volume trends
-- Customer acquisition patterns
 
-TOP SELLING PRODUCTS:
-- Which items sell the most by quantity
-- Which items generate the most revenue
-- Seasonal product performance
-
-HOW TO USE SALES ANALYTICS:
-1. "Show sales analytics" — basic overview
-2. "Sales report for last month" — specific period
-3. "Top selling items" — best performing products
-4. "Sales by product category" — category breakdown
-"""
-
-TOP_SELLING_KNOWLEDGE = """
-🏆 TOP SELLING ITEMS
-
-Top selling items show which products are most popular with customers.
-
-WHAT YOU CAN LEARN:
-- Which products generate the most revenue
-- Which items have the highest sales volume
-- Seasonal trends in product popularity
-- Customer purchasing preferences
-
-HOW TO USE:
-- "Show top selling items" — see current best sellers
-- "Top 10 selling products" — specify limit
-- "Best selling items this month" — time-specific
-
-INTERPRETING THE DATA:
-- High volume items may have low margins
-- High revenue items drive profitability
-- Fast movers need consistent stock levels
-- Best sellers are good for promotions
-"""
-
-SLOW_MOVING_KNOWLEDGE = """
-🐌 SLOW MOVING ITEMS
-
-Slow moving items are products with low turnover rates.
-
-IDENTIFYING SLOW MOVERS:
-- Items with low sales volume
-- Products with high inventory levels but few sales
-- Items that haven't sold in extended periods
-
-BUSINESS ACTIONS:
-1. Review pricing — may be too high
-2. Consider promotions — discount to move inventory
-3. Discontinue — remove from catalog if consistently slow
-4. Bundle with fast movers — increase appeal
-"""
-
-WAREHOUSE_KNOWLEDGE = """
-🏭 WAREHOUSE MANAGEMENT
-
-Leysco operates multiple warehouses across Kenya:
-
-WAREHOUSE LOCATIONS:
-- Nairobi Main — Central hub, largest inventory
-- Mombasa — Coastal region, import handling
-- Kisumu — Western Kenya distribution
-- Eldoret — Rift Valley region
-- Nakuru — Central Rift coverage
-
-WHAT YOU CAN CHECK:
-- "Show all warehouses" — view all locations
-- "Stock in [warehouse]" — inventory by location
-- "Low stock alerts in Nairobi" — specific warehouse alerts
-"""
-
-DELIVERY_KNOWLEDGE = """
-📦 DELIVERY TRACKING
-
-Track and manage customer deliveries through the system.
-
-DELIVERY STATUSES:
-- Open — Order created, not yet processed
-- In Transit — On the way to customer
-- Partially Delivered — Some items delivered
-- Completed — Fully delivered
-- Overdue — Past due date
-
-WHAT YOU CAN TRACK:
-- "Outstanding deliveries" — pending deliveries
-- "Track delivery [order number]" — specific order
-- "Delivery history for [customer]" — past deliveries
-"""
-
-CROSS_SELL_KNOWLEDGE = """
-🔄 CROSS-SELL & UPSELL
-
-CROSS-SELL: Complementary products customers often buy together
-
-EXAMPLES:
-- Fertilizer + Seeds — planting combo
-- Pesticide + Protective gear — safety bundle
-
-UPSELL: Premium alternatives with better features/benefits
-
-EXAMPLES:
-- Standard seed → Hybrid variety (higher yield)
-- Basic fertilizer → Controlled-release (efficiency)
-"""
-
-# ============================================================================
-# 5. DYNAMIC ERP-SOURCED FUNCTIONS (NEW)
-# ============================================================================
-
-async def get_erp_items_knowledge(tenant_code: str) -> str:
+def _is_company_or_knowledge_query(text: str) -> Tuple[bool, str]:
     """
-    Get current items from ERP API.
-    Returns formatted knowledge text for LLM context.
-    
-    This replaces hardcoded PRODUCTS_AND_BRANDS.
+    Returns (True, intent_label) if the query is clearly about the company,
+    the system, training, or general help — not about an ERP item.
+
+    intent_label is one of: COMPANY_INFO, CONTACT_INFO, PAYMENT_METHODS,
+    TRAINING_MODULE, GENERAL_HELP
     """
-    try:
-        api = get_leysco_api_client(tenant_code)
-        items = await api.get_items()
-        
-        if not items:
-            return "No items found in ERP."
-        
-        # Group by category
-        by_category = {}
-        for item in items:
-            category = item.get("category", "Other")
-            if category not in by_category:
-                by_category[category] = []
-            by_category[category].append(item)
-        
-        # Format as knowledge text
-        lines = ["📦 PRODUCT CATALOGUE (from ERP)\n"]
-        for category, items_in_cat in by_category.items():
-            lines.append(f"\n{category}:")
-            for item in items_in_cat[:10]:  # Limit to 10 per category
-                sku = item.get("sku", "N/A")
-                name = item.get("name", "Unknown")
-                lines.append(f"  - {name} (SKU: {sku})")
-        
-        return "\n".join(lines)
-    
-    except Exception as e:
-        logger.error(f"Failed to load ERP items: {e}")
-        return "Items data temporarily unavailable from ERP."
+    text_lower = text.lower().strip()
+
+    # Contact / address queries
+    if re.search(r'\b(?:contact|phone|email|address|location|website)\b', text_lower):
+        if re.search(r'\bleysco\b', text_lower) or re.search(
+            r'\b(?:the\s+company|you\s+guys|your\s+(?:office|number|email))\b', text_lower
+        ):
+            return True, "CONTACT_INFO"
+
+    # Payment / policy
+    if re.search(r'\b(?:payment\s+method|how\s+(?:do\s+i\s+pay|to\s+pay)|accepted\s+payment|mpesa|m-pesa)\b', text_lower):
+        return True, "PAYMENT_METHODS"
+    if re.search(r'\b(?:return\s+policy|refund|credit\s+terms)\b', text_lower):
+        return True, "PAYMENT_METHODS"
+
+    # Training / how-to
+    for pattern in _TRAINING_PATTERNS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True, "TRAINING_MODULE"
+
+    # General company info patterns
+    for pattern in _GENERAL_INFO_PATTERNS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True, "COMPANY_INFO"
+
+    # "tell me about X" where X is a company token (not an item)
+    tell_me_match = re.match(
+        r'^(?:tell\s+me|show\s+me|give\s+me|i\s+want)\s+(?:more\s+)?(?:info(?:rmation)?\s+)?about\s+(.+)',
+        text_lower,
+    )
+    if tell_me_match:
+        subject = tell_me_match.group(1).strip().rstrip('?.!')
+        if subject in _COMPANY_TOKENS:
+            return True, "COMPANY_INFO"
+        # Also catch "tell me about this app/system/platform"
+        if re.search(r'\b(?:this\s+(?:app|system|platform)|the\s+(?:app|system|platform))\b', subject):
+            return True, "COMPANY_INFO"
+
+    # "what is X" where X is a company token
+    what_is_match = re.match(r'^what\s+(?:is|are)\s+(.+)', text_lower)
+    if what_is_match:
+        subject = what_is_match.group(1).strip().rstrip('?.!')
+        if subject in _COMPANY_TOKENS:
+            return True, "COMPANY_INFO"
+
+    return False, ""
 
 
-async def get_erp_customers_knowledge(tenant_code: str) -> str:
+class QueryRewriter:
     """
-    Get current customers from ERP API.
-    Returns formatted knowledge text for LLM context.
-    
-    This replaces hardcoded customer references.
+    Rewrites vague or poorly phrased queries into structured patterns
+    that the intent classifier can better understand.
     """
-    try:
-        api = get_leysco_api_client(tenant_code)
-        customers = await api.get_customers()
-        
-        if not customers:
-            return "No customers found in ERP."
-        
-        lines = ["👥 CUSTOMER DIRECTORY (from ERP)\n"]
-        lines.append(f"Total customers: {len(customers)}\n")
-        lines.append("Top 10 customers by recent activity:")
-        
-        for customer in customers[:10]:
-            name = customer.get("name", "Unknown")
-            city = customer.get("city", "")
-            lines.append(f"  - {name}" + (f" ({city})" if city else ""))
-        
-        return "\n".join(lines)
-    
-    except Exception as e:
-        logger.error(f"Failed to load ERP customers: {e}")
-        return "Customer data temporarily unavailable from ERP."
 
+    def __init__(self):
+        # =========================================================
+        # PRICE-RELATED PATTERNS
+        # =========================================================
+        self.price_patterns = [
+            (r"^(?:what is|what\'s|whats)\s+the\s+price\s+of\s+(.+)", "price"),
+            (r"^(?:price|cost|bei|gharama)\s+(?:of|ya)?\s*(.+)", "price"),
+            (r"^how\s+much\s+(?:is|does)\s+(.+)\s+(?:cost|price)?$", "price"),
+            (r"(?:how much|what'?s the price|how much is|price of|cost of|bei ya|gharama ya)\s+(.+)", "price"),
+            (r"(.+)\s+(?:price|cost|bei|gharama)", "price"),
+            (r"(?:expensive|cheap|costly)\s+(.+)", "price"),
+            (r"(?:tell me|show me|get me)\s+(?:the )?price\s+(?:of|for)?\s*(.+)", "price"),
+            (r"(?:what does|how much does)\s+(.+)\s+(?:cost|sell for)", "price"),
+        ]
 
-async def get_erp_warehouses_knowledge(tenant_code: str) -> str:
-    """
-    Get current warehouses from ERP API.
-    Returns formatted knowledge text for LLM context.
-    """
-    try:
-        api = get_leysco_api_client(tenant_code)
-        warehouses = await api.get_warehouses()
-        
-        if not warehouses:
-            return WAREHOUSE_KNOWLEDGE  # Fall back to static
-        
-        lines = ["🏭 WAREHOUSE LOCATIONS (from ERP)\n"]
-        for wh in warehouses:
-            name = wh.get("name", "Unknown")
-            location = wh.get("location", "")
-            lines.append(f"  - {name}" + (f" — {location}" if location else ""))
-        
-        return "\n".join(lines)
-    
-    except Exception as e:
-        logger.error(f"Failed to load ERP warehouses: {e}")
-        return WAREHOUSE_KNOWLEDGE  # Fall back to static
+        # Stock-related patterns
+        self.stock_patterns = [
+            (r"(?:stock|inventory|available|hisa|viwango|idadi)\s+(?:of|for|ya|za)\s+(.+)", "stock"),
+            (r"(?:how many|quantity of)\s+(.+)\s+(?:do we have|is available|zilizopo)", "stock"),
+            (r"(?:is there|do we have)\s+(.+)\s+(?:in stock|available)", "stock"),
+            (r"(?:check|look up)\s+(?:stock of|inventory for)\s+(.+)", "stock"),
+            (r"(.+)\s+(?:stock|inventory|hisa)", "stock"),
+        ]
 
+        # INVOICE PATTERNS
+        self.invoice_patterns = [
+            (r"(?:show|list|get|view|display)\s+(?:ar|sales|customer)?\s*invoices?\s*(?:for\s+([A-Za-z0-9\s]+))?", "ar_invoices"),
+            (r"(?:overdue|past due|late)\s+invoices?\s*(?:for\s+([A-Za-z0-9\s]+))?", "overdue_invoices"),
+            (r"(?:customer\s+balance|balance\s+for|what does)\s+([A-Za-z0-9\s]+)\s+owe", "customer_balance"),
+            (r"(?:send|email)\s+(?:payment\s+)?reminder\s+(?:to|for)\s+([A-Za-z0-9\s]+)", "payment_reminder"),
+            (r"(?:aging|invoice aging)\s+report", "aging_report"),
+            (r"(?:who\s+owes|outstanding\s+payments|unpaid\s+bills)", "overdue_invoices"),
+        ]
 
-# ============================================================================
-# 6. MAIN KNOWLEDGE RETRIEVAL FUNCTION (Updated)
-# ============================================================================
+        # PURCHASE PATTERNS
+        self.purchase_patterns = [
+            (r"^(?:show|list|get)\s+(?:purchase\s+)?orders?\s*(?:for\s+([A-Za-z0-9\s]+))?$", "purchase_orders"),
+            (r"create\s+(?:a\s+)?purchase\s+order\s+(?:for\s+)?([A-Za-z0-9\s]+)(?:\s+with\s+|\s+containing\s+)(.+)", "create_purchase_order"),
+            (r"create\s+purchase\s+order$", "create_purchase_order"),
+            (r"(?:show|list|get)\s+(?:purchase\s+)?requests?", "purchase_requests"),
+            (r"(?:goods|stock)\s+receipt\s+(?:for\s+po\s+)?(\d+)", "goods_receipt"),
+            (r"approve\s+(?:purchase\s+)?order\s+(\d+)", "approve_purchase_order"),
+        ]
 
-async def get_knowledge(intent: str, query: str = "", tenant_code: str = "TEST001") -> str:
-    """
-    Returns the most relevant knowledge base content for a given intent.
-    
-    NOW: Combines static knowledge (policy) with dynamic knowledge (ERP data).
-    
-    Args:
-        intent: The user's intent (GET_ITEMS, GET_CUSTOMERS, etc.)
-        query: The original user query
-        tenant_code: The tenant making the request (for multi-tenancy)
-    """
-    intent = intent.upper()
+        # INVENTORY MOVEMENT PATTERNS
+        self.inventory_movement_patterns = [
+            (r"create\s+(?:a\s+)?(?:goods|stock)\s+issue\s+(?:from\s+)?([A-Z0-9]+)?\s+for\s+(.+)", "goods_issue"),
+            (r"create\s+(?:a\s+)?(?:goods|stock)\s+receipt\s+(?:from\s+po\s+(\d+)|for\s+(.+))", "goods_receipt"),
+            (r"transfer\s+stock\s+from\s+([A-Z0-9]+)\s+to\s+([A-Z0-9]+)\s+for\s+(.+)", "stock_transfer"),
+            (r"(?:what|which)\s+needs\s+reordering", "reorder_report"),
+            (r"(?:allocate|reserve)\s+stock\s+for\s+order\s+(\d+)", "allocate_stock"),
+            (r"inventory\s+valuation|stock\s+value|worth\s+of\s+inventory", "inventory_valuation"),
+        ]
 
-    knowledge_map = {
-        # ===== STATIC KNOWLEDGE (Policy) =====
-        "COMPANY_INFO": COMPANY_PROFILE,
-        "CONTACT_INFO": CONTACT_INFO,
-        "PAYMENT_METHODS": PAYMENT_METHODS,
-        "POLICY_QUESTION": PAYMENT_METHODS,
-        "HOW_TO_ORDER": HOW_TO_ORDER,
-        "CREATE_QUOTATION": HOW_TO_CREATE_QUOTATION,
-        "FAQ": ONBOARDING_GUIDE,
-        "GREETING": ONBOARDING_GUIDE,
-        "SMALL_TALK": ONBOARDING_GUIDE,
-        "TRAINING_MODULE": TRAINING_MODULES.get("TRAINING_MODULE", ""),
-        "TRAINING_GUIDE": TRAINING_MODULES.get("TRAINING_GUIDE", ""),
-        "TRAINING_FAQ": TRAINING_MODULES.get("TRAINING_FAQ", ""),
-        "TRAINING_WEBINAR": TRAINING_MODULES.get("TRAINING_WEBINAR", ""),
-        "TRAINING_VIDEO": TRAINING_MODULES.get("TRAINING_VIDEO", ""),
-        
-        # ===== ANALYTICS (Static) =====
-        "GET_SALES_ANALYTICS": SALES_ANALYTICS_KNOWLEDGE,
-        "GET_TOP_SELLING_ITEMS": TOP_SELLING_KNOWLEDGE,
-        "GET_SLOW_MOVING_ITEMS": SLOW_MOVING_KNOWLEDGE,
-        "GET_WAREHOUSES": WAREHOUSE_KNOWLEDGE,
-        "GET_DELIVERY_HISTORY": DELIVERY_KNOWLEDGE,
-        "GET_OUTSTANDING_DELIVERIES": DELIVERY_KNOWLEDGE,
-        "TRACK_DELIVERY": DELIVERY_KNOWLEDGE,
-        "GET_CROSS_SELL": CROSS_SELL_KNOWLEDGE,
-        "GET_UPSELL": CROSS_SELL_KNOWLEDGE,
-        
-        # ===== DYNAMIC KNOWLEDGE (from ERP - async loaded) =====
-        "GET_ITEMS": "ASYNC_LOAD",  # Will be loaded below
-        "GET_CUSTOMERS": "ASYNC_LOAD",
-        "FIND_CUSTOMERS_BY_ITEM": "ASYNC_LOAD",
-        "GET_CUSTOMER_DETAILS": "ASYNC_LOAD",
-        "GET_CUSTOMER_ORDERS": "ASYNC_LOAD",
-        "GET_WAREHOUSES": "ASYNC_LOAD",  # Can also be ERP-sourced
-    }
+        # DOCUMENT TRANSITION PATTERNS
+        self.document_transition_patterns = [
+            (r"convert\s+(?:quotation|quote)\s+(\d+)\s+to\s+(?:order|sales order)", "convert_quotation"),
+            (r"convert\s+it\s+to\s+order", "convert_quotation"),
+            (r"post\s+invoice\s+for\s+delivery\s+(\d+)", "post_invoice"),
+            (r"post\s+the\s+invoice", "post_invoice"),
+            (r"cancel\s+(?:order|quotation|purchase order)\s+(\d+)", "cancel_document"),
+            (r"reverse\s+(?:goods receipt|transfer)\s+(\d+)", "reverse_document"),
+        ]
 
-    # ===== HANDLE GLOSSARY =====
-    if intent == "TRAINING_GLOSSARY":
-        query_lower = query.lower()
-        matched = {
-            term: definition
-            for term, definition in GLOSSARY.items()
-            if term.lower() in query_lower
+        # BUSINESS RULES PATTERNS
+        self.business_rules_patterns = [
+            (r"check\s+credit\s+limit\s+for\s+([A-Za-z0-9\s]+)", "credit_limit"),
+            (r"(?:is|check)\s+stock\s+available\s+for\s+(.+)", "stock_availability"),
+            (r"(?:does|can)\s+([A-Za-z0-9\s]+)\s+need\s+approval", "approval_check"),
+        ]
+
+        # Churn risk patterns (HIGH PRIORITY)
+        self.churn_risk_patterns = [
+            (r"(?:show|customer|list|get|find)\s+customers?\s+(?:at|with|having)?\s+(?:churn\s+risk|churn risk|risk)", "customer_health"),
+            (r"(?:who|customers)\s+(?:is|are)\s+(?:likely|about)\s+to\s+(?:leave|churn)", "customer_health"),
+            (r"(?:customer\s+health|health\s+score|health\s+check)", "customer_health"),
+            (r"(?:churn\s+analysis|churn\s+prediction|churn\s+alert)", "customer_health"),
+            (r"(?:high|medium|low)\s+risk\s+customers?", "customer_health"),
+            (r"wateja\s+walio\s+katika\s+hatari", "customer_health"),
+            (r"afya\s+ya\s+wateja", "customer_health"),
+        ]
+
+        # Warehouse-related patterns
+        self.warehouse_patterns = [
+            (r"(?:view|show|list|get|display|see)\s+(?:all\s+)?warehouse(?:s)?\s*(?:stock|inventory|items)?", "warehouses"),
+            (r"warehouse(?:s)?\s+(?:stock|inventory|list|summary|overview|report)", "warehouses"),
+            (r"(?:all\s+)?warehouses?\s+(?:and\s+)?(?:stock|inventory|levels)", "warehouses"),
+            (r"(?:stock|inventory)\s+(?:across|by|per|in\s+all)\s+warehouses?", "warehouses"),
+            (r"(?:show|list|get)\s+warehouses?$", "warehouses"),
+            (r"onyesha\s+maghala|orodha\s+ya\s+maghala", "warehouses"),
+        ]
+
+        # Delivery-related patterns
+        self.delivery_patterns = [
+            (r"(?:track|where is|status of|check on)\s+(?:my )?(?:delivery|order|shipment)(?:\s+#?(\d+))?", "delivery"),
+            (r"(?:outstanding|pending|open)\s+(?:deliveries|orders|delivery)", "outstanding_deliveries"),
+            (r"(?:when will|when is)\s+(?:my )?(?:delivery|order)\s+(?:arrive|come|get here)", "delivery_status"),
+            (r"(?:delivery|order)\s+(?:status|update|progress)", "delivery_status"),
+            (r"(?:show me|list|what are)\s+(?:the )?(?:outstanding|pending)\s+(?:deliveries|orders)", "outstanding_deliveries"),
+        ]
+
+        # Top selling patterns
+        self.top_selling_patterns = [
+            (r"(?:top|best|popular|trending|hottest)\s+(?:selling|performing|products|items)", "top_selling"),
+            (r"(?:best sellers|bestsellers|top sellers)", "top_selling"),
+            (r"(?:what do|customers love|people buy|popular right now)", "top_selling"),
+            (r"(?:most sold|highest selling|frequently bought)", "top_selling"),
+            (r"sales (?:leaders|hits|winners)", "top_selling"),
+            (r"zinazouzwa sana|bidhaa bora|muu mkubwa", "top_selling"),
+        ]
+
+        # Slow moving patterns
+        self.slow_moving_patterns = [
+            (r"(?:slow(?:ly)?|poorly)\s+(?:moving|selling|performing)", "slow_moving"),
+            (r"(?:not|isn't)\s+(?:selling|moving)\s+well", "slow_moving"),
+            (r"(?:stuck|stagnant|dead)\s+(?:stock|inventory)", "slow_moving"),
+            (r"(?:excess|overstock|too much)\s+(?:stock|inventory)", "slow_moving"),
+            (r"(?:what's not|items not)\s+(?:selling|moving)", "slow_moving"),
+            (r"zinazotembea polepole|bidhaa zilizokaa|hisa zaidi", "slow_moving"),
+        ]
+
+        # Customer-related patterns
+        self.customer_patterns = [
+            (r"(?:find|show|get|search for)\s+(?:customer|mteja|client)\s+(.+)", "customer"),
+            (r"(?:who is|customer details|info on)\s+(.+)", "customer"),
+            (r"(?:orders?|purchases|buying history)\s+(?:for|of|from)\s+(.+)", "customer_orders"),
+            (r"(?:what has|what did)\s+(.+)\s+(?:ordered|bought|purchased)", "customer_orders"),
+        ]
+
+        # Quotation patterns
+        self.quotation_patterns = [
+            (r"(?:create|make|prepare|generate)\s+(?:a )?(?:quote|quotation|estimate)\s+(?:for)?\s*(.+)", "create_quotation"),
+            (r"(?:new quote|quotation for)\s+(.+)", "create_quotation"),
+            (r"(?:need a quote|quote me|give me a price)\s+(?:for)?\s*(.+)", "create_quotation"),
+            (r"unda nukuu|tengeneza nukuu|nukuu kwa", "create_quotation"),
+        ]
+
+        # Item extraction patterns
+        self.item_extraction = [
+            r"(?:vegimax|vegimax-\d+ml|vegimax-\d+l)",
+            r"(?:cabbage|cabage|cabiji|cabbage seeds)",
+            r"(?:tomato|tomatoes|matunda|nyanya)",
+            r"(?:maize|corn|mahindi|maize seed)",
+            r"(?:carrot|carrots|karoti|carrot seed)",
+            r"(?:onion|onions|kitunguu|onion seed)",
+            r"(?:beans|bean|maharagwe|bean seed)",
+            r"(?:easeed|easeed-\d+|easeed pouch)",
+            r"(?:tosheka|tosheka mh401|tosheka seed)",
+        ]
+
+        # Common misspellings and Swahili mappings
+        self.misspellings = {
+            "vegimax": "vegimax",
+            "vegimx": "vegimax",
+            "vegmax": "vegimax",
+            "vegimax 30": "vegimax 30ml",
+            "vegimax 30ml": "vegimax 30ml",
+            "cabage": "cabbage",
+            "cabiji": "cabbage",
+            "matunda": "tomato",
+            "nyanya": "tomato",
+            "mahindi": "maize",
+            "karoti": "carrot",
+            "kitunguu": "onion",
+            "maharagwe": "beans",
         }
-        if matched:
-            lines = [f"{term}: {defn}" for term, defn in matched.items()]
-            return "GLOSSARY DEFINITIONS:\n" + "\n".join(lines)
-        lines = [f"{term}: {defn}" for term, defn in GLOSSARY.items()]
-        return "LEYSCO GLOSSARY:\n" + "\n".join(lines)
 
-    # ===== GET STATIC CONTENT =====
-    content = knowledge_map.get(intent)
-    
-    # ===== LOAD DYNAMIC CONTENT FROM ERP =====
-    if content == "ASYNC_LOAD":
-        try:
-            if intent == "GET_ITEMS":
-                content = await get_erp_items_knowledge(tenant_code)
-            elif intent == "GET_CUSTOMERS":
-                content = await get_erp_customers_knowledge(tenant_code)
-            elif intent == "GET_WAREHOUSES":
-                content = await get_erp_warehouses_knowledge(tenant_code)
-            elif intent in ["FIND_CUSTOMERS_BY_ITEM", "GET_CUSTOMER_DETAILS", "GET_CUSTOMER_ORDERS"]:
-                content = await get_erp_customers_knowledge(tenant_code)
-            else:
-                content = ONBOARDING_GUIDE
-        except Exception as e:
-            logger.error(f"Failed to load ERP knowledge: {e}")
-            content = "Data temporarily unavailable. Please try again."
-    
-    # ===== FALLBACK =====
-    if not content:
-        content = ONBOARDING_GUIDE
+        # Intent to standard phrase mapping
+        self.intent_phrases = {
+            "GET_ITEM_PRICE": "price of",
+            "GET_STOCK_LEVELS": "stock of",
+            "GET_TOP_SELLING_ITEMS": "top selling items",
+            "GET_SLOW_MOVING_ITEMS": "slow moving items",
+            "GET_OUTSTANDING_DELIVERIES": "outstanding deliveries",
+            "TRACK_DELIVERY": "track delivery",
+            "CREATE_QUOTATION": "create quotation for",
+            "GET_CUSTOMERS": "show customers",
+            "GET_CUSTOMER_HEALTH": "show customers at churn risk",
+            "GET_CUSTOMER_ORDERS": "customer orders for",
+            "GET_WAREHOUSES": "show warehouses",
+            "FIND_CUSTOMERS_BY_ITEM": "customers who buy",
+            "GET_AR_INVOICES": "show invoices",
+            "GET_OVERDUE_INVOICES": "overdue invoices",
+            "GET_CUSTOMER_BALANCE": "customer balance for",
+            "SEND_PAYMENT_REMINDER": "send reminder to",
+            "GET_PURCHASE_ORDERS": "purchase orders",
+            "CREATE_PURCHASE_ORDER": "create purchase order for",
+            "GET_REORDER_REPORT": "what needs reordering",
+            "CREATE_STOCK_TRANSFER": "transfer stock",
+            "CONVERT_QUOTATION_TO_ORDER": "convert quotation to order",
+            "POST_INVOICE": "post invoice for",
+        }
 
-    return content
+    def rewrite(self, message: str) -> Tuple[str, Optional[str], Optional[dict]]:
+        """
+        Rewrite query and extract structured information.
+
+        Returns:
+            Tuple of (rewritten_message, detected_intent, extracted_entities)
+        """
+        original = message
+        rewritten = message
+        detected_intent = None
+        extracted_entities = {}
+
+        # =========================================================
+        # STEP 0 (HIGHEST PRIORITY): KNOWLEDGE / COMPANY BYPASS
+        # =========================================================
+        # Check before ANY item/price pattern matching so that questions
+        # about the company, how to use the system, or general help are
+        # never mistakenly routed to GET_ITEM_PRICE.
+        # =========================================================
+        is_knowledge_query, knowledge_intent = _is_company_or_knowledge_query(message)
+        if is_knowledge_query:
+            logger.info(
+                f"Knowledge bypass: '{original}' → intent: {knowledge_intent} "
+                f"(skipping item/price patterns)"
+            )
+            return original, knowledge_intent, {}
+
+        # =========================================================
+        # STEP 1: CHECK FOR PRICE QUERIES
+        # =========================================================
+        for pattern, _ in self.price_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                item_name = self._extract_item_name(match.group(1) if match.groups() else message)
+                if item_name:
+                    # Extra guard: don't treat company/system names as items
+                    if item_name.lower() in _COMPANY_TOKENS:
+                        logger.info(
+                            f"Price pattern suppressed: '{item_name}' is a company token, "
+                            f"routing to COMPANY_INFO"
+                        )
+                        return original, "COMPANY_INFO", {}
+                    extracted_entities = {"item_name": item_name}
+                    logger.info(f"Price pattern detected: '{original}' → intent: GET_ITEM_PRICE (item: {item_name})")
+                    return f"price of {item_name}", "GET_ITEM_PRICE", extracted_entities
+
+        # Step 2: Check for PROTECTED patterns (churn risk etc.)
+        protected_patterns = [
+            (self.churn_risk_patterns, "GET_CUSTOMER_HEALTH"),
+        ]
+        for patterns, intent_type in protected_patterns:
+            for pattern, _ in patterns:
+                if re.search(pattern, rewritten, re.IGNORECASE):
+                    logger.info(f"Protected pattern detected: '{original}' → intent: {intent_type}")
+                    return original, intent_type, {}
+
+        # Step 3: INVOICE patterns
+        for pattern, inv_type in self.invoice_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if match.groups() and match.group(1):
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
+                if inv_type == "overdue_invoices":
+                    return f"overdue invoices for {entities.get('customer_name', '')}".strip(), "GET_OVERDUE_INVOICES", entities
+                elif inv_type == "customer_balance":
+                    return f"customer balance for {entities.get('customer_name', '')}".strip(), "GET_CUSTOMER_BALANCE", entities
+                elif inv_type == "payment_reminder":
+                    return f"send reminder to {entities.get('customer_name', '')}".strip(), "SEND_PAYMENT_REMINDER", entities
+                elif inv_type == "aging_report":
+                    return "aging report", "GET_AGING_REPORT", {}
+                else:
+                    return f"show invoices for {entities.get('customer_name', '')}".strip(), "GET_AR_INVOICES", entities
+
+        # Step 4: PURCHASE patterns
+        for pattern, po_type in self.purchase_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if po_type == "create_purchase_order" and match.groups():
+                    if len(match.groups()) >= 2:
+                        entities["vendor_name"] = self._extract_customer_name(match.group(1))
+                        entities["items_raw"] = match.group(2)
+                    elif match.groups():
+                        entities["vendor_name"] = self._extract_customer_name(match.group(1))
+                    return message, "CREATE_PURCHASE_ORDER", entities
+                elif po_type == "purchase_orders" and match.groups() and match.group(1):
+                    entities["vendor_name"] = self._extract_customer_name(match.group(1))
+                    return f"purchase orders for {entities['vendor_name']}", "GET_PURCHASE_ORDERS", entities
+                elif po_type == "purchase_requests":
+                    return "purchase requests", "GET_PURCHASE_REQUESTS", {}
+                elif po_type == "goods_receipt" and match.groups():
+                    entities["po_num"] = match.group(1)
+                    return f"goods receipt for po {entities['po_num']}", "GET_GOODS_RECEIPT_PO", entities
+                elif po_type == "approve_purchase_order" and match.groups():
+                    entities["po_num"] = match.group(1)
+                    return f"approve purchase order {entities['po_num']}", "APPROVE_PURCHASE_ORDER", entities
+                else:
+                    return "purchase orders", "GET_PURCHASE_ORDERS", {}
+
+        # Step 5: INVENTORY MOVEMENT patterns
+        for pattern, inv_type in self.inventory_movement_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if inv_type == "goods_issue" and match.groups():
+                    if len(match.groups()) >= 2:
+                        entities["warehouse"] = match.group(1) if match.group(1) else "MAIN"
+                        entities["items_raw"] = match.group(2)
+                    return message, "CREATE_GOODS_ISSUE", entities
+                elif inv_type == "goods_receipt":
+                    if match.groups():
+                        if match.group(1):
+                            entities["po_num"] = match.group(1)
+                            return f"create goods receipt for po {entities['po_num']}", "CREATE_GOODS_RECEIPT", entities
+                        elif match.group(2):
+                            entities["items_raw"] = match.group(2)
+                    return message, "CREATE_GOODS_RECEIPT", entities
+                elif inv_type == "stock_transfer" and len(match.groups()) >= 3:
+                    entities["from_warehouse"] = match.group(1)
+                    entities["to_warehouse"] = match.group(2)
+                    entities["items_raw"] = match.group(3)
+                    return message, "CREATE_STOCK_TRANSFER", entities
+                elif inv_type == "reorder_report":
+                    return "what needs reordering", "GET_REORDER_REPORT", {}
+                elif inv_type == "allocate_stock" and match.groups():
+                    entities["order_num"] = match.group(1)
+                    return f"allocate stock for order {entities['order_num']}", "ALLOCATE_STOCK", entities
+                elif inv_type == "inventory_valuation":
+                    return "inventory valuation", "GET_INVENTORY_VALUATION", {}
+
+        # Step 6: DOCUMENT TRANSITION patterns
+        for pattern, trans_type in self.document_transition_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if trans_type == "convert_quotation":
+                    if match.groups() and match.group(1):
+                        entities["doc_num"] = match.group(1)
+                    return message, "CONVERT_QUOTATION_TO_ORDER", entities
+                elif trans_type == "post_invoice":
+                    if match.groups() and match.group(1):
+                        entities["doc_num"] = match.group(1)
+                    return message, "POST_INVOICE", entities
+                elif trans_type == "cancel_document" and match.groups():
+                    entities["doc_num"] = match.group(1)
+                    return f"cancel document {entities['doc_num']}", "CANCEL_DOCUMENT", entities
+                elif trans_type == "reverse_document" and match.groups():
+                    entities["doc_num"] = match.group(1)
+                    return f"reverse document {entities['doc_num']}", "REVERSE_DOCUMENT", entities
+
+        # Step 7: BUSINESS RULES patterns
+        for pattern, rule_type in self.business_rules_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                entities = {}
+                if rule_type == "credit_limit" and match.groups():
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
+                    return f"check credit limit for {entities['customer_name']}", "CHECK_CREDIT_LIMIT", entities
+                elif rule_type == "stock_availability" and match.groups():
+                    entities["item_name"] = self._extract_item_name(match.group(1))
+                    return f"check stock availability for {entities['item_name']}", "CHECK_STOCK_AVAILABILITY", entities
+
+        # Step 8: Warehouse patterns
+        for pattern, _ in self.warehouse_patterns:
+            if re.search(pattern, message, re.IGNORECASE):
+                return "show warehouses?", "GET_WAREHOUSES", {}
+
+        # Step 9: Fix common misspellings
+        rewritten = self._fix_misspellings(rewritten)
+
+        # Step 10: Detect intent and extract entities
+        detected_intent, extracted_entities = self._detect_intent_and_extract(rewritten)
+
+        # Step 11: Rewrite based on detected intent
+        if detected_intent:
+            rewritten = self._rewrite_for_intent(rewritten, detected_intent, extracted_entities)
+
+        # Step 12: If no intent detected, try pattern-based rewrite
+        if not detected_intent:
+            detected_intent, rewritten, extracted_entities = self._pattern_based_rewrite(rewritten)
+
+        # Step 13: Clean up the rewritten query
+        rewritten = self._clean_query(rewritten)
+
+        if rewritten != original:
+            logger.info(f"Query rewritten: '{original}' → '{rewritten}' (intent: {detected_intent})")
+
+        return rewritten, detected_intent, extracted_entities
+
+    def _fix_misspellings(self, text: str) -> str:
+        """Fix common misspellings"""
+        result = text.lower()
+        for wrong, correct in self.misspellings.items():
+            if wrong in result:
+                result = result.replace(wrong, correct)
+        return result
+
+    def _detect_intent_and_extract(self, text: str) -> Tuple[Optional[str], dict]:
+        """Detect intent and extract entities from text"""
+        text_lower = text.lower()
+        entities = {}
+
+        # CRITICAL: Check for churn risk first
+        for pattern, _ in self.churn_risk_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return "GET_CUSTOMER_HEALTH", entities
+
+        # Check for price queries
+        for pattern, _ in self.price_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                item = self._extract_item_name(match.group(1))
+                if item and item.lower() not in _COMPANY_TOKENS:
+                    entities["item_name"] = item
+                    return "GET_ITEM_PRICE", entities
+
+        # Check for stock queries
+        for pattern, _ in self.stock_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                candidate = self._extract_item_name(match.group(1) if match.groups() else text)
+                if candidate and candidate.lower().strip() not in _NON_ITEM_WORDS:
+                    entities["item_name"] = candidate
+                    return "GET_STOCK_LEVELS", entities
+                if re.search(r'\b(?:stock|inventory)\b', text_lower):
+                    return "GET_STOCK_LEVELS", {}
+
+        # Check for delivery queries
+        for pattern, delivery_type in self.delivery_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                if delivery_type == "outstanding_deliveries":
+                    return "GET_OUTSTANDING_DELIVERIES", entities
+                elif delivery_type in ("delivery", "delivery_status"):
+                    if match.groups() and match.group(1):
+                        entities["delivery_number"] = match.group(1)
+                    return "TRACK_DELIVERY", entities
+
+        # Check for top selling
+        for pattern, _ in self.top_selling_patterns:
+            if re.search(pattern, text_lower):
+                return "GET_TOP_SELLING_ITEMS", entities
+
+        # Check for slow moving
+        for pattern, _ in self.slow_moving_patterns:
+            if re.search(pattern, text_lower):
+                return "GET_SLOW_MOVING_ITEMS", entities
+
+        # Check for quotation creation
+        for pattern, _ in self.quotation_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                if match.groups():
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
+                return "CREATE_QUOTATION", entities
+
+        # Check for customer queries
+        for pattern, intent_type in self.customer_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                if intent_type == "customer":
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
+                    return "GET_CUSTOMERS", entities
+                elif intent_type == "customer_orders":
+                    entities["customer_name"] = self._extract_customer_name(match.group(1))
+                    return "GET_CUSTOMER_ORDERS", entities
+
+        return None, entities
+
+    def _extract_item_name(self, text: str) -> Optional[str]:
+        """Extract item name from text"""
+        if not text:
+            return None
+
+        text = text.strip()
+
+        for pattern in self.item_extraction:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(0)
+
+        filler_words = {"the", "a", "an", "of", "for", "to", "in", "at",
+                        "with", "about", "tell", "me", "show", "get",
+                        "levels", "level", "all", "alerts", "alert",
+                        "summary", "overview", "report", "list"}
+        words = text.split()
+        cleaned = [w for w in words if w.lower() not in filler_words]
+
+        if cleaned:
+            result = " ".join(cleaned[:3]).strip()
+            if result.lower() in _NON_ITEM_WORDS:
+                return None
+            # Don't return company tokens as item names
+            if result.lower() in _COMPANY_TOKENS:
+                return None
+            return result
+
+        return None
+
+    def _extract_customer_name(self, text: str) -> Optional[str]:
+        """Extract customer name from text"""
+        if not text:
+            return None
+
+        remove_words = {"a", "quotation", "quote", "for", "with", "the", "and", "new"}
+        words = text.split()
+        cleaned = [w for w in words if w.lower() not in remove_words]
+
+        if cleaned:
+            return " ".join(cleaned[:2])
+
+        return None
+
+    def _rewrite_for_intent(self, text: str, intent: str, entities: dict) -> str:
+        """Rewrite query into standard format for the detected intent."""
+        standard_phrase = self.intent_phrases.get(intent, "")
+
+        if intent == "GET_ITEM_PRICE" and entities.get("item_name"):
+            return f"{standard_phrase} {entities['item_name']}"
+
+        if intent == "GET_STOCK_LEVELS" and entities.get("item_name"):
+            return f"{standard_phrase} {entities['item_name']}"
+
+        if intent == "GET_CUSTOMER_ORDERS" and entities.get("customer_name"):
+            return f"{standard_phrase} {entities['customer_name']}"
+
+        if intent == "GET_CUSTOMER_BALANCE" and entities.get("customer_name"):
+            return f"{standard_phrase} {entities['customer_name']}"
+
+        if intent == "SEND_PAYMENT_REMINDER" and entities.get("customer_name"):
+            return f"{standard_phrase} {entities['customer_name']}"
+
+        if intent == "CREATE_PURCHASE_ORDER" and entities.get("vendor_name"):
+            return f"{standard_phrase} {entities['vendor_name']}"
+
+        if intent == "CREATE_QUOTATION":
+            return text
+
+        if intent == "GET_CUSTOMER_HEALTH":
+            return text
+
+        if intent in ["CONVERT_QUOTATION_TO_ORDER", "POST_INVOICE", "CREATE_STOCK_TRANSFER",
+                      "CREATE_GOODS_ISSUE", "CREATE_GOODS_RECEIPT"]:
+            return text
+
+        # Knowledge intents — preserve original
+        if intent in ["COMPANY_INFO", "CONTACT_INFO", "PAYMENT_METHODS", "TRAINING_MODULE",
+                      "GENERAL_HELP"]:
+            return text
+
+        return text
+
+    def _pattern_based_rewrite(self, text: str) -> Tuple[Optional[str], str, dict]:
+        """Pattern-based rewrite for ambiguous queries"""
+        text_lower = text.lower()
+        entities = {}
+
+        # "tell me about X" — only route to price if X looks like an actual item
+        if re.match(r'tell\s+me\s+about\s+', text_lower):
+            topic = re.sub(r'^tell\s+me\s+about\s+', '', text_lower).strip().rstrip('?.!')
+            # Company token → already handled by Step 0, but double-check
+            if topic in _COMPANY_TOKENS:
+                return "COMPANY_INFO", text, {}
+            # Only treat as item query if we can extract a known item name
+            item = self._extract_item_name(topic)
+            if item and item.lower() not in _COMPANY_TOKENS:
+                return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
+            # Otherwise fall through — let the classifier handle it
+            return None, text, {}
+
+        # "what is X" — guard company tokens
+        if re.match(r'what\s+(?:is|are)\s+', text_lower):
+            subject = re.sub(r'^what\s+(?:is|are)\s+', '', text_lower).strip().rstrip('?.!')
+            if subject in _COMPANY_TOKENS:
+                return "COMPANY_INFO", text, {}
+            if "price" in text_lower or "cost" in text_lower:
+                item = self._extract_item_name(text_lower.replace("what is", "").replace("what's", ""))
+                if item and item.lower() not in _COMPANY_TOKENS:
+                    return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
+            if "stock" in text_lower or "available" in text_lower:
+                item = self._extract_item_name(text_lower)
+                if item:
+                    return "GET_STOCK_LEVELS", f"stock of {item}", {"item_name": item}
+            if "overdue" in text_lower or "invoice" in text_lower:
+                return "GET_OVERDUE_INVOICES", "overdue invoices", {}
+
+        # "how many/much" patterns
+        if text_lower.startswith("how many") or text_lower.startswith("how much"):
+            if "stock" in text_lower or "available" in text_lower or "left" in text_lower:
+                item = self._extract_item_name(text_lower)
+                if item:
+                    return "GET_STOCK_LEVELS", f"stock of {item}", {"item_name": item}
+            if "price" in text_lower or "cost" in text_lower:
+                item = self._extract_item_name(text_lower)
+                if item:
+                    return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
+
+        # "show / view / list" patterns
+        if re.match(r'^(?:show(?:\s+me)?|view|list|display|see)\b', text_lower):
+            rest = re.sub(r'^(?:show(?:\s+me)?|view|list|display|see)\s*', '', text_lower).strip()
+
+            if "churn risk" in rest or "customer health" in rest or "at risk" in rest:
+                return "GET_CUSTOMER_HEALTH", text, {}
+            if "invoice" in rest:
+                if "overdue" in rest:
+                    return "GET_OVERDUE_INVOICES", "overdue invoices", {}
+                return "GET_AR_INVOICES", "show invoices", {}
+            if "purchase order" in rest or "po" in rest:
+                return "GET_PURCHASE_ORDERS", "purchase orders", {}
+            if "warehouse" in rest or "warehouses" in rest:
+                return "GET_WAREHOUSES", "show warehouses", {}
+            if "price" in rest:
+                item = self._extract_item_name(rest)
+                if item:
+                    return "GET_ITEM_PRICE", f"price of {item}", {"item_name": item}
+            if "stock" in rest or "inventory" in rest:
+                item = self._extract_item_name(rest)
+                if item and item.lower() not in _NON_ITEM_WORDS:
+                    return "GET_STOCK_LEVELS", f"stock of {item}", {"item_name": item}
+                return "GET_STOCK_LEVELS", text, {}
+            if "customer" in rest or "customers" in rest:
+                return "GET_CUSTOMERS", "show customers", {}
+            if "order" in rest or "orders" in rest:
+                customer = self._extract_customer_name(rest)
+                if customer:
+                    return "GET_CUSTOMER_ORDERS", f"customer orders for {customer}", {"customer_name": customer}
+
+        return None, text, entities
+
+    def _clean_query(self, text: str) -> str:
+        """Clean and normalize the query"""
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text.endswith(('?', '.', '!')):
+            text += '?'
+        return text
+
+    def expand_query(self, query: str) -> List[str]:
+        """Generate query variations for better matching"""
+        variations = [query]
+
+        if "price of" in query:
+            item = query.replace("price of", "").strip()
+            variations.append(f"how much is {item}")
+            variations.append(f"what does {item} cost")
+            variations.append(f"{item} price")
+
+        if "stock of" in query:
+            item = query.replace("stock of", "").strip()
+            variations.append(f"how many {item} in stock")
+            variations.append(f"inventory of {item}")
+            variations.append(f"{item} available")
+
+        direct = re.sub(r'^(what|how|where|when|why|tell me|show me|can you)\s+', '', query.lower())
+        if direct != query.lower():
+            variations.append(direct)
+
+        return list(set(variations))
 
 
-# ============================================================================
-# 7. STRUCTURED INFO FUNCTIONS (Updated for async)
-# ============================================================================
-
-async def get_company_info() -> dict:
-    """Returns structured company info dict."""
-    return {
-        "name": "Leysco Limited",
-        "tagline": "Simply Reliable",
-        "about": (
-            "Leysco is a software development and consultancy company specialising in "
-            "enterprise-wide Resource Planning and Management Systems."
-        ),
-        "phone": "+254(0) 780 457 591",
-        "email": "info@leysco.com",
-        "website": "https://leysco.com",
-        "address": "APA Arcade, Hurlingham, Nairobi, Kenya",
-    }
+# Singleton instance
+_query_rewriter = None
 
 
-async def get_contact_info() -> dict:
-    """Returns structured contact info dict."""
-    return {
-        "customer_support": {
-            "phone": "+254(0) 780 457 591",
-            "email": "info@leysco.com",
-            "hours": "Monday – Friday, 8:00 AM – 5:00 PM EAT",
-        },
-        "technical_support": "Email: info@leysco.com | Phone: +254(0) 780 457 591",
-        "address": "APA Arcade, Hurlingham, Nairobi, Kenya",
-        "website": "https://leysco.com",
-    }
-
-
-async def get_policies() -> dict:
-    """Returns structured policy info dict."""
-    return {
-        "returns": "Returns accepted within 7 days with original receipt.",
-        "quality_guarantee": "All seeds are certified. Products failing quality standards will be replaced.",
-        "credit_policy": "Credit limits set per customer based on payment history.",
-        "delivery_policy": "All deliveries require a signed gate pass.",
-    }
-
-
-async def get_glossary_term(term: str) -> str:
-    """Look up a single glossary term."""
-    return GLOSSARY.get(term.upper(), f"Term '{term}' not found in glossary.")
-
-
-def get_sales_rep_reference() -> str:
-    """Returns the quick reference cheat sheet for sales reps."""
-    return SALES_REP_QUICK_REFERENCE
-
-
-def get_onboarding_guide() -> str:
-    """Returns the new user onboarding guide."""
-    return ONBOARDING_GUIDE
-
-
-def clear_knowledge_cache():
-    """Clear the knowledge base cache."""
-    cache = get_cache_service()
-    cache.clear()
-    logger.info("Knowledge base cache cleared")
+def get_query_rewriter() -> QueryRewriter:
+    """Get singleton query rewriter instance"""
+    global _query_rewriter
+    if _query_rewriter is None:
+        _query_rewriter = QueryRewriter()
+    return _query_rewriter

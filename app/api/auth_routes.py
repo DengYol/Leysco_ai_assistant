@@ -1,234 +1,349 @@
-# app/api/auth_routes.py
 """
-Authentication routes - handles login and returns tokens
-Solves multi-tenant token passing at the backend level
+app/api/auth_routes.py
+======================
+
+Authentication API endpoints.
+
+Endpoints:
+  POST   /api/auth/login      - Login with email/password, get tokens
+  POST   /api/auth/logout     - Logout and blacklist token
+  POST   /api/auth/refresh    - Refresh access token
+  POST   /api/auth/verify     - Verify token validity
 """
 
+from fastapi import APIRouter, Request, HTTPException, status, Depends
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional, Dict, Any
 import logging
-from fastapi import APIRouter, Request, HTTPException, status
-from typing import Dict, Any
-import httpx
 
+from app.core.auth_service import get_auth_service
 from app.api.dependencies import (
+    get_token_from_header,
     resolve_backend_url,
-    UserSessionManager,
     get_company_code_header,
 )
 
 logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
-router = APIRouter(prefix="/api/auth", tags=["authentication"])
+
+# ============================================================================
+# REQUEST/RESPONSE SCHEMAS
+# ============================================================================
+
+class LoginRequest(BaseModel):
+    """Login request"""
+    email: EmailStr = Field(..., description="User email")
+    password: str = Field(..., min_length=8, description="User password")
+    company_code: Optional[str] = Field(None, description="Company code (optional, from header if not provided)")
 
 
-# =========================================================
-# LOGIN ENDPOINT
-# =========================================================
+class LoginResponse(BaseModel):
+    """Login response"""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int  # seconds
+    user: Dict[str, Any]
 
-@router.post("/login")
+
+class RefreshRequest(BaseModel):
+    """Token refresh request"""
+    refresh_token: str = Field(..., description="Refresh token")
+
+
+class RefreshResponse(BaseModel):
+    """Token refresh response"""
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class VerifyResponse(BaseModel):
+    """Token verification response"""
+    valid: bool
+    user_id: Optional[int] = None
+    user_email: Optional[str] = None
+    user_role: Optional[str] = None
+    company_code: Optional[str] = None
+    expires_in: Optional[int] = None  # seconds until expiration
+
+
+class LogoutResponse(BaseModel):
+    """Logout response"""
+    message: str
+
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
+@router.post("/login", response_model=LoginResponse, status_code=200)
 async def login(
     request: Request,
-    credentials: Dict[str, Any]
-) -> Dict[str, Any]:
+    credentials: LoginRequest,
+) -> LoginResponse:
     """
-    Frontend login endpoint.
+    Authenticate user and return tokens.
     
-    Frontend sends email + password to THIS endpoint.
-    Backend automatically:
-    1. Determines which tenant backend to use
-    2. Logs in to Laravel backend
-    3. Gets token
-    4. Caches token
-    5. Returns token to frontend
+    **Flow:**
+    1. Get company code from body or X-Company-Code header
+    2. Resolve backend URL for that company
+    3. Authenticate against Laravel backend
+    4. Generate JWT tokens (access + refresh)
+    5. Return tokens + user info
     
-    Frontend then uses this token for all AI API requests.
-    
-    Request body:
-    {
+    **Example:**
+    ```bash
+    curl -X POST http://localhost:8000/api/auth/login \\
+      -H "Content-Type: application/json" \\
+      -d {
         "email": "user@example.com",
-        "password": "password123"
-    }
+        "password": "SecurePassword123",
+        "company_code": "TEST001"
+      }
+    ```
     
-    Response:
+    **Response:**
+    ```json
     {
-        "token": "2555|Cl7tQFy6JkPej...",
-        "user": {
-            "id": 1,
-            "name": "John Doe",
-            "email": "user@example.com",
-            "company_code": "TEST001",
-            "is_manager": true
-        },
-        "backend_url": "https://dev100-be.leysco100.com"
+      "access_token": "eyJhbGciOiJIUzI1NiI...",
+      "refresh_token": "eyJhbGciOiJIUzI1NiI...",
+      "token_type": "bearer",
+      "expires_in": 86400,
+      "user": {
+        "user_id": 123,
+        "user_email": "user@example.com",
+        "user_name": "John Doe",
+        "user_role": "sales_rep",
+        "company_code": "TEST001"
+      }
     }
+    ```
     """
     
     try:
-        # Extract credentials
-        email = credentials.get("email")
-        password = credentials.get("password")
+        # Get company code
+        company_code = (
+            credentials.company_code or
+            await get_company_code_header(request)
+        )
         
-        if not email or not password:
+        if not company_code:
+            logger.warning(f"Login attempt without company code: {credentials.email}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Missing email or password"
+                detail="company_code is required (provide as parameter or X-Company-Code header)"
             )
         
-        # Determine which tenant backend to use
-        # Priority: 1) Header, 2) Origin sniffing, 3) Global fallback
-        company_code = await get_company_code_header(request)
-        backend_url = resolve_backend_url(company_code=company_code, request=request)
+        logger.info(f"🔐 Login request: {credentials.email} for {company_code}")
         
-        logger.info(f"🔐 Login attempt for {email} on backend: {backend_url}")
-        
-        # Login to Laravel backend
-        login_url = f"{backend_url}/api/v1/login"
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                login_url,
-                json={"email": email, "password": password},
-                headers={"Content-Type": "application/json"}
-            )
-        
-        if response.status_code != 200:
-            logger.warning(f"❌ Login failed for {email}: HTTP {response.status_code}")
+        # Resolve backend URL for this company
+        try:
+            backend_url = resolve_backend_url(company_code=company_code, request=request)
+        except HTTPException as e:
+            logger.error(f"Cannot resolve backend for {company_code}: {e.detail}")
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication service not configured for this company"
             )
         
-        login_data = response.json()
-        token = login_data.get("token")
+        # Authenticate
+        auth_service = get_auth_service()
+        result = await auth_service.login(
+            email=credentials.email,
+            password=credentials.password,
+            company_code=company_code,
+            backend_url=backend_url,
+        )
         
-        if not token:
-            logger.error(f"❌ No token in login response from {backend_url}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Backend did not return token"
-            )
+        logger.info(f"✅ Login successful: {credentials.email} ({company_code})")
         
-        # Validate token against backend to get user info
-        logger.info(f"✅ Token received, validating: {token[:20]}...")
-        
-        validate_url = f"{backend_url}/api/user"
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            validate_response = await client.get(
-                validate_url,
-                headers={"Authorization": f"Bearer {token}"}
-            )
-        
-        if validate_response.status_code != 200:
-            logger.error(f"❌ Token validation failed: HTTP {validate_response.status_code}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token validation failed"
-            )
-        
-        user_data = validate_response.json()
-        
-        # Build user info dict
-        user_info = {
-            "user_id": user_data.get("id"),
-            "user_role": "manager" if user_data.get("SUPERUSER") == "1" else "sales_rep",
-            "user_email": user_data.get("email"),
-            "company_code": user_data.get("company_code") or company_code,
-            "assigned_customers": user_data.get("assigned_customers", []),
-            "is_manager": user_data.get("SUPERUSER") == "1",
-            "backend_url": backend_url,  # ← Store backend URL for future requests
-        }
-        
-        # Cache session so future requests don't validate again
-        UserSessionManager.store(token, user_info, ttl_seconds=3600)
-        logger.info(f"✅ User {user_data.get('email')} logged in successfully")
-        
-        # Return token + user info to frontend
-        return {
-            "token": token,
-            "user": {
-                "id": user_info["user_id"],
-                "name": user_data.get("name"),
-                "email": user_info["user_email"],
-                "role": user_info["user_role"],
-                "company_code": user_info["company_code"],
-                "is_manager": user_info["is_manager"],
-            },
-            "backend_url": backend_url,  # For debugging
-            "success": True
-        }
-        
+        return LoginResponse(**result)
+    
+    except ValueError as e:
+        logger.warning(f"❌ Login failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(e)
+        )
+    
     except HTTPException:
         raise
+    
     except Exception as e:
         logger.error(f"❌ Login error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login failed"
+            detail="Login failed. Please try again."
         )
 
 
-# =========================================================
-# LOGOUT ENDPOINT
-# =========================================================
-
-@router.post("/logout")
-async def logout(request: Request) -> Dict[str, Any]:
+@router.post("/refresh", response_model=RefreshResponse, status_code=200)
+async def refresh_token(
+    request: Request,
+    body: RefreshRequest,
+) -> RefreshResponse:
     """
-    Logout endpoint - clears cached session.
+    Get a new access token using a refresh token.
     
-    Frontend sends token, backend clears it from cache.
+    **Flow:**
+    1. Validate refresh token signature and expiration
+    2. Generate new access token
+    3. Blacklist old refresh token (rotation)
+    4. Return new access token
+    
+    **Example:**
+    ```bash
+    curl -X POST http://localhost:8000/api/auth/refresh \\
+      -H "Content-Type: application/json" \\
+      -d {
+        "refresh_token": "eyJhbGciOiJIUzI1NiI..."
+      }
+    ```
+    
+    **Response:**
+    ```json
+    {
+      "access_token": "eyJhbGciOiJIUzI1NiI...",
+      "token_type": "bearer",
+      "expires_in": 86400
+    }
+    ```
     """
+    
     try:
-        from app.api.dependencies import get_token_from_header
+        auth_service = get_auth_service()
         
-        token = await get_token_from_header(request)
-        UserSessionManager.clear(token)
+        # Validate refresh token
+        new_token = await auth_service.refresh_access_token(body.refresh_token)
         
-        logger.info(f"✅ User logged out")
+        logger.info("✅ Token refreshed successfully")
         
-        return {"success": True, "message": "Logged out successfully"}
+        return RefreshResponse(
+            access_token=new_token,
+            token_type="bearer",
+            expires_in=auth_service.config.JWT_ACCESS_TOKEN_EXPIRE_HOURS * 3600
+        )
+    
+    except ValueError as e:
+        logger.warning(f"❌ Token refresh failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token"
+        )
+    
+    except Exception as e:
+        logger.error(f"❌ Refresh error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Token refresh failed"
+        )
+
+
+@router.post("/verify", response_model=VerifyResponse, status_code=200)
+async def verify_token(
+    request: Request,
+    token: str = Depends(get_token_from_header),
+) -> VerifyResponse:
+    """
+    Verify that an access token is valid.
+    
+    **Example:**
+    ```bash
+    curl -X POST http://localhost:8000/api/auth/verify \\
+      -H "Authorization: Bearer <access_token>"
+    ```
+    
+    **Response (valid):**
+    ```json
+    {
+      "valid": true,
+      "user_id": 123,
+      "user_email": "user@example.com",
+      "user_role": "sales_rep",
+      "company_code": "TEST001",
+      "expires_in": 3600
+    }
+    ```
+    
+    **Response (invalid):**
+    ```json
+    {
+      "valid": false,
+      "reason": "Token expired"
+    }
+    ```
+    """
+    
+    try:
+        auth_service = get_auth_service()
         
+        claims = auth_service.validate_access_token(token)
+        
+        if not claims:
+            return VerifyResponse(valid=False)
+        
+        return VerifyResponse(
+            valid=True,
+            user_id=claims.user_id,
+            user_email=claims.user_email,
+            user_role=claims.user_role,
+            company_code=claims.company_code,
+            expires_in=claims.get_ttl_seconds()
+        )
+    
+    except Exception as e:
+        logger.error(f"Verification error: {e}")
+        return VerifyResponse(valid=False)
+
+
+@router.post("/logout", response_model=LogoutResponse, status_code=200)
+async def logout(
+    request: Request,
+    token: str = Depends(get_token_from_header),
+) -> LogoutResponse:
+    """
+    Logout user by blacklisting token.
+    
+    **Example:**
+    ```bash
+    curl -X POST http://localhost:8000/api/auth/logout \\
+      -H "Authorization: Bearer <access_token>"
+    ```
+    
+    **Response:**
+    ```json
+    {
+      "message": "Successfully logged out"
+    }
+    ```
+    """
+    
+    try:
+        auth_service = get_auth_service()
+        
+        # Validate token first
+        claims = auth_service.validate_access_token(token)
+        if not claims:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+        
+        # Blacklist token
+        auth_service.logout(token)
+        
+        logger.info(f"✅ User {claims.user_id} logged out")
+        
+        return LogoutResponse(message="Successfully logged out")
+    
+    except HTTPException:
+        raise
+    
     except Exception as e:
         logger.error(f"Logout error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Logout failed"
-        )
-
-
-# =========================================================
-# VERIFY TOKEN ENDPOINT
-# =========================================================
-
-@router.post("/verify")
-async def verify_token(request: Request) -> Dict[str, Any]:
-    """
-    Verify that a token is still valid.
-    
-    Frontend can use this to check if token expired without
-    making a full API call.
-    """
-    try:
-        from app.api.dependencies import get_token_from_header, extract_user_info_from_token
-        
-        token = await get_token_from_header(request)
-        user_info = await extract_user_info_from_token(token, request)
-        
-        return {
-            "valid": True,
-            "user_id": user_info.get("user_id"),
-            "user_email": user_info.get("user_email"),
-            "role": user_info.get("user_role"),
-            "is_manager": user_info.get("is_manager"),
-        }
-        
-    except HTTPException as e:
-        if e.status_code == 401:
-            return {"valid": False, "message": "Token expired or invalid"}
-        raise
-    except Exception as e:
-        logger.error(f"Token verification error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Verification failed"
         )

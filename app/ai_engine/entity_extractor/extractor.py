@@ -21,7 +21,7 @@ from .rules import (
     clean_customer_name,
     clean_customer_search_term
 )
-from app.services.llm_service import LLMService
+from app.services.llm import LLMService
 from app.ai_engine.prompt_manager import PromptManager
 from app.services.cache_service import cache_service
 from app.services.leysco_api.client import LeyscoAPIService, create_api_service
@@ -48,14 +48,18 @@ class EntityExtractor:
     Enhanced with context awareness and Swahili support.
     """
 
-    def __init__(self, user_token: str = None):
+    def __init__(self, user_token: str = None, company_code: str = None):
         """
-        Initialize EntityExtractor with optional user token.
-        
+        Initialize EntityExtractor with optional user token and company code.
+
         Args:
             user_token: Optional user token for API access
+            company_code: Company code for multi-tenant URL resolution.
+                          CRITICAL: without this the API service resolves to the
+                          wrong tenant backend (dev109 vs dev100 etc.).
         """
         self.user_token = user_token
+        self.company_code = company_code
         self.llm = LLMService()
         self.prompt_manager = PromptManager()
         self.fuzzy_matcher = None  # Lazy initialized with API service
@@ -65,9 +69,21 @@ class EntityExtractor:
         self._extract_cache_ttl = 300
         self._customers_fetched = False
 
-    def set_user_token(self, token: str):
-        """Update user token for API access."""
+    def set_user_token(self, token: str, company_code: str = None):
+        """
+        Update user token (and optionally company code) for API access.
+
+        When company_code changes the cached API service is dropped so it
+        is recreated with the correct tenant URL on next access.
+        """
         self.user_token = token
+        if company_code and company_code != self.company_code:
+            self.company_code = company_code
+            # Drop cached service — it was built for the old company_code
+            self._api_service = None
+            self.fuzzy_matcher = None
+            self._customers_fetched = False
+            logger.debug(f"EntityExtractor company_code updated to: {company_code}")
         if self._api_service:
             self._api_service.set_user_token(token)
 
@@ -75,8 +91,15 @@ class EntityExtractor:
     def api_service(self):
         """Lazy load API service to avoid circular imports."""
         if self._api_service is None:
-            # Use LeyscoAPIService from client
-            self._api_service = create_api_service(user_token=self.user_token)
+            # FIXED: forward company_code so the correct tenant backend URL
+            # is resolved (e.g. dev100-be vs dev109-be).
+            # Previously company_code was omitted here, causing all entity-
+            # extractor API calls (customer fuzzy-match, item cache) to hit
+            # the wrong backend and return HTML login pages.
+            self._api_service = create_api_service(
+                user_token=self.user_token,
+                company_code=self.company_code,
+            )
             # Initialize fuzzy matcher with API service
             self.fuzzy_matcher = FuzzyMatcher(self._api_service)
         return self._api_service
@@ -159,6 +182,20 @@ class EntityExtractor:
         is_compare = IntentRules.is_compare_query(text_lower)
         is_price_alert = IntentRules.is_price_alert_query(text_lower)
 
+        # ====================================================================
+        # FIX: Check if this is an ITEM DETAILS query
+        # If it is, skip customer extraction entirely
+        # ====================================================================
+        is_item_details_query = bool(
+            re.search(r'(?:item|product|stock|inventory)\s+details?\s+for', text_lower, re.IGNORECASE) or
+            re.search(r'details?\s+for\s+(?:item|product|stock|inventory)', text_lower, re.IGNORECASE) or
+            re.search(r'(?:show|view|get)\s+(?:me\s+)?(?:item|product)\s+details?\s+for', text_lower, re.IGNORECASE)
+        )
+        
+        if is_item_details_query:
+            logger.info(f"🔍 Detected item details query, skipping customer extraction: '{text}'")
+            # Still extract item name but don't extract customer
+
         # Extract month for seasonal queries
         month = None
         if is_seasonal:
@@ -187,12 +224,19 @@ class EntityExtractor:
             re.search(r"\b(detail|details|spec|specs|information|info|about|maelezo|taarifa)\b", text_lower)
         )
 
-        # Extract customer name
-        customer_name = CustomerRules.extract_customer_name(
-            original_text, 
-            is_listing=is_listing, 
-            is_competitor_pricing=is_competitor_pricing
-        )
+        # ====================================================================
+        # FIX: Only extract customer name if NOT an item details query
+        # ====================================================================
+        customer_name = None
+        if not is_item_details_query:
+            customer_name = CustomerRules.extract_customer_name(
+                original_text, 
+                is_listing=is_listing, 
+                is_competitor_pricing=is_competitor_pricing
+            )
+        else:
+            # Clear any customer that might have been incorrectly extracted
+            logger.info(f"🔍 Item details query: clearing customer extraction")
 
         # Extract item name and items list for quotations
         item_name = None
@@ -217,34 +261,12 @@ class EntityExtractor:
                 "", item_name, flags=re.IGNORECASE
             ).strip()
 
-            # ============================================================================
-            # FIX: DO NOT move item_name to customer_name
-            # ============================================================================
-            # REMOVED the problematic logic that was moving items to customer_name:
-            #
-            # OLD CODE (BUGGY):
-            #   if CustomerRules.looks_like_company(item_name) and not ItemRules.is_product_name(item_name):
-            #       logger.info(f"Item '{item_name}' looks like company — moving to customer_name")
-            #       if not customer_name:
-            #           customer_name = item_name
-            #       item_name = None
-            #
-            # REASON: This logic was causing items extracted from price queries to be
-            # reclassified as customer names, breaking the intent flow. Example:
-            #   Query: "what is the price of punched washer?"
-            #   - Item "PUNCHED WASHER" was correctly extracted from API
-            #   - But then reclassified as customer_name because it "looks like company"
-            #   - This triggered intent override to GET_CUSTOMER_PRICE
-            #   - Customer lookup failed → "Customer not found" response
-            #
-            # SOLUTION: If an item was extracted from product source (API), trust it.
-            # Only if it has no supporting data should we consider reclassification.
-            # For now, we simply trust the item extraction logic and keep item_name.
-            # ============================================================================
-            logger.info(f"✅ Item name retained: '{item_name}' (no reclassification to customer)")
+            logger.info(f"✅ Item name extracted: '{item_name}'")
 
-        # Extract from "for [company]" patterns (fallback) - only if no item exists
-        if not customer_name and not item_name and not is_listing and not is_competitor_pricing:
+        # ====================================================================
+        # FIX: Only extract customer from "for [company]" pattern if NOT an item details query
+        # ====================================================================
+        if not customer_name and not item_name and not is_listing and not is_competitor_pricing and not is_item_details_query:
             for_company_match = re.search(r'(?:for|kwa)\s+([A-Z][a-zA-Z0-9\s&\-.]+)$', original_text)
             if for_company_match:
                 potential_customer = for_company_match.group(1).strip()
@@ -265,6 +287,7 @@ class EntityExtractor:
             "date": date_value,
             "detail_mode": detail_mode,
             "_is_listing": is_listing,  # Store for later use
+            "_is_item_details": is_item_details_query,  # Store for later use
         }
         
         if items_list:
@@ -306,6 +329,7 @@ class EntityExtractor:
         
         # Get is_listing from fresh_entities (set in _rule_based_entities)
         is_listing = fresh_entities.get("_is_listing", False)
+        is_item_details = fresh_entities.get("_is_item_details", False)
 
         # Step 5: Merge with session entities if provided
         if initial_entities:
@@ -347,9 +371,11 @@ class EntityExtractor:
                     rule_entities["_item_corrected_from"] = raw_item
                     logger.info(f"Item fuzzy corrected: '{raw_item}' → '{corrected_item}'")
 
-        # Step 7: Apply fuzzy matching for customer names (IMPORTANT!)
+        # ====================================================================
+        # FIX: Only apply fuzzy matching for customer names if NOT an item details query
+        # ====================================================================
         raw_customer = rule_entities.get("customer_name")
-        if raw_customer and not is_listing and not is_pronoun_query:
+        if raw_customer and not is_listing and not is_pronoun_query and not is_item_details:
             # Try to resolve with fuzzy matching
             resolved_customer, customer_data = await self._resolve_customer_with_fuzzy_match(raw_customer)
             
@@ -363,12 +389,17 @@ class EntityExtractor:
                 if customer_data:
                     rule_entities["_customer_code"] = customer_data.get('CardCode')
                 logger.debug(f"Customer name verified: '{resolved_customer}'")
+        elif is_item_details and raw_customer:
+            # This was a false positive - clear it
+            logger.info(f"🔍 Clearing incorrectly extracted customer '{raw_customer}' for item details query")
+            rule_entities["customer_name"] = None
 
         rule_entities["_original_query"] = user_message
 
         # Step 8: Remove internal flags before returning
         result_entities = {k: v for k, v in rule_entities.items() if not k.startswith('_') or k == "_original_query"}
         result_entities["_is_listing"] = is_listing  # Keep for context
+        result_entities["_is_item_details"] = is_item_details  # Keep for context
 
         # Step 9: Return if we have entities
         if any([
@@ -421,7 +452,10 @@ class EntityExtractor:
                     result_entities["_item_corrected_from"] = structured["item_name"]
                 structured["item_name"] = corrected
 
-            if structured.get("customer_name") and self.fuzzy_matcher and not is_listing:
+            # ================================================================
+            # FIX: Only apply customer fuzzy matching if NOT an item details query
+            # ================================================================
+            if structured.get("customer_name") and self.fuzzy_matcher and not is_listing and not is_item_details:
                 structured["customer_name"] = clean_customer_name(structured["customer_name"])
                 # Apply fuzzy matching
                 resolved, customer_data = await self._resolve_customer_with_fuzzy_match(structured["customer_name"])
@@ -429,6 +463,10 @@ class EntityExtractor:
                     structured["customer_name"] = resolved
                     if customer_data:
                         result_entities["_customer_code"] = customer_data.get('CardCode')
+            elif is_item_details and structured.get("customer_name"):
+                # Clear incorrectly extracted customer
+                logger.info(f"🔍 Clearing incorrectly extracted customer from AI for item details query")
+                structured["customer_name"] = None
 
             for key, value in structured.items():
                 if value is not None:
@@ -460,5 +498,6 @@ class EntityExtractor:
         return match.group() if match else None
 
 
-# Singleton instance
+# Singleton instance — token and company_code are set per-request via
+# set_user_token() before extract_async() is called, so no args needed here.
 entity_extractor = EntityExtractor()

@@ -66,6 +66,62 @@ def _ensure_list(data: Any) -> List[Any]:
 
 
 # ============================================================================
+# LOW STOCK RESPONSE FORMATTER
+# ============================================================================
+
+def _format_low_stock_response(items: list, threshold: int, language: str) -> dict:
+    """Format low stock items into a user-friendly response."""
+    
+    if not items:
+        if language == "sw":
+            msg = f"✅ Habari njema! Hakuna bidhaa zilizo chini ya kiwango cha {threshold} uniti. Hisa zote ziko sawa."
+        else:
+            msg = f"✅ Great news! No items are currently below the {threshold} unit threshold. All stock levels are healthy."
+        return {"message": msg, "data": []}
+    
+    # Format the items for display
+    lines = []
+    
+    # Header
+    if language == "sw":
+        lines.append(f"📊 **Bidhaa Zilizo na Hisa Chini (chini ya {threshold} uniti):**\n")
+    else:
+        lines.append(f"📊 **Low Stock Items (below {threshold} units):**\n")
+    
+    # Add items (limit to 30 for readability)
+    display_items = items[:30]
+    for idx, item in enumerate(display_items, 1):
+        item_name = item.get('ItemName', 'Unknown')
+        item_code = item.get('ItemCode', '')
+        on_hand = item.get('OnHand', 0)
+        item_group = item.get('item_group', {})
+        group_name = item_group.get('ItmsGrpNam', '') if item_group else ''
+        
+        # Highlight very low stock (below 20) with emoji
+        stock_icon = "🔴" if on_hand < 20 else "🟡" if on_hand < 50 else "🟠"
+        
+        if group_name:
+            lines.append(f"{stock_icon} {idx}. **{item_code}** -- {item_name} — {group_name} | Stock: {on_hand:,.0f}")
+        else:
+            lines.append(f"{stock_icon} {idx}. **{item_code}** -- {item_name} | Stock: {on_hand:,.0f}")
+    
+    # Show count of remaining items
+    if len(items) > 30:
+        lines.append(f"\n... and {len(items) - 30} more low stock items.")
+    
+    # Add summary
+    if language == "sw":
+        lines.append(f"\n💡 **Kidokezo:** {len(items)} bidhaa zina hisa chini ya {threshold}. Unataka kuona maelezo zaidi kwa bidhaa yoyote?")
+    else:
+        lines.append(f"\n💡 **Tip:** {len(items)} items have stock below {threshold}. Would you like to see more details for any item?")
+    
+    return {
+        "message": "\n".join(lines),
+        "data": items
+    }
+
+
+# ============================================================================
 # CUSTOMER BEHAVIOR RESPONSE FORMATTER
 # ============================================================================
 
@@ -174,6 +230,124 @@ def _format_customer_behavior_response(data: dict, language: str) -> str:
     return "\n".join(lines)
 
 
+# ============================================================================
+# GENERAL AI HANDLER - Handles CLARIFY and GENERAL_AI with LLM
+# ============================================================================
+
+async def _handle_general_ai(
+    intent: str,
+    entities: dict,
+    message: str,
+    language: str,
+    llm,
+    context: Dict,
+    session_id: str
+) -> AIResponse:
+    """Handle general AI queries with LLM for open-ended questions."""
+    
+    logger.info(f"🤖 Handling general AI query: {message} (intent: {intent}")
+    
+    try:
+        # Get conversation context for better responses
+        context_info = ""
+        if context and context.get("last_intent"):
+            context_info = f"\nPrevious conversation: User was asking about {context.get('last_intent')}. "
+            if context.get("referenced_items"):
+                items = [i.get('name', '') for i in context['referenced_items'][:3] if i.get('name')]
+                if items:
+                    context_info += f"Previous items mentioned: {', '.join(items)}. "
+        
+        # Build prompt based on language
+        if language == "sw":
+            prompt = f"""Wewe ni Msaidizi wa AI wa Leysco. Unapaswa kujibu swali la mtumiaji kwa lugha ya Kiswahili.
+
+MTUMIAJI ALIULIZA: {message}
+
+{context_info}
+
+MUHIMU:
+1. Jibu swali kwa lugha ya Kiswahili
+2. Iwapo swali linahusu biashara (bei, hisa, wateja, maagizo), elekeza mtumiaji kwenye mfumo wa Leysco
+3. Iwapo swali ni la jumla (sayansi, historia, elimu, hesabu), jibu kwa maarifa yako ya jumla
+4. Usijibu mambo ambayo hujui - sema tu "Samahani, sijui jibu la swali hilo"
+5. Weka jibu fupi na muhimu (sentensi 2-4)
+6. Mwishoni, uliza kama kuna kitu kingine wanachohitaji
+
+JIBU LAKO:"""
+        else:
+            prompt = f"""You are the Leysco AI Assistant. You should answer the user's question with general knowledge.
+
+USER ASKED: {message}
+
+{context_info}
+
+IMPORTANT:
+1. Answer the question in English
+2. If the question is about business (pricing, stock, customers, orders), guide the user to the Leysco system
+3. If the question is general (science, history, education, math, weather), answer with your general knowledge
+4. Don't answer things you don't know - just say "I'm sorry, I don't know the answer to that"
+5. Keep the response short and relevant (2-4 sentences)
+6. End by asking if there's anything else they need
+
+YOUR RESPONSE:"""
+        
+        # ================================================================
+        # FIX: Remove 'temperature' parameter - LLMService.generate_async()
+        # doesn't accept it. Use only supported parameters.
+        # ================================================================
+        response = await llm.generate_async(
+            prompt,
+            intent="GENERAL_AI",
+            max_tokens=300,
+            language=language
+        )
+        
+        # If response is empty or too short, use fallback
+        if not response or len(response.strip()) < 10:
+            if language == "sw":
+                response = "Samahani, sikuelewa swali lako. Tafadhali jaribu kuuliza swali lingine. Ninaweza kukusaidia na bei za bidhaa, hisa, wateja, na maagizo."
+            else:
+                response = "I'm sorry, I didn't understand your question. Please try asking something else. I can help with items, pricing, stock levels, customers, and orders."
+        
+        # Generate suggestions
+        suggestions = [
+            "Check price of an item",
+            "Show me stock levels",
+            "Create a quotation",
+            "What can you help me with?"
+        ]
+        
+        return AIResponse(
+            intent=intent,
+            entities=entities,
+            result=response,
+            data=[],
+            suggestions=suggestions,
+            session_id=session_id,
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in general AI handler: {e}", exc_info=True)
+        # Fallback response
+        if language == "sw":
+            response = "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena. Ninaweza kukusaidia na bei za bidhaa, hisa, wateja, na maagizo."
+        else:
+            response = "I'm sorry, I encountered an error. Please try again. I can help with items, pricing, stock levels, customers, and orders."
+        
+        return AIResponse(
+            intent=intent,
+            entities=entities,
+            result=response,
+            data=[],
+            suggestions=[
+                "Check price of an item",
+                "Show me stock levels",
+                "Create a quotation"
+            ],
+            session_id=session_id,
+        )
+
+
 async def route_async(
     intent: str,
     entities: dict,
@@ -212,6 +386,16 @@ async def route_async(
         user_role: User's role (manager/sales_rep)
         company_code: Company code for multi-tenant URL resolution
     """
+    
+    # ========================================================================
+    # FIX: Handle CLARIFY and GENERAL_AI with LLM FIRST
+    # This must be checked BEFORE creating services to save resources
+    # ========================================================================
+    if intent in ["CLARIFY", "GENERAL_AI"]:
+        logger.info(f"🔄 Routing to General AI handler: {intent}")
+        return await _handle_general_ai(
+            intent, entities, message, language, llm, context, session_id
+        )
     
     # Add assigned customers filter for sales reps
     if user_role == "sales_rep" and assigned_customers:
@@ -289,6 +473,15 @@ async def route_async(
     # TIER 4: Database query with LLM narration
     # ========================================================================
     
+    # ========================================================================
+    # FIX: Handle GET_LOW_STOCK as a special case with direct DB query
+    # ========================================================================
+    if intent == "GET_LOW_STOCK":
+        logger.info(f"Tier 4 — Low stock query: {intent}")
+        return await _handle_low_stock_query(
+            intent, entities, message, language, db, formatter, context, session_id, llm
+        )
+    
     if intent not in ACTION_ROUTER_INTENTS:
         logger.info(f"Tier 4 — DB query + narrate: {intent}")
         return await _handle_db_query(
@@ -311,17 +504,37 @@ async def route_async(
 
 def _handle_greeting(language: str, intent: str, entities: dict, context: Dict, session_id: str) -> AIResponse:
     """Handle greeting intent."""
-    if language == "sw":
-        msg = "Habari! Mimi ni Msaidizi wa AI wa Leysco. Ninaweza kukusaidia na bei za bidhaa, hisa, wateja, maagizo, na zaidi. Unahitaji nini?"
+    # Check for more specific conversational queries
+    message = entities.get("_original_query", "").lower()
+    
+    if "tell me about yourself" in message or "who are you" in message or "what are you" in message:
+        if language == "sw":
+            msg = "Habari! Mimi ni Msaidizi wa AI wa Leysco. Nimetengenezwa kusaidia na shughuli za biashara kama vile bei, hisa, wateja, na maagizo. Unaweza kuniuliza swali lolote kuhusu mfumo wa Leysco."
+        else:
+            msg = "Hello! I'm the Leysco AI Assistant. I was built to help with business operations like pricing, stock levels, customers, and orders. You can ask me anything about the Leysco system."
+    elif "how are you" in message or "how's it going" in message:
+        if language == "sw":
+            msg = "Niko vizuri, asante! Niko tayari kukusaidia. Je, una swali gani leo?"
+        else:
+            msg = "I'm doing great, thanks! Ready to help you. What can I assist you with today?"
     else:
-        msg = "Hello! I'm the Leysco AI Assistant. I can help you with items, pricing, stock levels, customers, orders, and more. What would you like to know?"
+        # Default greeting
+        if language == "sw":
+            msg = "Habari! Mimi ni Msaidizi wa AI wa Leysco. Ninaweza kukusaidia na bei za bidhaa, hisa, wateja, maagizo, na zaidi. Unahitaji nini?"
+        else:
+            msg = "Hello! I'm the Leysco AI Assistant. I can help you with items, pricing, stock levels, customers, orders, and more. What would you like to know?"
     
     return AIResponse(
         intent=intent,
         entities=entities,
         result=msg,
         data=[],
-        suggestions=[],
+        suggestions=[
+            "Check price of an item",
+            "Show me stock levels",
+            "Create a quotation",
+            "What can you help me with?"
+        ],
         session_id=session_id,
     )
 
@@ -338,7 +551,11 @@ def _handle_thanks(language: str, intent: str, entities: dict, context: Dict, se
         entities=entities,
         result=msg,
         data=[],
-        suggestions=[],
+        suggestions=[
+            "Check price of an item",
+            "Show me stock levels",
+            "Create a quotation"
+        ],
         session_id=session_id,
     )
 
@@ -657,6 +874,102 @@ async def _handle_decision_support(
 # ============================================================================
 # TIER 4 HANDLERS
 # ============================================================================
+
+# ========================================================================
+# FIX: NEW HANDLER FOR LOW STOCK QUERIES
+# ========================================================================
+
+async def _handle_low_stock_query(
+    intent: str, entities: dict, message: str, language: str,
+    db, formatter: ResponseFormatter, context: Dict, session_id: str, llm
+) -> AIResponse:
+    """Handle low stock queries - returns items with lowest stock first."""
+    logger.info(f"🔍 Handling low stock query: {message}")
+    
+    try:
+        # Get threshold from entities or use default
+        threshold = entities.get('threshold', 100)
+        if not isinstance(threshold, int) or threshold <= 0:
+            threshold = 100
+        
+        # Get all items sorted by stock ascending (lowest first)
+        # The db.get_items method should support sorting
+        try:
+            # Try to use db.get_items with sorting
+            items = db.get_items(
+                limit=100,  # Get more items to filter
+                sort_by="OnHand",
+                sort_order="ASC"
+            )
+        except Exception as e:
+            logger.warning(f"db.get_items with sort failed: {e}, falling back to db.query")
+            # Fallback: use db.query with intent
+            items = db.query(intent="GET_ITEMS", entities=entities, language=language)
+        
+        # Ensure items is a list
+        if items is None:
+            items = []
+        elif isinstance(items, dict):
+            items = [items]
+        elif not isinstance(items, list):
+            items = list(items) if items else []
+        
+        # Filter items with stock below threshold
+        low_stock_items = []
+        for item in items:
+            on_hand = item.get('OnHand', 0)
+            if isinstance(on_hand, (int, float)) and on_hand < threshold:
+                low_stock_items.append(item)
+        
+        # If no low stock items found, take the lowest stock items
+        if not low_stock_items and items:
+            # Sort by OnHand
+            sorted_items = sorted(
+                items, 
+                key=lambda x: float(x.get('OnHand', 0)) if x.get('OnHand') is not None else float('inf')
+            )
+            # Take top 20 lowest
+            low_stock_items = sorted_items[:20]
+            if low_stock_items:
+                threshold = max([item.get('OnHand', 0) for item in low_stock_items])
+                logger.info(f"⚠️ No items below {threshold}, showing {len(low_stock_items)} lowest stock items")
+        
+        # Format the response
+        formatted = _format_low_stock_response(low_stock_items, threshold, language)
+        
+        # Generate suggestions
+        suggestions = [
+            "Check stock levels for specific item",
+            "Show all items",
+            "What's the price of [item]?",
+            "Show warehouses"
+        ]
+        
+        # Add specific item suggestions if we have items
+        if low_stock_items:
+            first_item = low_stock_items[0]
+            item_name = first_item.get('ItemName', '')
+            item_code = first_item.get('ItemCode', '')
+            if item_name:
+                suggestions.insert(0, f"Price of {item_name}")
+                suggestions.insert(1, f"Stock details for {item_name}")
+        
+        return AIResponse(
+            intent=intent,
+            entities=entities,
+            result=formatted.get("message", "No low stock items found."),
+            data=_ensure_list(formatted.get("data", low_stock_items)),
+            suggestions=suggestions,
+            session_id=session_id,
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error in low stock query: {e}", exc_info=True)
+        # Fallback to regular DB query
+        return await _handle_db_query(
+            intent, entities, message, language, db, formatter, context, session_id, llm
+        )
+
 
 async def _handle_db_query(
     intent: str, entities: dict, message: str, language: str,

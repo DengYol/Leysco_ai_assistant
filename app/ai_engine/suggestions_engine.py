@@ -279,6 +279,18 @@ _SUGGESTIONS: dict[str, list[tuple[str, str, str]]] = {
 _UNIT_SUFFIXES = {"ml", "kg", "g", "l", "lt", "gm", "mg"}
 
 
+def _unwrap_entity(val):
+    """
+    Entity extractors sometimes return (value, is_exact_match) tuples
+    instead of plain strings (e.g. the item/customer fuzzy matcher).
+    Normalize to a plain string/None here so downstream .strip() calls
+    never raise AttributeError: 'tuple' object has no attribute 'strip'.
+    """
+    if isinstance(val, tuple):
+        val = val[0] if val else None
+    return val
+
+
 def _title_item(name: str) -> str:
     """
     'vegimax 10ml'       -> 'Vegimax 10ml'
@@ -317,8 +329,14 @@ class SuggestionsEngine:
 
     def _get_cache_key(self, intent: str, entities: dict, language: str) -> str:
         """Generate cache key for suggestions."""
-        # Create a stable representation of entities
-        entity_str = "|".join(f"{k}:{v}" for k, v in sorted(entities.items()) if v and not k.startswith('_'))
+        # Create a stable representation of entities. Unwrap tuple-valued
+        # entities (item_name/customer_name may be (value, is_exact)) so
+        # equivalent entities produce the same cache key.
+        entity_str = "|".join(
+            f"{k}:{_unwrap_entity(v)}"
+            for k, v in sorted(entities.items())
+            if v and not k.startswith('_')
+        )
         return f"suggestions:{intent}:{language}:{entity_str}"
 
     @lru_cache(maxsize=256)
@@ -362,9 +380,11 @@ class SuggestionsEngine:
 
         templates = _SUGGESTIONS.get(intent.upper(), _SUGGESTIONS["_DEFAULT"])
 
-        item = (entities.get("item_name") or "").strip()
-        customer = (entities.get("customer_name") or "").strip()
-        warehouse = (entities.get("warehouse") or "").strip()
+        # Entity extractors may return (value, is_exact_match) tuples for
+        # item_name / customer_name — unwrap before calling .strip().
+        item = (_unwrap_entity(entities.get("item_name")) or "").strip()
+        customer = (_unwrap_entity(entities.get("customer_name")) or "").strip()
+        warehouse = (_unwrap_entity(entities.get("warehouse")) or "").strip()
 
         chips: list[str] = []
 

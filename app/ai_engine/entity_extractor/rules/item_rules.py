@@ -11,6 +11,17 @@ logger = logging.getLogger(__name__)
 class ItemRules:
     """Rules for item name extraction"""
     
+    # ====================================================================
+    # FIX: Conversational terms that should NOT be extracted as items
+    # ====================================================================
+    CONVERSATIONAL_TERMS = [
+        'yourself', 'about you', 'who are you', 'what are you',
+        'tell me about', 'introduce yourself', 'your name',
+        'who made you', 'who created you', 'what do you do',
+        'how can you help', 'what are your capabilities', 'your features',
+        'about yourself', 'tell me about yourself'
+    ]
+    
     @staticmethod
     def is_product_name(text: str) -> bool:
         """Check if text is likely a product name."""
@@ -18,6 +29,11 @@ class ItemRules:
             return False
 
         text_lower = text.lower()
+        
+        # Skip conversational terms
+        for term in ItemRules.CONVERSATIONAL_TERMS:
+            if term in text_lower:
+                return False
 
         for product in PRODUCT_INDICATORS:
             if product in text_lower:
@@ -30,59 +46,88 @@ class ItemRules:
         return False
     
     @staticmethod
-    def validate_sellable_item(item_name: str, api_service) -> str:
+    def validate_sellable_item(item_name: str, api_service, required_size: str = None) -> str:
         """
         Validate that the item is sellable, find a sellable alternative if not.
         This prevents returning packing materials, raw materials, etc.
+        
+        Args:
+            item_name: The item name to validate
+            api_service: API service for searching items
+            required_size: Optional required size (e.g., "250ml")
+        
+        Returns:
+            Best matching sellable item name, or original if no size specified
         """
         if not item_name or not api_service:
             return item_name
         
-        # Search for the item
-        items = api_service.get_items(search=item_name, limit=30)
+        # ====================================================================
+        # FIX: Skip validation for conversational terms
+        # ====================================================================
+        for term in ItemRules.CONVERSATIONAL_TERMS:
+            if term in item_name.lower():
+                logger.info(f"🔍 Skipping validation for conversational term: '{item_name}'")
+                return item_name
+        
+        # ====================================================================
+        # FIX: If no size is specified, return the original item name
+        # This allows the pricing handler to search for ALL matching items
+        # ====================================================================
+        if not required_size:
+            logger.info(f"🔍 No size specified for '{item_name}', returning original for multi-item search")
+            return item_name
+        
+        # Search for the item with the required size
+        items = api_service.get_items(search=item_name, limit=50)
         if not items:
             return item_name
         
         item_name_lower = item_name.lower()
+        normalized_required = ItemRules.normalize_size(required_size)
+        logger.info(f"🔍 Searching for items with size: {normalized_required}")
         
-        # First, look for sellable items that match closely
-        sellable_matches = []
+        # First, find sellable items that match the size
+        size_matches = []
         for item in items:
             if item.get("SellItem") == "Y":
                 item_display = item.get("ItemName", "")
-                ratio = difflib.SequenceMatcher(None, item_name_lower, item_display.lower()).ratio()
-                sellable_matches.append({
-                    "name": item_display,
-                    "code": item.get("ItemCode"),
-                    "score": ratio
-                })
+                item_size = ItemRules.normalize_size(item_display)
+                if item_size and item_size == normalized_required:
+                    size_matches.append({
+                        "name": item_display,
+                        "code": item.get("ItemCode"),
+                        "score": difflib.SequenceMatcher(None, item_name_lower, item_display.lower()).ratio()
+                    })
         
-        if sellable_matches:
-            sellable_matches.sort(key=lambda x: x["score"], reverse=True)
-            best_match = sellable_matches[0]
-            if best_match["score"] > 0.3:
-                logger.info(f"Found sellable item '{best_match['name']}' (score: {best_match['score']:.2f}) for query '{item_name}'")
-                return best_match["name"]
-        
-        # If no sellable match, look for any item excluding packing materials (ItmsGrpCod=3)
-        non_packing_matches = []
-        for item in items:
-            group_cod = item.get("ItmsGrpCod")
-            if group_cod != 3:
-                item_display = item.get("ItemName", "")
-                ratio = difflib.SequenceMatcher(None, item_name_lower, item_display.lower()).ratio()
-                non_packing_matches.append({
-                    "name": item_display,
-                    "score": ratio
-                })
-        
-        if non_packing_matches:
-            non_packing_matches.sort(key=lambda x: x["score"], reverse=True)
-            best_match = non_packing_matches[0]
-            logger.warning(f"No sellable item found for '{item_name}', using non-packing item: '{best_match['name']}'")
+        if size_matches:
+            # Sort by score and return the best match
+            size_matches.sort(key=lambda x: x["score"], reverse=True)
+            best_match = size_matches[0]
+            logger.info(f"✅ Found sellable item with exact size match: '{best_match['name']}' (size: {required_size})")
             return best_match["name"]
         
-        logger.warning(f"No sellable or non-packing item found for '{item_name}'")
+        # If no sellable with exact size, look for any item with matching size
+        size_matches_any = []
+        for item in items:
+            item_display = item.get("ItemName", "")
+            item_size = ItemRules.normalize_size(item_display)
+            if item_size and item_size == normalized_required:
+                group_cod = item.get("ItmsGrpCod")
+                if group_cod != 3:  # Exclude packing material
+                    size_matches_any.append({
+                        "name": item_display,
+                        "score": difflib.SequenceMatcher(None, item_name_lower, item_display.lower()).ratio()
+                    })
+        
+        if size_matches_any:
+            size_matches_any.sort(key=lambda x: x["score"], reverse=True)
+            best_match = size_matches_any[0]
+            logger.warning(f"⚠️ No sellable item with size {required_size}, using non-sellable: '{best_match['name']}'")
+            return best_match["name"]
+        
+        # If no size match found, return the original item name
+        logger.info(f"ℹ️ No items found with size {required_size}, returning original: '{item_name}'")
         return item_name
 
     @staticmethod
@@ -228,7 +273,17 @@ class ItemRules:
         detected_size = None
         exact_size_match_required = False
         
-        # Extract size first
+        # ====================================================================
+        # FIX: Skip item extraction for conversational queries
+        # ====================================================================
+        for term in ItemRules.CONVERSATIONAL_TERMS:
+            if term in text_lower:
+                logger.info(f"🔍 Conversational query detected, skipping item extraction: '{text_lower[:50]}'")
+                return None, detected_size, exact_size_match_required
+        
+        # ====================================================================
+        # Extract size FIRST and store it
+        # ====================================================================
         for pattern in SIZE_PATTERNS:
             match = re.search(pattern, text_lower)
             if match:
@@ -246,7 +301,7 @@ class ItemRules:
 
                 detected_size = ItemRules.normalize_size(detected_size)
                 exact_size_match_required = True
-                logger.info(f"Detected size: {detected_size} (exact match required: {exact_size_match_required})")
+                logger.info(f"✅ Detected size: {detected_size} (exact match required: {exact_size_match_required})")
                 break
         
         # Sell out patterns
@@ -315,6 +370,7 @@ class ItemRules:
                         if detected_size is None:
                             detected_size = ItemRules.normalize_size(size_candidate)
                             exact_size_match_required = True
+                            logger.info(f"✅ Detected size from price pattern: {detected_size}")
                     candidate = re.sub(r'\b(price|of|the|a|an|for|in|at|to|is|are|was|were|bei|ya)\b', '', candidate, flags=re.IGNORECASE)
                     candidate = candidate.strip()
                     if candidate and len(candidate) > 1:
@@ -342,12 +398,23 @@ class ItemRules:
                         logger.info(f"Extracted item from stock pattern: '{item_name}'")
                         break
         
-        # Validate and correct item name to a sellable item
+        # ====================================================================
+        # Validate and correct item name with size awareness
+        # If no size is specified, keep the original name for multi-item search
+        # ====================================================================
         if item_name and api_service:
             original_item_name = item_name
-            item_name = ItemRules.validate_sellable_item(item_name, api_service)
+            logger.info(f"🔍 Validating item '{original_item_name}' with required_size: {detected_size}")
+            # Pass detected_size to validate_sellable_item for size-aware matching
+            item_name = ItemRules.validate_sellable_item(
+                item_name, 
+                api_service, 
+                required_size=detected_size
+            )
             if original_item_name != item_name:
-                logger.info(f"Item name corrected from '{original_item_name}' to sellable '{item_name}'")
+                logger.info(f"✅ Item name corrected from '{original_item_name}' to '{item_name}' (size: {detected_size})")
+            else:
+                logger.info(f"✅ Item name unchanged: '{item_name}' (size: {detected_size})")
         
         return item_name, detected_size, exact_size_match_required
     
@@ -356,11 +423,13 @@ class ItemRules:
         """Normalize size string to a standard format for comparison."""
         if not size_str:
             return ""
+        # Remove whitespace and normalize
         normalized = re.sub(r'\s+', '', size_str.lower())
-        normalized = re.sub(r'ml$', 'ml', normalized)
-        normalized = re.sub(r'kg$', 'kg', normalized)
-        normalized = re.sub(r'g$', 'g', normalized)
-        normalized = re.sub(r'l$', 'l', normalized)
+        # Convert common variations
+        normalized = re.sub(r'^(\d+)ml$', r'\1ml', normalized)
+        normalized = re.sub(r'^(\d+)kg$', r'\1kg', normalized)
+        normalized = re.sub(r'^(\d+)g$', r'\1g', normalized)
+        normalized = re.sub(r'^(\d+)l$', r'\1l', normalized)
         return normalized
     
     @staticmethod
